@@ -1,0 +1,1194 @@
+#!/usr/bin/env python3
+"""Philips Hue bridge helper for the Hue Lights GNOME Shell extension.
+
+Long-running process: reads one JSON command per line on stdin and prints one
+JSON snapshot per line on stdout. Talks to the bridge's local CLIP v2 API over
+HTTPS only. The bridge certificate is self-signed by Philips, so it is pinned
+(SHA-256 fingerprint + CN == bridge id) when pairing and checked on every
+connection afterwards. The application key lives in
+$XDG_CONFIG_HOME/hue-lights/config.json (~/.config/hue-lights, mode 0600) and
+never leaves this process.
+"""
+
+import atexit
+import hashlib
+import http.client
+import ipaddress
+import json
+import math
+import os
+import re
+import select
+import shutil
+import signal
+import socket
+import ssl
+import stat
+import tempfile
+import subprocess
+import sys
+import threading
+import time
+
+def _config_home():
+    """$XDG_CONFIG_HOME when it is an absolute path (the spec ignores relative ones), else ~/.config."""
+    home = os.environ.get("XDG_CONFIG_HOME", "")
+    return home if os.path.isabs(home) else os.path.join(os.path.expanduser("~"), ".config")
+
+
+CONFIG_DIR = os.path.join(_config_home(), "hue-lights")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+POLL_OPEN = 2.0       # seconds between refreshes while the panel is open
+POLL_CLOSED = 20.0    # seconds between refreshes while it is closed
+PAIR_WINDOW = 35.0    # how long to keep asking for a key after "pair"
+LIGHT_INTERVAL = 0.12 # Hue guidance: ~10 light commands per second
+GROUP_INTERVAL = 0.6  # ... and ~1 group command per second
+HTTP_TIMEOUT = 4.0     # overall deadline per request: connect, TLS, headers and body
+# The bridge always listens on 443. HUE_LIGHTS_BRIDGE_PORT exists for the test harness's
+# mock bridge (tools/mock-bridge.py), which cannot bind 443 without root.
+try:
+    BRIDGE_PORT = int(os.environ.get("HUE_LIGHTS_BRIDGE_PORT", "443"))
+except ValueError:
+    BRIDGE_PORT = 443
+if not 1 <= BRIDGE_PORT <= 65535:
+    BRIDGE_PORT = 443
+MAX_BODY = 4 * 1024 * 1024
+MAX_CONFIG = 64 * 1024
+MAX_PENDING = 256     # queued light/group/scene commands at most (one per resource)
+MAX_COMMAND = 4096    # bytes per panel command line; longer lines are dropped unread
+# Rooms and zones name their lights directly or through devices, and nothing stops
+# a bridge from repeating them: each group keeps a light once and at most
+# MAX_GROUP_LIGHTS of them, all groups together at most MAX_MEMBERSHIPS. The lights
+# in no room ("Other lights") are a group like the others: the same two limits.
+MAX_GROUP_LIGHTS = 150
+MAX_MEMBERSHIPS = 1000
+# Each room or zone ID is shown once. Scenes are kept once per ID, at most
+# MAX_GROUP_SCENES per group and MAX_SCENES on the whole bridge, and every scene
+# goes to the one group it names, so the model never holds more than MAX_SCENES.
+MAX_GROUP_SCENES = 100
+MAX_SCENES = 1000
+
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+BRIDGE_ID_RE = re.compile(r"^[0-9A-F]{16}$")
+APP_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,100}")     # the bridge's application key ("username")
+CLIENT_KEY_RE = re.compile(r"[0-9A-Fa-f]{1,64}")    # the entertainment client key
+MAX_SECRETS = 8
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers (unit tested)
+
+def valid_uuid(value):
+    return isinstance(value, str) and UUID_RE.match(value) is not None
+
+
+def valid_bridge_ip(value):
+    """Only private / link-local IPv4 literals: the bridge is always on the LAN."""
+    try:
+        ip = ipaddress.IPv4Address(str(value))
+    except (ipaddress.AddressValueError, ValueError):
+        return False
+    return ip.is_private and not ip.is_loopback and not ip.is_unspecified and not ip.is_multicast
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def finite(value, default, low, high):
+    """A bridge or panel number as a float in [low, high]; `default` for NaN, infinities and junk
+    (json.loads accepts NaN/Infinity, which the panel's JSON.parse would reject)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return clamp(number, low, high) if math.isfinite(number) else default
+
+
+def clean(text, limit=60):
+    """Names come from the bridge or mDNS: no markup or control characters ever reach Qt."""
+    text = "".join(ch for ch in str(text or "") if ch.isprintable() and ch not in "<>&")
+    return text.strip()[:limit]
+
+
+def fingerprint(der):
+    return hashlib.sha256(der).hexdigest()
+
+
+def _der_items(buf, pos, end):
+    """Yield (tag, content_start, content_end) for the DER items in buf[pos:end]."""
+    while pos < end:
+        tag = buf[pos]
+        length = buf[pos + 1]
+        pos += 2
+        if length & 0x80:
+            count = length & 0x7F
+            length = int.from_bytes(buf[pos:pos + count], "big")
+            pos += count
+        yield tag, pos, pos + length
+        pos += length
+
+
+def cert_common_name(der):
+    """Subject CN of a DER certificate (Certificate > TBSCertificate > subject)."""
+    try:
+        _, cert_start, cert_end = next(_der_items(der, 0, len(der)))
+        _, tbs_start, tbs_end = next(_der_items(der, cert_start, cert_end))
+        fields = list(_der_items(der, tbs_start, tbs_end))
+        if fields and fields[0][0] == 0xA0:  # explicit version
+            fields = fields[1:]
+        _, subj_start, subj_end = fields[4]   # serial, sigAlg, issuer, validity, subject
+        for _, set_start, set_end in _der_items(der, subj_start, subj_end):
+            for _, atv_start, atv_end in _der_items(der, set_start, set_end):
+                (_, oid_s, oid_e), (_, val_s, val_e) = list(_der_items(der, atv_start, atv_end))[:2]
+                if der[oid_s:oid_e] == b"\x55\x04\x03":
+                    return der[val_s:val_e].decode("utf-8", "replace")
+    except (StopIteration, IndexError, ValueError):
+        pass
+    return ""
+
+
+def _gamma(c):
+    c = clamp(c, 0.0, 1.0)
+    return 12.92 * c if c <= 0.0031308 else 1.055 * (c ** (1 / 2.4)) - 0.055
+
+
+def xy_to_hex(x, y):
+    """CIE xy (Hue colour) to an sRGB hex string at full brightness, for a swatch."""
+    x, y = finite(x, None, 0.0, 1.0), finite(y, None, 0.0, 1.0)
+    if x is None or y is None or y <= 0:
+        return "#ffd27a"
+    z = 1.0 - x - y
+    Y = 1.0
+    X = (Y / y) * x
+    Z = (Y / y) * z
+    r = X * 1.656492 - Y * 0.354851 - Z * 0.255038
+    g = -X * 0.707196 + Y * 1.655397 + Z * 0.036152
+    b = X * 0.051713 - Y * 0.121364 + Z * 1.011530
+    peak = max(r, g, b)
+    if peak > 1:
+        r, g, b = r / peak, g / peak, b / peak
+    return "#%02x%02x%02x" % tuple(int(round(_gamma(c) * 255)) for c in (r, g, b))
+
+
+def mirek_to_hex(mirek):
+    """Colour temperature (mirek) to an approximate sRGB hex (Tanner Helland fit)."""
+    mirek = finite(mirek, None, 1.0, 1000000.0)
+    if mirek is None:
+        return "#ffd27a"
+    kelvin = 1000000.0 / mirek
+    t = clamp(kelvin, 1000, 40000) / 100.0
+    import math
+    if t <= 66:
+        r = 255
+        g = 99.4708025861 * math.log(t) - 161.1195681661
+        b = 0 if t <= 19 else 138.5177312231 * math.log(t - 10) - 305.0447927307
+    else:
+        r = 329.698727446 * ((t - 60) ** -0.1332047592)
+        g = 288.1221695283 * ((t - 60) ** -0.0755148492)
+        b = 255
+    return "#%02x%02x%02x" % tuple(int(clamp(c, 0, 255)) for c in (r, g, b))
+
+
+def light_color(light):
+    ct = light.get("color_temperature") or {}
+    if ct.get("mirek_valid") and ct.get("mirek"):
+        return mirek_to_hex(ct["mirek"])
+    xy = (light.get("color") or {}).get("xy")
+    if xy:
+        return xy_to_hex(xy.get("x"), xy.get("y"))
+    if ct.get("mirek"):
+        return mirek_to_hex(ct["mirek"])
+    return "#ffd27a"
+
+
+def brightness(value):
+    """A bridge brightness in 0..100; anything else (a string, NaN, an infinity) makes the whole
+    reply one this app does not understand, rather than a value the panel cannot parse."""
+    number = finite(value, None, 0.0, 100.0)
+    if number is None:
+        raise ValueError("unexpected brightness")
+    return number
+
+
+def blend_colors(colors):
+    """Average of '#rrggbb' strings (the room's swatch), warm white when empty."""
+    rgb = [tuple(int(c[i:i + 2], 16) for i in (1, 3, 5)) for c in colors if re.fullmatch(r"#[0-9a-f]{6}", c or "")]
+    if not rgb:
+        return "#ffd27a"
+    return "#%02x%02x%02x" % tuple(int(round(sum(ch[i] for ch in rgb) / len(rgb))) for i in range(3))
+
+
+def build_model(resources):
+    """Turn the flat CLIP v2 /resource list into rooms -> lights / scenes."""
+    by_type = {}
+    for res in resources if isinstance(resources, list) else []:
+        if isinstance(res, dict):
+            by_type.setdefault(res.get("type"), []).append(res)
+    lights = {r["id"]: r for r in by_type.get("light", []) if valid_uuid(r.get("id"))}
+    grouped = {r["id"]: r for r in by_type.get("grouped_light", []) if valid_uuid(r.get("id"))}
+    devices = {r["id"]: r for r in by_type.get("device", []) if valid_uuid(r.get("id"))}
+    connectivity = {}
+    for zc in by_type.get("zigbee_connectivity", []):
+        owner = (zc.get("owner") or {}).get("rid")
+        if owner:
+            connectivity[owner] = zc.get("status") == "connected"
+
+    def light_entry(light):
+        dimming = light.get("dimming") or {}
+        owner = (light.get("owner") or {}).get("rid")
+        return {
+            "id": light["id"],
+            "name": clean((light.get("metadata") or {}).get("name") or "Light"),
+            "on": bool((light.get("on") or {}).get("on")),
+            "bri": round(brightness(dimming.get("brightness", 100.0)), 1),
+            "dimmable": "dimming" in light,
+            "color": light_color(light),
+            "reachable": connectivity.get(owner, True),
+        }
+
+    device_lights = {}   # each device's light services, once and capped
+    for did, device in devices.items():
+        found = {}
+        for svc in device.get("services") or []:
+            if isinstance(svc, dict) and svc.get("rtype") == "light" and svc.get("rid") in lights:
+                found[svc["rid"]] = None
+                if len(found) >= MAX_GROUP_LIGHTS:
+                    break
+        device_lights[did] = list(found)
+    budget = [MAX_MEMBERSHIPS]
+
+    def lights_of(group):
+        ids = {}   # insertion-ordered set
+        limit = min(MAX_GROUP_LIGHTS, budget[0])
+
+        def add(rid):
+            if rid in lights and rid not in ids and len(ids) < limit:
+                ids[rid] = None
+
+        for child in group.get("children") or []:
+            if len(ids) >= limit:
+                break
+            if not isinstance(child, dict):
+                continue
+            rid, rtype = child.get("rid"), child.get("rtype")
+            if rtype == "light":
+                add(rid)
+            elif rtype == "device":
+                for lid in device_lights.get(rid, ()):
+                    add(lid)
+        budget[0] -= len(ids)
+        return list(ids)
+
+    scenes_by_group = {}
+    seen_scenes = set()
+    for scene in by_type.get("scene", []):
+        if len(seen_scenes) >= MAX_SCENES:
+            break
+        gid = ((scene.get("group") if isinstance(scene.get("group"), dict) else None) or {}).get("rid")
+        if not valid_uuid(scene.get("id")) or not valid_uuid(gid) or scene["id"] in seen_scenes:
+            continue
+        group_scenes = scenes_by_group.setdefault(gid, [])
+        if len(group_scenes) >= MAX_GROUP_SCENES:
+            continue
+        seen_scenes.add(scene["id"])
+        group_scenes.append({
+            "id": scene["id"],
+            "name": clean((scene.get("metadata") or {}).get("name") or "Scene", 30),
+            "active": (scene.get("status") or {}).get("active", "inactive") != "inactive",
+        })
+    for group_scenes in scenes_by_group.values():
+        group_scenes.sort(key=lambda s: s["name"].lower())
+
+    rooms = []
+    assigned = set()
+    seen_groups = set()
+    for kind in ("room", "zone"):
+        for group in by_type.get(kind, []):
+            if not valid_uuid(group.get("id")) or group["id"] in seen_groups:
+                continue
+            seen_groups.add(group["id"])
+            gl_id = None
+            for svc in group.get("services") or []:
+                if svc.get("rtype") == "grouped_light" and svc.get("rid") in grouped:
+                    gl_id = svc["rid"]
+            ids = lights_of(group)
+            if not ids:
+                continue
+            if kind == "room":
+                assigned.update(ids)
+            members = sorted((light_entry(lights[i]) for i in ids), key=lambda l: l["name"].lower())
+            on_members = [l for l in members if l["on"]]
+            gl = grouped.get(gl_id) or {}
+            bri = (gl.get("dimming") or {}).get("brightness")
+            bri = None if bri is None else brightness(bri)
+            if bri is None:
+                bri = sum(l["bri"] for l in on_members) / len(on_members) if on_members else 0
+            rooms.append({
+                "id": group["id"],
+                "kind": kind,
+                "name": clean((group.get("metadata") or {}).get("name") or kind.title()),
+                "grouped_light": gl_id or "",
+                "on": any(l["on"] for l in members),
+                "bri": round(float(bri), 1),
+                "on_count": len(on_members),
+                "archetype": clean((group.get("metadata") or {}).get("archetype") or "", 30),
+                "color": blend_colors([l["color"] for l in on_members]),
+                "lights": members,
+                "scenes": scenes_by_group.pop(group["id"], []),
+            })
+    loose = []
+    for lid, light in lights.items():
+        if len(loose) >= min(MAX_GROUP_LIGHTS, budget[0]):
+            break
+        if lid not in assigned:
+            loose.append(light_entry(light))
+    budget[0] -= len(loose)
+    if loose:
+        loose.sort(key=lambda l: l["name"].lower())
+        on_members = [l for l in loose if l["on"]]
+        rooms.append({
+            "id": "", "kind": "other", "name": "Other lights", "grouped_light": "",
+            "on": bool(on_members),
+            "bri": round(sum(l["bri"] for l in on_members) / len(on_members), 1) if on_members else 0,
+            "on_count": len(on_members), "archetype": "", "color": blend_colors([l["color"] for l in on_members]),
+            "lights": loose, "scenes": [],
+        })
+    rooms.sort(key=lambda r: (r["kind"] != "room", r["name"].lower()))
+    return rooms, len(lights), sum(1 for l in lights.values() if (l.get("on") or {}).get("on"))
+
+
+def parse_avahi_hue(lines):
+    """Parse `avahi-browse -rtpk _hue._tcp` output into [{ip, bridge_id, name}]."""
+    found = {}
+    for line in lines:
+        parts = line.split(";")
+        if len(parts) < 10 or parts[0] != "=" or parts[2] != "IPv4":
+            continue
+        ip = parts[7]
+        if not valid_bridge_ip(ip):
+            continue
+        bridge_id = ""
+        m = re.search(r'"bridgeid=([0-9a-fA-F]{16})"', ";".join(parts[9:]))
+        if m:
+            bridge_id = m.group(1).upper()
+        name = parts[3].replace("\\032", " ")
+        name = re.sub(r"\\(\d{3})", lambda mm: chr(int(mm.group(1))), name)
+        found[ip] = {"ip": ip, "bridge_id": bridge_id, "name": clean(name)}
+    return sorted(found.values(), key=lambda b: b["ip"])
+
+
+def parse_command(line):
+    try:
+        cmd = json.loads(line)
+    except (ValueError, TypeError, RecursionError):
+        return None
+    return cmd if isinstance(cmd, dict) and isinstance(cmd.get("cmd"), str) else None
+
+
+def read_commands(stream):
+    """Commands from a binary stream, one JSON object per line. A line longer than MAX_COMMAND
+    is skipped through its newline without being kept in memory."""
+    while True:
+        line = stream.readline(MAX_COMMAND + 1)
+        if not line:
+            return
+        if len(line) > MAX_COMMAND:
+            while not line.endswith(b"\n"):
+                line = stream.readline(MAX_COMMAND + 1)
+                if not line:
+                    return
+            continue
+        cmd = parse_command(line)
+        if cmd:
+            yield cmd
+
+
+# ---------------------------------------------------------------------------
+# Config
+
+def private_config_dir():
+    """Create the config directory as 0700 and refuse it unless it is our own real directory."""
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    info = os.lstat(CONFIG_DIR)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise OSError("config directory is not a private directory owned by this user")
+    if info.st_mode & 0o077:
+        os.chmod(CONFIG_DIR, 0o700)
+    return CONFIG_DIR
+
+
+def load_config():
+    try:
+        fd = os.open(CONFIG_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # a FIFO must not block
+    except OSError:
+        return {}
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > MAX_CONFIG:
+            return {}
+        raw = os.read(fd, MAX_CONFIG)
+    except OSError:
+        return {}
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if not (valid_bridge_ip(data.get("ip")) and isinstance(data.get("app_key"), str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", data["app_key"])
+            and re.fullmatch(r"[0-9a-f]{64}", str(data.get("fingerprint", "")))
+            and BRIDGE_ID_RE.match(str(data.get("bridge_id", "")))):
+        return {}
+    return data
+
+
+def save_config(data):
+    """Atomic 0600 write via a unique temp file (never a predictable name, never a followed link)."""
+    directory = private_config_dir()
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".config.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, CONFIG_PATH)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def remove_config():
+    """Delete the saved pairing. True when no pairing file is left (a missing one counts),
+    False when one is still there (not ours, or the folder is read-only)."""
+    try:
+        info = os.lstat(CONFIG_PATH)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if not ((stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)) and info.st_uid == os.getuid()):
+        return False
+    try:
+        os.unlink(CONFIG_PATH)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+# Children the helper started and has not reaped yet: ended when the helper exits or gets SIGTERM.
+_CHILDREN = set()
+_CHILDREN_LOCK = threading.Lock()
+_SETPRIV = None   # path of util-linux setpriv, "" when it is not installed; looked up once
+
+
+def kill_children():
+    with _CHILDREN_LOCK:
+        children = list(_CHILDREN)
+    for proc in children:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except OSError:
+            pass
+
+
+def _parent_death_prefix():
+    """`setpriv --pdeathsig KILL --` so a child ends even when the helper is SIGKILLed. No Python
+    preexec_fn: running Python between fork and exec in this threaded process can deadlock."""
+    global _SETPRIV
+    if _SETPRIV is None:
+        _SETPRIV = shutil.which("setpriv") or ""
+    return [_SETPRIV, "--pdeathsig", "KILL", "--"] if _SETPRIV else []
+
+
+def run_bounded(argv, timeout=6.0, max_bytes=262144):
+    """Run a fixed argv (no shell) and read at most `max_bytes` of stdout before `timeout`."""
+    try:
+        with _CHILDREN_LOCK:
+            proc = subprocess.Popen(_parent_death_prefix() + list(argv), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            _CHILDREN.add(proc)
+    except OSError:
+        return ""
+    chunks, size = [], 0
+    deadline = time.monotonic() + timeout
+    fd = proc.stdout.fileno()
+    try:
+        while size < max_bytes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                break
+            chunk = os.read(fd, min(65536, max_bytes - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    except OSError:
+        pass
+    finally:
+        proc.stdout.close()
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=0.5)
+        except subprocess.SubprocessError:
+            pass
+        with _CHILDREN_LOCK:
+            _CHILDREN.discard(proc)
+    return b"".join(chunks).decode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------------------
+# HTTPS with certificate pinning
+
+class PinError(Exception):
+    pass
+
+
+class BridgeError(Exception):
+    """The bridge answered with CLIP "errors": a fixed message, never the bridge's own text."""
+
+
+def https_request(ip, method, path, body=None, headers=None, pin=None, timeout=HTTP_TIMEOUT, port=None):
+    """One HTTPS request to the bridge. Returns (status, parsed_json, (fingerprint, cn)).
+
+    With `pin`, the peer certificate must match pin["fingerprint"] and have
+    CN == pin["bridge_id"], otherwise PinError is raised before anything is sent.
+    """
+    port = port or BRIDGE_PORT
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE  # self-signed Philips cert; pinned below instead
+    conn = http.client.HTTPSConnection(ip, port, timeout=timeout, context=ctx)
+    # One overall deadline: a responder that drips headers or body byte by byte is
+    # cut off when the timer shuts the socket down, not just per recv(). The socket is
+    # kept here because a "Connection: close" reply takes it away from conn.sock.
+    expired = threading.Event()
+    connected = []
+    resp = None
+
+    def cut():
+        expired.set()
+        sock = connected[0] if connected else conn.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+    watchdog = threading.Timer(timeout, cut)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        conn.connect()
+        connected.append(conn.sock)
+        if expired.is_set():
+            raise OSError("bridge reply timed out")
+        der = conn.sock.getpeercert(binary_form=True) or b""
+        peer = (fingerprint(der), cert_common_name(der).upper())
+        if pin is not None:
+            if peer[0] != pin.get("fingerprint") or (pin.get("bridge_id") and peer[1] != pin["bridge_id"]):
+                raise PinError("bridge certificate changed")
+        data = json.dumps(body).encode() if body is not None else None
+        hdrs = {"Accept": "application/json"}
+        if data is not None:
+            hdrs["Content-Type"] = "application/json"
+        hdrs.update(headers or {})
+        conn.request(method, path, body=data, headers=hdrs)
+        resp = conn.getresponse()
+        length = resp.getheader("Content-Length")
+        if length is not None and (not length.strip().isdigit() or int(length) > MAX_BODY):
+            raise OSError("reply too large")
+        chunks, size = [], 0
+        while size <= MAX_BODY:
+            if expired.is_set():
+                raise OSError("bridge reply timed out")
+            chunk = resp.read1(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > MAX_BODY:
+            raise OSError("reply too large")
+        if expired.is_set():
+            raise OSError("bridge reply timed out")
+        raw = b"".join(chunks)
+        try:
+            parsed = json.loads(raw.decode("utf-8")) if raw else None
+        except (ValueError, RecursionError):
+            parsed = None
+        return resp.status, parsed, peer
+    finally:
+        watchdog.cancel()
+        if resp is not None:
+            resp.close()
+        conn.close()
+        for sock in connected:
+            sock.close()
+
+
+# ---------------------------------------------------------------------------
+# Main state machine
+
+class Hue:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.wake = threading.Event()
+        self.config = load_config()
+        self.panel_open = False
+        self.rooms = []
+        self.light_count = 0
+        self.on_count = 0
+        self.phase = "connecting" if self.config else "unpaired"
+        self.error = ""
+        # error_code/error_args let the panel show the message in its language.
+        self.error_code = ""
+        self.error_args = []
+        self.candidates = []
+        self.discovering = False
+        self.pair_ip = ""
+        self.pair_until = 0.0
+        self.pair_generation = 0   # bumped by pair, cancel_pair and unpair
+        # Bumped by pair, a saved pairing and unpair: a refresh, relocation or command that
+        # started under an older connection drops its result.
+        self.conn_generation = 0
+        # Keys this process has held (application key, client key): never part of an error text.
+        # Only well-formed keys from a pairing that is still current, at most MAX_SECRETS.
+        self.secrets = {self.config["app_key"]} if self.config.get("app_key") else set()
+        self.pending = {}          # (kind, id) -> body, coalesced
+        self.last_sent = {"light": 0.0, "grouped_light": 0.0, "scene": 0.0}
+        self.last_refresh = 0.0
+        self.refresh_hold_until = 0.0
+
+    def remember_secrets(self, *keys):
+        """Under self.lock: keep `keys` for redaction. The set stays small: when full, only the
+        current application key survives."""
+        keys = [k for k in keys if k]
+        if len(self.secrets) + len(keys) > MAX_SECRETS:
+            current = self.config.get("app_key")
+            self.secrets = {current} if current else set()
+        self.secrets.update(keys)
+
+    def redact(self, text):
+        text = str(text)
+        for secret in self.secrets | {self.config.get("app_key") or ""}:
+            if len(secret) >= 6:
+                text = text.replace(secret, "***")
+        return text
+
+    def safe(self, exc, limit):
+        """An exception's text for the panel: keys removed first, then cleaned and cut."""
+        return clean(self.redact(exc), limit)
+
+    def set_error(self, code, text, *args):
+        """English message for logs and old panels, plus a code and arguments the panel translates.
+        Keys are removed from every part as a backstop."""
+        args = [self.redact(a) for a in args]
+        self.error = self.redact(text % tuple(args) if args else text)
+        self.error_code = code
+        self.error_args = args
+
+    # -- output
+    def snapshot(self):
+        with self.lock:
+            bridge = {}
+            if self.config:
+                bridge = {"ip": self.config.get("ip", ""), "name": self.config.get("name", "Hue Bridge"),
+                          "model": self.config.get("model", "")}
+            return {
+                "phase": self.phase, "error": self.error, "bridge": bridge,
+                "error_code": self.error_code if self.error else "", "error_args": self.error_args if self.error else [],
+                "rooms": self.rooms, "light_count": self.light_count, "on_count": self.on_count,
+                "candidates": self.candidates, "discovering": self.discovering,
+                "pair_ip": self.pair_ip,
+                "pair_remaining": max(0, int(self.pair_until - time.time())) if self.pair_ip else 0,
+            }
+
+    def emit(self):
+        # Taken, serialised and written under one lock, so snapshots leave in the order they were
+        # taken (an older one can never overwrite the panel's view after Unpair).
+        with self.lock:
+            snap = self.snapshot()
+            try:
+                line = json.dumps(snap, separators=(",", ":"), allow_nan=False)
+            except ValueError:   # backstop: a non-finite number the parsers missed
+                self.rooms, self.light_count, self.on_count, self.phase = [], 0, 0, "error"
+                self.set_error("errReply", "The bridge sent a reply this app does not understand.")
+                line = json.dumps(self.snapshot(), separators=(",", ":"), allow_nan=False)
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+
+    # -- bridge access
+    def connection(self):
+        """(config snapshot, generation) for network work outside the lock; no config while a
+        pairing runs, so nothing started then can change what the pairing shows."""
+        with self.lock:
+            return (dict(self.config) if not self.pair_ip else {}), self.conn_generation
+
+    def connection_current(self, generation):
+        """Still the connection the work started under, and no pairing running (lock held)."""
+        return bool(self.config) and not self.pair_ip and self.conn_generation == generation
+
+    def known(self, kind, rid):
+        """A light, grouped light or scene of the current model (call with the lock held)."""
+        for room in self.rooms:
+            if kind == "grouped_light" and room["grouped_light"] == rid:
+                return True
+            if kind == "light" and any(light["id"] == rid for light in room["lights"]):
+                return True
+            if kind == "scene" and any(scene["id"] == rid for scene in room["scenes"]):
+                return True
+        return False
+
+    def may_queue(self, kind, rid):
+        """Only resources the panel can show, and at most MAX_PENDING queued (lock held)."""
+        return self.known(kind, rid) and ((kind, rid) in self.pending or len(self.pending) < MAX_PENDING)
+
+    def api(self, method, path, body=None, config=None):
+        config = config if config is not None else self.connection()[0]
+        pin = {"fingerprint": config.get("fingerprint"), "bridge_id": config.get("bridge_id", "")}
+        status, data, _ = https_request(config["ip"], method, path, body,
+                                        {"hue-application-key": config["app_key"]}, pin=pin)
+        if status in (401, 403):
+            raise PermissionError("bridge rejected the app key")
+        if status >= 400:
+            raise OSError("bridge returned HTTP %d" % status)
+        errors = data.get("errors") if isinstance(data, dict) else None
+        if isinstance(errors, list) and errors:
+            raise BridgeError("bridge reported an error")
+        return data
+
+    def refresh(self):
+        config, generation = self.connection()
+        if not config:
+            return
+        failure = None
+        try:
+            data = self.api("GET", "/clip/v2/resource", config=config)
+            if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+                raise ValueError("unexpected reply")
+            rooms, total, on = build_model(data["data"])
+            with self.lock:
+                if self.connection_current(generation):
+                    if time.time() >= self.refresh_hold_until:
+                        self.rooms, self.light_count, self.on_count = rooms, total, on
+                    self.phase, self.error = "ok", ""
+        except (ValueError, TypeError, KeyError, AttributeError, BridgeError):
+            failure = ("errReply", "The bridge sent a reply this app does not understand.")
+        except PinError:
+            failure = ("errCert", "The bridge certificate changed. Unpair and pair again if you replaced the bridge.")
+        except PermissionError:
+            failure = ("errRejected", "The bridge no longer accepts this app. Unpair and pair again.")
+        except (OSError, socket.timeout, http.client.HTTPException) as exc:
+            failure = ("errUnreachable", "Bridge not reachable (%s)", self.safe(exc, 80))
+        if failure:
+            with self.lock:
+                current = self.connection_current(generation)
+                if current:
+                    self.phase = "error"
+                    self.set_error(*failure)
+            if current and failure[0] == "errUnreachable":
+                self.relocate(config, generation)
+        self.last_refresh = time.time()
+
+    def relocate(self, config, generation):
+        """The bridge got a new DHCP address: find it again by bridge id via mDNS. The new address
+        is saved only if Unpair or another Pair did not replace the connection meanwhile."""
+        bridge_id = config.get("bridge_id")
+        if not bridge_id:
+            return
+        for cand in self.discover_now():
+            if cand["bridge_id"] == bridge_id and cand["ip"] != config.get("ip"):
+                with self.lock:
+                    if not self.connection_current(generation):
+                        return
+                    moved = dict(self.config, ip=cand["ip"])
+                    save_config(moved)
+                    self.config = moved
+                    self.conn_generation += 1
+                self.wake.set()
+                return
+
+    def discover_now(self):
+        return parse_avahi_hue(run_bounded(["avahi-browse", "-rtpk", "_hue._tcp"]).splitlines())
+
+    def claim_discovery(self):
+        """One discovery at a time: True when this caller got the slot."""
+        with self.lock:
+            if self.discovering:
+                return False
+            self.discovering = True
+            return True
+
+    def start_discovery(self):
+        if self.claim_discovery():
+            threading.Thread(target=self.run_discovery, daemon=True).start()
+
+    def discover(self):
+        if self.claim_discovery():
+            self.run_discovery()
+
+    def run_discovery(self):
+        """With the slot claimed: browse, publish the candidates, release the slot."""
+        found = []
+        try:
+            self.emit()
+            found = self.discover_now()
+        finally:
+            with self.lock:
+                self.candidates, self.discovering = found, False
+            self.emit()
+
+    # -- pairing
+    def pairing_current(self, ip, generation):
+        """Still the pairing this attempt started for (call with the lock held)."""
+        return self.pair_ip == ip and self.pair_generation == generation
+
+    def try_pair(self):
+        with self.lock:
+            ip, generation = self.pair_ip, self.pair_generation
+        if not ip:
+            return
+        try:
+            _, cfg, peer = https_request(ip, "GET", "/api/0/config")
+            cfg = cfg if isinstance(cfg, dict) else {}
+            bridge_id = str((cfg or {}).get("bridgeid", "")).upper()
+            if not BRIDGE_ID_RE.match(bridge_id) or peer[1] != bridge_id:
+                with self.lock:
+                    if not self.pairing_current(ip, generation):
+                        return
+                    self.set_error("errNotHue", "%s does not look like a Hue bridge", ip)
+                    self.pair_ip = ""
+                    self.phase = "unpaired"
+                return
+            with self.lock:
+                if not self.pairing_current(ip, generation):
+                    return   # Cancel, Unpair or a new Pair during the first request: no key request
+            host = clean(socket.gethostname(), 19) or "pc"
+            _, resp, peer2 = https_request(ip, "POST", "/api",
+                                           {"devicetype": "gnome_hue_lights#" + host, "generateclientkey": True})
+            if peer2 != peer:
+                raise PinError("certificate changed during pairing")
+            entry = resp[0] if isinstance(resp, list) and resp and isinstance(resp[0], dict) else {}
+            if not isinstance(entry.get("success", {}), dict) or not isinstance(entry.get("error", {}), dict):
+                entry = {}
+            key = (entry.get("success") or {}).get("username")
+            client_key = (entry.get("success") or {}).get("clientkey")
+            key = key if isinstance(key, str) and APP_KEY_RE.fullmatch(key) else None
+            client_key = client_key if isinstance(client_key, str) and CLIENT_KEY_RE.fullmatch(client_key) else None
+            with self.lock:
+                if not self.pairing_current(ip, generation):
+                    return   # a reply for an attempt that was cancelled or replaced: nothing kept
+                self.remember_secrets(key, client_key)
+            if key:
+                config = {
+                    "ip": ip, "bridge_id": bridge_id, "fingerprint": peer[0],
+                    "app_key": key,
+                    "name": clean(cfg.get("name") or "Hue Bridge"), "model": clean(cfg.get("modelid") or ""),
+                }
+                with self.lock:
+                    if not self.pairing_current(ip, generation):
+                        return
+                    save_config(config)
+                    self.conn_generation += 1
+                    self.rooms, self.light_count, self.on_count, self.pending = [], 0, 0, {}
+                    self.config, self.pair_ip, self.phase, self.error = config, "", "connecting", ""
+                self.wake.set()
+            elif (entry.get("error") or {}).get("type") == 101:
+                with self.lock:
+                    if self.pairing_current(ip, generation):
+                        self.error = ""  # link button not pressed yet: keep asking
+            else:
+                with self.lock:
+                    if not self.pairing_current(ip, generation):
+                        return
+                    kind = (entry.get("error") or {}).get("type")
+                    self.set_error("errPairFailed", "Pairing failed: %s",
+                                   "bridge error %d" % kind if type(kind) is int and 0 <= kind < 100000 else "bridge error")
+        except (OSError, socket.timeout, http.client.HTTPException, PinError, ValueError) as exc:
+            with self.lock:
+                if not self.pairing_current(ip, generation):
+                    return
+                self.set_error("errCannotReach", "Cannot reach %s (%s)", ip, self.safe(exc, 60))
+
+    # -- control commands
+    def queue(self, kind, rid, body):
+        with self.lock:
+            if not self.may_queue(kind, rid):
+                return
+            key = (kind, rid)
+            merged = dict(self.pending.get(key, {}))
+            merged.update(body)
+            self.pending[key] = merged
+            self.apply_optimistic(kind, rid, body)
+            self.refresh_hold_until = time.time() + 1.0
+        self.emit()
+        self.wake.set()
+
+    def all_off(self):
+        """Every room that is on, and every light in no room that is on: all commands queued at
+        once, the model updated in one pass, one snapshot and one wake-up (not one per light)."""
+        with self.lock:
+            items = []
+            for room in self.rooms:
+                if room["kind"] == "room" and room["on"] and valid_uuid(room["grouped_light"]):
+                    items.append(("grouped_light", room["grouped_light"]))
+                elif room["kind"] == "other":
+                    items += [("light", light["id"]) for light in room["lights"] if light["on"]]
+            if not items:
+                return
+            for key in items:
+                self.pending[key] = {**self.pending.get(key, {}), "on": {"on": False}}
+            groups = {rid for kind, rid in items if kind == "grouped_light"}
+            off = {rid for kind, rid in items if kind == "light"}
+            for room in self.rooms:
+                if room["grouped_light"] in groups:
+                    off.update(light["id"] for light in room["lights"])
+            for room in self.rooms:
+                for light in room["lights"]:
+                    if light["id"] in off:
+                        light["on"] = False
+                lit = sum(1 for light in room["lights"] if light["on"])
+                room["on_count"] = lit
+                room["on"] = bool(lit) and room["grouped_light"] not in groups
+            self.on_count = sum(1 for r in self.rooms if r["kind"] != "zone" for l in r["lights"] if l["on"])
+            self.refresh_hold_until = time.time() + 1.0
+        self.emit()
+        self.wake.set()
+
+    def apply_optimistic(self, kind, rid, body):
+        on = body.get("on", {}).get("on") if "on" in body else None
+        bri = body.get("dimming", {}).get("brightness") if "dimming" in body else None
+        for room in self.rooms:
+            targets = []
+            if kind == "grouped_light" and room["grouped_light"] == rid:
+                targets = room["lights"]
+                if on is not None:
+                    room["on"] = on
+                if bri is not None:
+                    room["bri"], room["on"] = bri, True
+            elif kind == "light":
+                targets = [l for l in room["lights"] if l["id"] == rid]
+            for light in targets:
+                if on is not None:
+                    light["on"] = on
+                if bri is not None:
+                    light["bri"], light["on"] = bri, True
+            if kind == "light" and targets:
+                lit = [l for l in room["lights"] if l["on"]]
+                room["on"], room["on_count"] = bool(lit), len(lit)
+                if lit and room["grouped_light"] == "":
+                    room["bri"] = round(sum(l["bri"] for l in lit) / len(lit), 1)
+            elif kind == "grouped_light" and targets:
+                room["on_count"] = sum(1 for l in room["lights"] if l["on"])
+        self.on_count = sum(1 for r in self.rooms if r["kind"] != "zone" for l in r["lights"] if l["on"])
+
+    def send_pending(self):
+        sent = False
+        now = time.time()
+        config, generation = self.connection()
+        with self.lock:
+            items = list(self.pending.items()) if config else []
+        for (kind, rid), body in items:
+            interval = GROUP_INTERVAL if kind == "grouped_light" else LIGHT_INTERVAL
+            if now - self.last_sent.get(kind, 0) < interval:
+                continue
+            with self.lock:
+                if not self.connection_current(generation):
+                    break   # Unpair, Pair or a relocation since the batch started
+                if self.pending.get((kind, rid)) is not body:
+                    continue
+                del self.pending[(kind, rid)]
+            try:
+                self.api("PUT", "/clip/v2/resource/%s/%s" % (kind, rid), body, config=config)
+            except BridgeError:
+                with self.lock:
+                    if self.connection_current(generation):
+                        self.set_error("errCommand", "Command failed (%s)", "bridge error")
+            except (OSError, PinError, PermissionError, socket.timeout, http.client.HTTPException) as exc:
+                with self.lock:
+                    if self.connection_current(generation):
+                        self.set_error("errCommand", "Command failed (%s)", self.safe(exc, 60))
+            self.last_sent[kind] = time.time()
+            sent = True
+        return sent
+
+    def handle(self, cmd):
+        name = cmd.get("cmd")
+        if name == "open":
+            self.panel_open = True
+            self.wake.set()
+        elif name == "closed":
+            self.panel_open = False
+        elif name == "refresh":
+            self.last_refresh = 0
+            self.wake.set()
+        elif name == "discover":
+            self.start_discovery()
+        elif name == "pair":
+            ip = str(cmd.get("ip", "")).strip()
+            if not valid_bridge_ip(ip):
+                with self.lock:
+                    self.set_error("errEnterIp", "Enter the bridge's local IPv4 address")
+                self.emit()
+                return
+            with self.lock:
+                self.pair_generation += 1
+                self.conn_generation += 1
+                self.pending = {}   # commands for the old connection are not sent any more
+                self.pair_ip, self.pair_until, self.phase, self.error = ip, time.time() + PAIR_WINDOW, "pairing", ""
+            self.emit()
+            self.wake.set()
+        elif name == "cancel_pair":
+            with self.lock:
+                self.pair_generation += 1
+                self.pair_ip, self.phase = "", ("connecting" if self.config else "unpaired")
+            self.emit()
+        elif name == "unpair":
+            # One lock for invalidating, deleting and clearing: try_pair validates and saves
+            # under it too, so no pairing reply can save a key between deletion and clearing.
+            with self.lock:
+                self.pair_generation += 1
+                self.conn_generation += 1
+                removed = remove_config()
+                self.pair_ip = ""
+                self.config, self.rooms, self.light_count, self.on_count = {}, [], 0, 0
+                self.phase, self.error, self.pending = "unpaired", "", {}
+                if not removed:
+                    # Otherwise the pairing would silently come back with the next start.
+                    self.set_error("errInternal", "Something went wrong (%s)",
+                                   "the saved pairing could not be deleted: " + CONFIG_PATH)
+            self.emit()
+            self.start_discovery()
+        elif name in ("light", "group") and self.config:
+            kind = "light" if name == "light" else "grouped_light"
+            rid = cmd.get("id")
+            if not valid_uuid(rid):
+                return
+            body = {}
+            if isinstance(cmd.get("on"), bool):
+                body["on"] = {"on": cmd["on"]}
+            bri = cmd.get("bri")
+            if isinstance(bri, (int, float)) and not isinstance(bri, bool):
+                bri = finite(bri, None, 1.0, 100.0)
+                if bri is None:
+                    return
+                body["dimming"] = {"brightness": round(bri, 1)}
+                body["on"] = {"on": True}
+            if body:
+                self.queue(kind, rid, body)
+        elif name == "all_off" and self.config:
+            self.all_off()
+        elif name == "scene" and self.config:
+            rid = cmd.get("id")
+            if valid_uuid(rid):
+                with self.lock:
+                    if not self.may_queue("scene", rid):
+                        return
+                    self.pending[("scene", rid)] = {"recall": {"action": "active"}}
+                    self.refresh_hold_until = 0
+                self.wake.set()
+
+    # -- loops
+    def worker(self):
+        """One round at a time. Whatever goes wrong in a round (a bridge reply of a shape
+        nobody expected) is shown as an error and the next round runs: the thread never dies
+        while the helper process stays up, which the extension could not notice."""
+        while True:
+            with self.lock:
+                generations = (self.pair_generation, self.conn_generation)
+            try:
+                self.work_once()
+            except Exception as exc:   # noqa: BLE001 - the loop must survive anything
+                with self.lock:
+                    # Not after Unpair, Cancel or a new Pair: the failure belonged to the old state.
+                    if generations == (self.pair_generation, self.conn_generation):
+                        self.set_error("errInternal", "Something went wrong (%s)", self.safe(exc, 60))
+                try:
+                    self.emit()
+                except OSError:
+                    return
+                time.sleep(2.0)
+
+    def work_once(self):
+        if self.pair_ip:
+            with self.lock:
+                expired = bool(self.pair_ip) and time.time() > self.pair_until   # a new Pair may have just started
+                if expired:
+                    self.pair_ip = ""
+                    self.phase = "connecting" if self.config else "unpaired"
+                    self.set_error("errNoPress", "No button press seen. Press the round button on the bridge, then try again.")
+            if not expired:
+                self.try_pair()
+            self.emit()
+            if self.pair_ip:
+                self.wake.wait(2.0)
+                self.wake.clear()
+            return
+        if self.send_pending():
+            with self.lock:
+                has_more = bool(self.pending)
+            if not has_more:
+                # Let the bridge settle, then show the real state.
+                self.last_refresh = time.time() - (POLL_OPEN if self.panel_open else POLL_CLOSED) + 1.2
+            return
+        with self.lock:
+            has_more = bool(self.pending)
+        if has_more:
+            time.sleep(0.05)
+            return
+        interval = POLL_OPEN if self.panel_open else POLL_CLOSED
+        if self.config and time.time() - self.last_refresh >= interval:
+            self.refresh()
+            self.emit()
+        elif not self.config and not self.candidates and not self.discovering and self.panel_open:
+            self.discover()
+        wait = max(0.05, interval - (time.time() - self.last_refresh)) if self.config else 5.0
+        self.wake.wait(wait)
+        self.wake.clear()
+
+    def run(self):
+        self.emit()
+        threading.Thread(target=self.worker, daemon=True).start()
+        for cmd in read_commands(sys.stdin.buffer):
+            try:
+                self.handle(cmd)
+            except Exception as exc:   # noqa: BLE001 - one bad command must not end the helper
+                with self.lock:
+                    self.set_error("errInternal", "Something went wrong (%s)", self.safe(exc, 60))
+                self.emit()
+
+
+def _terminate(signum, _frame):
+    sys.exit(128 + signum)   # unwinds the main thread; atexit then ends the children
+
+
+def main():
+    atexit.register(kill_children)
+    signal.signal(signal.SIGTERM, _terminate)
+    if "--once" in sys.argv:
+        hue = Hue()
+        hue.refresh()
+        print(json.dumps(hue.snapshot(), indent=1))
+        return
+    try:
+        Hue().run()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+
+
+if __name__ == "__main__":
+    main()
