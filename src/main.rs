@@ -31,9 +31,9 @@ use cosmic::{Element, theme};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-const APP_ID: &str = "io.github.ubruckhaus.CosmicHueLights";
+const APP_ID: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights";
 static AUTOSIZE_ID: LazyLock<Id> = LazyLock::new(|| Id::new("hue-lights-autosize"));
-static BULB_ON: &[u8] = include_bytes!("../data/icons/io.github.ubruckhaus.CosmicHueLights-symbolic.svg");
+static BULB_ON: &[u8] = include_bytes!("../data/icons/io.github.ubruckhaus.CosmicMaprismaHueLights-symbolic.svg");
 static BULB_OFF: &[u8] = include_bytes!("../data/icons/hue-bulb-off-symbolic.svg");
 
 const RESTART_DELAY: Duration = Duration::from_secs(5); // before a helper that exited starts again
@@ -375,7 +375,7 @@ impl HueLights {
         let mut hero = icon::icon(bulb(lit)).size(32);
         hero = if lit { hero.class(tinted_svg(LIT)) } else { hero.opacity(0.6) };
         let meta = if self.paired() { bridge_text(&self.stats) } else { "No bridge paired".into() };
-        let mut header = row![hero, column![text::title4("Hue Lights"), dim(meta)].spacing(2), space::horizontal()]
+        let mut header = row![hero, column![text::title4("Maprisma Hue Lights"), dim(meta)].spacing(2), space::horizontal()]
             .spacing(12)
             .align_y(Alignment::Center);
         if self.phase() == "ok" {
@@ -787,7 +787,7 @@ impl cosmic::Application for HueLights {
 
 // ------------------------------------------------------------------------- helper process
 
-// Next to the binary (installed: ../share/cosmic-hue-lights/scripts), or in the
+// Next to the binary (installed: ../share/maprisma-hue-lights/scripts), or in the
 // data home; HUE_LIGHTS_SCRIPTS wins (development).
 fn script_path() -> Option<PathBuf> {
     let name = "hue-lights.py";
@@ -798,15 +798,15 @@ fn script_path() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(bin) = exe.parent()
     {
-        dirs.push(bin.join("../share/cosmic-hue-lights/scripts"));
+        dirs.push(bin.join("../share/maprisma-hue-lights/scripts"));
     }
     let data_home = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
     if let Some(data) = data_home {
-        dirs.push(data.join("cosmic-hue-lights/scripts"));
+        dirs.push(data.join("maprisma-hue-lights/scripts"));
     }
-    dirs.push("/usr/share/cosmic-hue-lights/scripts".into());
+    dirs.push("/usr/share/maprisma-hue-lights/scripts".into());
     dirs.into_iter().map(|d| d.join(name)).find(|p| p.is_file())
 }
 

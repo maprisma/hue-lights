@@ -1,12 +1,12 @@
 [Desktop Entry]
-Name=Hue Lights
+Name=Maprisma Hue Lights
 Comment=Philips Hue rooms, zones, lights and scenes in the panel
 Type=Application
-Exec=cosmic-hue-lights
+Exec=maprisma-hue-lights
 Terminal=false
 Categories=COSMIC;
 Keywords=COSMIC;Applet;Hue;Philips;Lights;
-Icon=io.github.ubruckhaus.CosmicHueLights-symbolic
+Icon=io.github.ubruckhaus.CosmicMaprismaHueLights-symbolic
 NoDisplay=true
 X-CosmicApplet=true
 X-HostWaylandDisplay=true

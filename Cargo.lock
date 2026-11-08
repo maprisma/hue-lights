@@ -1015,15 +1015,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cosmic-hue-lights"
-version = "0.1.0"
-dependencies = [
- "libcosmic",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "cosmic-launch"
 version = "0.1.0"
 source = "git+https://github.com/pop-os/libcosmic?rev=95236a944bfd51c63a2fc65fe50a592c47168d40#95236a944bfd51c63a2fc65fe50a592c47168d40"
@@ -3221,6 +3212,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62bb907fe88d54d8d9ce32a3cceab4218ed2f6b7d35617cafe9adf84e43919cb"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "maprisma-hue-lights"
+version = "0.1.0"
+dependencies = [
+ "libcosmic",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

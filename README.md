@@ -1,4 +1,4 @@
-# Hue Lights for COSMIC
+# Maprisma Hue Lights for COSMIC
 
 A native COSMIC panel applet (Rust/libcosmic) for Philips Hue: rooms, zones, lights and
 scenes. Port of the GNOME extension [gnome-hue-lights](../gnome-hue-lights), itself a port
