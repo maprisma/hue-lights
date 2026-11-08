@@ -9,7 +9,7 @@
 // in ~/.config/hue-lights/config.json and never reaches this process.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use maprisma_hue_lights::{script_path, TITLE, WINDOW_BUS};
 use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -31,6 +31,16 @@ use cosmic::{Element, theme};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+// Window controls also work for windows launched independently of the tray.
+static WINDOW_ACTION: LazyLock<tokio::sync::watch::Sender<Option<bool>>> = LazyLock::new(|| tokio::sync::watch::channel(None).0);
+struct WindowControl;
+#[zbus::interface(name = "io.github.ubruckhaus.HueLights.Window")]
+impl WindowControl {
+    fn close(&self) { let _ = WINDOW_ACTION.send_replace(Some(false)); }
+    fn show(&self) { let _ = WINDOW_ACTION.send_replace(Some(true)); }
+}
+
+// The installed desktop entry for this Wayland app ID supplies the window icon.
 const APP_ID: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights";
 static AUTOSIZE_ID: LazyLock<Id> = LazyLock::new(|| Id::new("hue-lights-autosize"));
 static BULB_ON: &[u8] = include_bytes!("../data/icons/io.github.ubruckhaus.CosmicMaprismaHueLights-symbolic.svg");
@@ -45,7 +55,20 @@ const LIT: Color = Color::from_rgb(0x33 as f32 / 255.0, 0xd1 as f32 / 255.0, 0x7
 const WARM: Color = Color::from_rgb(1.0, 0xd2 as f32 / 255.0, 0x7a as f32 / 255.0);
 
 fn main() -> cosmic::iced::Result {
-    cosmic::applet::run::<HueLights>(())
+    if std::env::args().any(|arg| arg == "--window") {
+        let runtime = tokio::runtime::Runtime::new().expect("window D-Bus runtime");
+        let connection = runtime.block_on(async {
+            let c = zbus::connection::Builder::session()?.serve_at("/Window", WindowControl)?.build().await?;
+            c.request_name_with_flags(WINDOW_BUS, zbus::fdo::RequestNameFlags::DoNotQueue.into()).await?;
+            Ok::<_, zbus::Error>(c)
+        });
+        let _connection = match connection { Ok(c) => c, Err(e) => { eprintln!("Window unavailable or already open: {e}"); return Ok(()); } };
+        cosmic::app::run::<HueLights>(cosmic::app::Settings::default()
+            .size(cosmic::iced::Size::new(POPUP_WIDTH, 650.0))
+            .resizable(Some(8.0)).exit_on_close(true).is_daemon(false), true)
+    } else {
+        cosmic::applet::run::<HueLights>(false)
+    }
 }
 
 // ------------------------------------------------------------------------- data
@@ -254,6 +277,7 @@ fn bulb(on: bool) -> icon::Handle {
 #[derive(Default)]
 struct HueLights {
     core: Core,
+    window_mode: bool,
     popup: Option<window::Id>,
     rectangle: Rectangle,
     tracker: Option<RectangleTracker<u32>>,
@@ -272,6 +296,8 @@ enum Message {
     Helper(mpsc::UnboundedSender<String>),
     Stats(Value),
     TogglePopup,
+    Quit,
+    Show,
     CloseRequested(window::Id),
     Rectangle(RectangleUpdate<u32>),
     Expand(String),
@@ -348,14 +374,7 @@ impl HueLights {
     }
 
     fn summary(&self) -> String {
-        match self.phase() {
-            "unpaired" | "pairing" => "No bridge paired yet: click to pair".into(),
-            "error" => match s(&self.stats, "error") {
-                "" => "Bridge not reachable".into(),
-                e => e.to_string(),
-            },
-            _ => format!("{} of {} on", self.on_count(), num(&self.stats, "light_count")),
-        }
+        maprisma_hue_lights::summary(&self.stats)
     }
 
     fn panel_content(&self) -> Element<'_, Message> {
@@ -592,6 +611,18 @@ impl HueLights {
         content.into()
     }
 
+    fn popup_content(&self) -> Element<'_, Message> {
+        let content = column![padded_control(self.details()).padding([12, 16]), self.actions()]
+            .width(if self.window_mode { Length::Fill } else { Length::Fixed(POPUP_WIDTH) })
+            .padding([0, 0, 8, 0]);
+        if self.window_mode {
+            // Keep every action reachable when the normal window is resized smaller.
+            scrollable(content).height(Length::Fill).into()
+        } else {
+            content.into()
+        }
+    }
+
     fn actions(&self) -> Element<'_, Message> {
         if !self.paired() {
             return space::vertical().height(Length::Fixed(0.0)).into();
@@ -617,7 +648,7 @@ impl HueLights {
 
 impl cosmic::Application for HueLights {
     type Executor = cosmic::SingleThreadExecutor;
-    type Flags = ();
+    type Flags = bool;
     type Message = Message;
     const APP_ID: &'static str = APP_ID;
 
@@ -629,8 +660,10 @@ impl cosmic::Application for HueLights {
         &mut self.core
     }
 
-    fn init(core: Core, _flags: ()) -> (Self, Task<Message>) {
-        (Self { core, ..Default::default() }, Task::none())
+    fn init(mut core: Core, window_mode: bool) -> (Self, Task<Message>) {
+        if window_mode { core.set_header_title(TITLE.into()); }
+        let title = if window_mode { core.set_title(core.main_window_id(), TITLE.into()) } else { Task::none() };
+        (Self { core, window_mode, ..Default::default() }, title)
     }
 
     fn on_close_requested(&self, id: window::Id) -> Option<Message> {
@@ -638,8 +671,22 @@ impl cosmic::Application for HueLights {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch(vec![
-            rectangle_tracker_subscription(0).map(|update| Message::Rectangle(update.1)),
+        let close = if self.window_mode {
+            Subscription::run_with("window-close", |_| stream::channel(1, |mut output: mpsc::Sender<Message>| async move {
+                let mut rx = WINDOW_ACTION.subscribe();
+                loop {
+                    let action = *rx.borrow_and_update();
+                    if let Some(show) = action {
+                        let _ = output.send(if show { Message::Show } else { Message::Quit }).await;
+                    }
+                    if rx.changed().await.is_err() { break; }
+                }
+            }))
+        } else { Subscription::none() };
+        let rectangles = if self.window_mode { Subscription::none() } else {
+            rectangle_tracker_subscription(0).map(|update| Message::Rectangle(update.1))
+        };
+        Subscription::batch(vec![close, rectangles,
             Subscription::run_with("hue-lights-helper", |_| {
                 stream::channel(8, |mut output| async move {
                     run_helper(&mut output).await;
@@ -650,9 +697,15 @@ impl cosmic::Application for HueLights {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::Show => {
+                if let Some(id) = self.core.main_window_id() {
+                    return Task::batch([window::set_mode(id, window::Mode::Windowed), window::gain_focus(id)]);
+                }
+            }
+            Message::Quit => return cosmic::iced::exit(),
             Message::Helper(sender) => {
                 self.helper = Some(sender);
-                if self.popup.is_some() {
+                if self.window_mode || self.popup.is_some() {
                     self.send(json!({"cmd": "open"}));
                 }
             }
@@ -667,6 +720,7 @@ impl cosmic::Application for HueLights {
                 RectangleUpdate::Init(tracker) => self.tracker = Some(tracker),
             },
             Message::CloseRequested(id) => {
+                if self.window_mode { return cosmic::iced::exit(); }
                 if self.popup == Some(id) {
                     self.popup = None;
                     self.confirm_unpair = false;
@@ -674,6 +728,7 @@ impl cosmic::Application for HueLights {
                 }
             }
             Message::TogglePopup => {
+                if self.window_mode { return Task::none(); }
                 if let Some(popup) = self.popup.take() {
                     self.confirm_unpair = false;
                     self.send(json!({"cmd": "closed"}));
@@ -757,6 +812,7 @@ impl cosmic::Application for HueLights {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        if self.window_mode { return self.popup_content(); }
         let horizontal = matches!(self.core.applet.anchor, PanelAnchor::Top | PanelAnchor::Bottom);
         let padding = self.core.applet.suggested_padding(true).0;
         let button = button::custom(self.panel_content())
@@ -774,41 +830,16 @@ impl cosmic::Application for HueLights {
     }
 
     fn view_window(&self, _id: window::Id) -> Element<'_, Message> {
-        let content = column![padded_control(self.details()).padding([12, 16]), self.actions()]
-            .width(Length::Fixed(POPUP_WIDTH))
-            .padding([0, 0, 8, 0]);
-        self.core.applet.popup_container(content).into()
+        if self.window_mode { return self.popup_content(); }
+        self.core.applet.popup_container(self.popup_content()).into()
     }
 
     fn style(&self) -> Option<cosmic::iced::theme::Style> {
-        Some(cosmic::applet::style())
+        if self.window_mode { None } else { Some(cosmic::applet::style()) }
     }
 }
 
 // ------------------------------------------------------------------------- helper process
-
-// Next to the binary (installed: ../share/maprisma-hue-lights/scripts), or in the
-// data home; HUE_LIGHTS_SCRIPTS wins (development).
-fn script_path() -> Option<PathBuf> {
-    let name = "hue-lights.py";
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = std::env::var_os("HUE_LIGHTS_SCRIPTS") {
-        dirs.push(dir.into());
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(bin) = exe.parent()
-    {
-        dirs.push(bin.join("../share/maprisma-hue-lights/scripts"));
-    }
-    let data_home = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
-    if let Some(data) = data_home {
-        dirs.push(data.join("maprisma-hue-lights/scripts"));
-    }
-    dirs.push("/usr/share/maprisma-hue-lights/scripts".into());
-    dirs.into_iter().map(|d| d.join(name)).find(|p| p.is_file())
-}
 
 // Runs the helper: hands the app a sender for commands (one JSON per line), streams
 // its snapshots, and starts it again RESTART_DELAY after it exits.

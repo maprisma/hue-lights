@@ -13,9 +13,51 @@ bin="$HOME/.local/bin"
 
 cargo build --release
 install -Dm755 target/release/maprisma-hue-lights "$bin/maprisma-hue-lights"
+install -Dm755 target/release/maprisma-hue-lights-tray "$bin/maprisma-hue-lights-tray"
+# Desktop Exec has two escaping layers: argument quoting, then string-value escaping.
+desktop_exec() {
+    local v=$1
+    v=${v//\\/\\\\}
+    v=${v//\"/\\\"}
+    v=${v//\`/\\\`}
+    v=${v//\$/\\\$}
+    v=${v//\%/%%}
+    v=${v//\\/\\\\}
+    printf '"%s"' "$v"
+}
+mkdir -p "$data/applications" "${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+window_exec="$(desktop_exec "$bin/maprisma-hue-lights") --window"
+tray_exec="$(desktop_exec "$bin/maprisma-hue-lights-tray")"
+cat > "$data/applications/$id.Window.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Maprisma Hue Lights
+Comment=Philips Hue rooms, zones, lights and scenes
+Exec=$window_exec
+Icon=$id-symbolic
+Terminal=false
+NoDisplay=false
+Categories=Utility;
+StartupWMClass=$id
+EOF
+cat > "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$id.Tray.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Maprisma Hue Lights Tray
+Exec=$tray_exec
+Icon=$id-symbolic
+Terminal=false
+OnlyShowIn=KDE;
+EOF
 install -Dm644 scripts/hue-lights.py "$data/maprisma-hue-lights/scripts/hue-lights.py"
 install -Dm644 "data/icons/$id-symbolic.svg" "$data/icons/hicolor/scalable/apps/$id-symbolic.svg"
 # The panel starts applets without ~/.local/bin in PATH: the full path.
-sed "s|^Exec=.*|Exec=$bin/maprisma-hue-lights|" "data/$id.desktop" > "$data/applications/$id.desktop"
+while IFS= read -r line; do
+    if [[ $line == Exec=* ]]; then
+        printf 'Exec=%s\n' "$(desktop_exec "$bin/maprisma-hue-lights")"
+    else
+        printf '%s\n' "$line"
+    fi
+done < "data/$id.desktop" > "$data/applications/$id.desktop"
 gtk-update-icon-cache -q -t "$data/icons/hicolor" 2>/dev/null || true
 echo "Installed. Add “Maprisma Hue Lights” in COSMIC Settings › Desktop › Panel › Applets."

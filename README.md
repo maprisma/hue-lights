@@ -34,3 +34,26 @@ env -u DISPLAY -u WAYLAND_DISPLAY python3 -m unittest discover -s tests
 ```
 
 None of the tests talks to a real bridge.
+
+## KDE Plasma
+
+On KDE Plasma 6.8 (Wayland), run `./install.sh`, then open **Maprisma Hue Lights**
+from the launcher, or run `~/.local/bin/maprisma-hue-lights --window`. The normal,
+resizable window has the same controls as the COSMIC popup, including pairing,
+rooms, zones, individual lights, scenes and refresh. Only one window runs per session.
+
+The installer also installs `maprisma-hue-lights-tray` and a KDE-only autostart entry
+(`~/.config/autostart/io.github.ubruckhaus.CosmicMaprismaHueLights.Tray.desktop`).
+Start the tray manually once, or log out and back in. Left click toggles the window;
+the menu offers **Open Maprisma Hue Lights** and **Quit tray**. Quitting the tray
+leaves an open window running. The tooltip uses the same bridge helper and status
+text as the COSMIC panel, polling at the helper's inexpensive closed-popup rate
+(20 seconds). The tray reconnects when Plasma's StatusNotifierWatcher restarts.
+COSMIC continues to use the existing panel applet without `--window`.
+
+Rust checks (no bridge required):
+
+```sh
+cargo test
+cargo build --release --offline
+```
