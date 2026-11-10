@@ -400,13 +400,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
-    let monitor_task = tokio::spawn(monitor(state, connection.clone()));
-    while let Some(action) = rx.recv().await {
+    let monitor_task = tokio::spawn(monitor(state.clone(), connection.clone()));
+    let mut language = maprisma_hue_lights::i18n::setting();
+    let mut refresh = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        let action = tokio::select! {
+            action = rx.recv() => match action { Some(a) => a, None => break },
+            _ = refresh.tick() => {
+                let current = maprisma_hue_lights::i18n::setting();
+                if current != language {
+                    language = current;
+                    let mut s = state.lock().await;
+                    s.menu = model::menu();
+                    s.revision += 1;
+                    let _ = Menu::layout_updated(&SignalEmitter::new(&connection, "/MenuBar")?, s.revision, 0).await;
+                    let _ = Tray::new_tool_tip(&SignalEmitter::new(&connection, "/StatusNotifierItem")?).await;
+                }
+                continue;
+            }
+        };
         if action == Action::Quit {
             monitor_task.abort();
             return Ok(());
         }
-        execute(&connection, action).await;
+        if let Action::Language(i) = action {
+            if let Some((code, _)) = maprisma_hue_lights::i18n::choices().get(i) {
+                if maprisma_hue_lights::i18n::save(code).is_ok() {
+                    language = code.clone();
+                    let mut s = state.lock().await;
+                    s.menu = model::menu();
+                    s.revision += 1;
+                    let _ = Menu::layout_updated(&SignalEmitter::new(&connection, "/MenuBar")?, s.revision, 0).await;
+                    let _ = Tray::new_tool_tip(&SignalEmitter::new(&connection, "/StatusNotifierItem")?).await;
+                } else {
+                    let mut s = state.lock().await;
+                    s.menu = model::menu_error();
+                    s.revision += 1;
+                    let _ = Menu::layout_updated(&SignalEmitter::new(&connection, "/MenuBar")?, s.revision, 0).await;
+                }
+            }
+        } else { execute(&connection, action).await; }
     }
     Ok(())
 }

@@ -8,6 +8,7 @@
 // It talks only to the bridge on the LAN, over pinned HTTPS; its app key stays
 // in ~/.config/hue-lights/config.json and never reaches this process.
 
+use maprisma_hue_lights::i18n::{tr, trf};
 use std::collections::{HashMap, HashSet};
 use maprisma_hue_lights::{script_path, TITLE, WINDOW_BUS};
 use std::process::Stdio;
@@ -116,7 +117,7 @@ fn room_key(room: &Value) -> String {
 }
 
 fn room_name(room: &Value) -> String {
-    if s(room, "kind") == "other" { "Other lights".into() } else { s(room, "name").to_string() }
+    if s(room, "kind") == "other" { tr("Other lights") } else { s(room, "name").to_string() }
 }
 
 // Room type (Hue archetype) to an icon. Many rooms keep the Hue app's default
@@ -164,18 +165,18 @@ fn room_status(room: &Value) -> String {
     let total = lights.len();
     let mut parts: Vec<String> = Vec::new();
     if s(room, "kind") == "zone" {
-        parts.push("Zone".into());
+        parts.push(tr("Zone"));
     }
     if flag(room, "on") {
-        parts.push(format!("{} of {total} on", num(room, "on_count")));
+        parts.push(trf("{0} of {1} on", &[num(room, "on_count").to_string(), total.to_string()]));
     } else if total == 1 {
-        parts.push("Off · 1 light".into());
+        parts.push(tr("Off · 1 light"));
     } else {
-        parts.push(format!("Off · {total} lights"));
+        parts.push(trf("Off · {0} lights", &[total.to_string()]));
     }
     let unreachable = lights.iter().filter(|l| l.get("reachable").and_then(Value::as_bool) == Some(false)).count();
     if unreachable > 0 {
-        parts.push(format!("{unreachable} unreachable"));
+        parts.push(trf("{0} unreachable", &[unreachable.to_string()]));
     }
     parts.join(" · ")
 }
@@ -289,6 +290,7 @@ struct HueLights {
     dragging: HashMap<String, (u8, Instant)>,
     ip: String,
     confirm_unpair: bool,
+    language_error: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +317,7 @@ enum Message {
     Discover,
     CancelPair,
     Unpair,
+    Language(String),
 }
 
 impl HueLights {
@@ -343,7 +346,7 @@ impl HueLights {
         list(&self.stats, "rooms").iter().find(|r| room_key(r) == key)
     }
 
-    // Rooms with a grouped light are switched with one bridge command; "Other lights" per light.
+    // Rooms with a grouped light are switched with one bridge command; tr("Other lights") per light.
     fn set_room(&self, key: &str, field: &str, value: Value) {
         let Some(room) = self.room(key) else { return };
         let grouped = s(room, "grouped_light");
@@ -393,12 +396,12 @@ impl HueLights {
         let lit = self.on_count() > 0.0;
         let mut hero = icon::icon(bulb(lit)).size(32);
         hero = if lit { hero.class(tinted_svg(LIT)) } else { hero.opacity(0.6) };
-        let meta = if self.paired() { bridge_text(&self.stats) } else { "No bridge paired".into() };
-        let mut header = row![hero, column![text::title4("Maprisma Hue Lights"), dim(meta)].spacing(2), space::horizontal()]
+        let meta = if self.paired() { bridge_text(&self.stats) } else { tr("No bridge paired") };
+        let mut header = row![hero, column![text::title4(tr("Maprisma Hue Lights")), dim(meta)].spacing(2), space::horizontal()]
             .spacing(12)
             .align_y(Alignment::Center);
         if self.phase() == "ok" {
-            let pill = format!("{} of {} on", self.on_count(), num(&self.stats, "light_count"));
+            let pill = trf("{0} of {1} on", &[self.on_count().to_string(), num(&self.stats, "light_count").to_string()]);
             header = header.push(container(text::caption(pill)).padding([2, 10]).class(pill_style()));
         }
         header.into()
@@ -407,17 +410,13 @@ impl HueLights {
     fn pairing(&self) -> Element<'_, Message> {
         let stats = &self.stats;
         let pairing = self.phase() == "pairing";
-        let mut content = column![text::heading("Pair a Hue bridge")].spacing(8);
+        let mut content = column![text::heading(tr("Pair a Hue bridge"))].spacing(8);
         if pairing {
-            content = content.push(text::body(format!(
-                "Press the round link button on top of the bridge now. Waiting {} s for {} …",
-                num(stats, "pair_remaining"),
-                s(stats, "pair_ip")
-            )));
-            content = content.push(button::standard("Cancel").on_press(Message::CancelPair));
+            content = content.push(text::body(trf("Press the round link button on top of the bridge now. Waiting {0} s for {1} …", &[num(stats, "pair_remaining").to_string(), s(stats, "pair_ip").to_string()])));
+            content = content.push(button::standard(tr("Cancel")).on_press(Message::CancelPair));
             return content.into();
         }
-        content = content.push(dim("Click Pair, then press the round link button on top of the bridge within 30 seconds."));
+        content = content.push(dim(tr("Click Pair, then press the round link button on top of the bridge within 30 seconds.")));
         let candidates = list(stats, "candidates");
         for candidate in candidates {
             let name = match s(candidate, "name") {
@@ -429,7 +428,7 @@ impl HueLights {
                 row![
                     text::body(format!("{name}  ·  {ip}")),
                     space::horizontal(),
-                    button::suggested("Pair").on_press(Message::Pair(ip))
+                    button::suggested(tr("Pair")).on_press(Message::Pair(ip))
                 ]
                 .align_y(Alignment::Center),
             );
@@ -437,24 +436,24 @@ impl HueLights {
         let discovering = flag(stats, "discovering");
         if candidates.is_empty() {
             content = content.push(dim(if discovering {
-                "Searching the network for Hue bridges …"
+                tr("Searching the network for Hue bridges …")
             } else {
-                "No bridge found automatically. Enter its IP address:"
+                tr("No bridge found automatically. Enter its IP address:")
             }));
         }
         let ip = self.ip.trim().to_string();
         content = content.push(
             row![
-                text_input("Bridge IP, e.g. 192.168.1.50", &self.ip)
+                text_input(tr("Bridge IP, e.g. 192.168.178.106"), &self.ip)
                     .on_input(Message::Ip)
                     .on_submit(|value: String| Message::Pair(value.trim().to_string()))
                     .width(Length::Fill),
-                button::standard("Pair").on_press_maybe((!ip.is_empty()).then_some(Message::Pair(ip)))
+                button::standard(tr("Pair")).on_press_maybe((!ip.is_empty()).then_some(Message::Pair(ip)))
             ]
             .spacing(8)
             .align_y(Alignment::Center),
         );
-        content = content.push(button::standard("Search again").on_press_maybe((!discovering).then_some(Message::Discover)));
+        content = content.push(button::standard(tr("Search again")).on_press_maybe((!discovering).then_some(Message::Discover)));
         content.into()
     }
 
@@ -540,7 +539,7 @@ impl HueLights {
                     .collect();
                 if scenes.len() > SCENE_LIMIT {
                     let shown = pills.len();
-                    let label = if all { "less".to_string() } else { format!("+{} more", scenes.len() - shown) };
+                    let label = if all { tr("less").to_string() } else { trf("+{0} more", &[(scenes.len() - shown).to_string()]) };
                     pills.push(button::text(label).on_press(Message::AllScenes(key.clone())).into());
                 }
                 card_content =
@@ -557,7 +556,7 @@ impl HueLights {
         let c = color(light.get("color").unwrap_or(&Value::Null));
         let mut name = s(light, "name").to_string();
         if !reachable {
-            name += " · unreachable";
+            name += &format!(" · {}", tr("unreachable"));
         }
         let name: Element<Message> = if on && reachable { text::body(name).into() } else { dim(name) };
         let mut line = row![swatch(on.then_some(c), reachable), container(name).width(Length::Fill)]
@@ -583,7 +582,7 @@ impl HueLights {
         let mut content = column![self.header()].spacing(10);
         let error = s(&self.stats, "error");
         if !error.is_empty() {
-            content = content.push(error_text(error.to_string()));
+            content = content.push(error_text(maprisma_hue_lights::i18n::error(&self.stats)));
         }
         if !self.paired() {
             content = content.push(divider::horizontal::default());
@@ -594,9 +593,9 @@ impl HueLights {
         let rooms = list(&self.stats, "rooms");
         if rooms.is_empty() {
             content = content.push(dim(if self.phase() == "ok" {
-                "No lights on this bridge yet."
+                tr("No lights on this bridge yet.")
             } else {
-                "Connecting to the bridge …"
+                tr("Connecting to the bridge …")
             }));
             return content.into();
         }
@@ -612,7 +611,13 @@ impl HueLights {
     }
 
     fn popup_content(&self) -> Element<'_, Message> {
-        let content = column![padded_control(self.details()).padding([12, 16]), self.actions()]
+        let choices = maprisma_hue_lights::i18n::choices();
+        let selected = choices.iter().position(|(code, _)| code == &maprisma_hue_lights::i18n::setting());
+        let labels: Vec<String> = choices.iter().map(|(_, label)| label.clone()).collect();
+        let mut language_content = column![].spacing(4);
+        if self.language_error { language_content = language_content.push(error_text(tr("Could not save language setting."))); }
+        let language = row![text::body(tr("Language")), cosmic::widget::dropdown(labels, selected, move |i| Message::Language(choices[i].0.clone()))].spacing(8);
+        let content = column![padded_control(self.details()).padding([12, 16]), padded_control(language_content.push(language)), self.actions()]
             .width(if self.window_mode { Length::Fill } else { Length::Fixed(POPUP_WIDTH) })
             .padding([0, 0, 8, 0]);
         if self.window_mode {
@@ -628,16 +633,16 @@ impl HueLights {
             return space::vertical().height(Length::Fixed(0.0)).into();
         }
         let unpair = if self.confirm_unpair {
-            button::destructive("Really unpair?").on_press(Message::Unpair)
+            button::destructive(tr("Really unpair?")).on_press(Message::Unpair)
         } else {
-            button::text("Unpair").on_press(Message::Unpair)
+            button::text(tr("Unpair")).on_press(Message::Unpair)
         };
         column![
             divider::horizontal::default(),
-            menu_button(text::body("All off")).on_press_maybe((self.on_count() > 0.0).then_some(Message::AllOff)),
-            menu_button(text::body("Refresh")).on_press(Message::Refresh),
+            menu_button(text::body(tr("All off"))).on_press_maybe((self.on_count() > 0.0).then_some(Message::AllOff)),
+            menu_button(text::body(tr("Refresh"))).on_press(Message::Refresh),
             padded_control(
-                row![dim("Bridge"), text::caption(bridge_text(&self.stats)), space::horizontal(), unpair]
+                row![dim(tr("Bridge")), text::caption(bridge_text(&self.stats)), space::horizontal(), unpair]
                     .spacing(10)
                     .align_y(Alignment::Center)
             ),
@@ -799,6 +804,9 @@ impl cosmic::Application for HueLights {
             }
             Message::Discover => self.send(json!({"cmd": "discover"})),
             Message::CancelPair => self.send(json!({"cmd": "cancel_pair"})),
+            Message::Language(code) => {
+                self.language_error = maprisma_hue_lights::i18n::save(&code).is_err();
+            }
             Message::Unpair => {
                 if self.confirm_unpair {
                     self.confirm_unpair = false;

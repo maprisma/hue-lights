@@ -1,3 +1,5 @@
+pub mod i18n;
+use i18n::{tr, trf};
 use serde_json::Value;
 use std::path::PathBuf;
 pub const TITLE: &str = "Maprisma Hue Lights";
@@ -26,16 +28,12 @@ pub fn script_path() -> Option<PathBuf> {
 
 pub fn summary(stats: &Value) -> String {
     match stats["phase"].as_str().unwrap_or("") {
-        "unpaired" | "pairing" => "No bridge paired yet: click to pair".into(),
+        "unpaired" | "pairing" => tr("No bridge paired yet: click to pair"),
         "error" => match stats["error"].as_str().unwrap_or("") {
-            "" => "Bridge not reachable".into(),
-            e => e.to_string(),
+            "" => tr("Bridge not reachable"),
+            _ => i18n::error(stats),
         },
-        _ => format!(
-            "{} of {} on",
-            number(stats, "on_count"),
-            number(stats, "light_count")
-        ),
+        _ => trf("{0} of {1} on", &[number(stats, "on_count").to_string(), number(stats, "light_count").to_string()]),
     }
 }
 fn number(v: &Value, k: &str) -> f64 {

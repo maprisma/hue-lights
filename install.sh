@@ -32,7 +32,21 @@ cat > "$data/applications/$id.Window.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Maprisma Hue Lights
-Comment=Philips Hue rooms, zones, lights and scenes
+Name[de]=Maprisma Hue Lights
+Comment[de]=Philips-Hue-Räume, Zonen, Lampen und Szenen in der Leiste
+Name[fr]=Maprisma Hue Lights
+Comment[fr]=Pièces, zones, lampes et scènes Philips Hue dans le panneau
+Name[es]=Maprisma Hue Lights
+Comment[es]=Habitaciones, zonas, luces y escenas Philips Hue en el panel
+Name[it]=Maprisma Hue Lights
+Comment[it]=Stanze, zone, luci e scene Philips Hue nel pannello
+Name[pt]=Maprisma Hue Lights
+Comment[pt]=Divisões, zonas, luzes e cenas Philips Hue no painel
+Name[nl]=Maprisma Hue Lights
+Comment[nl]=Philips Hue-kamers, zones, lampen en scènes in het paneel
+Name[pl]=Maprisma Hue Lights
+Comment[pl]=Pokoje, strefy, lampy i sceny Philips Hue w panelu
+Comment=Philips Hue rooms, zones, lights and scenes in the panel
 Exec=$window_exec
 Icon=$id-symbolic
 Terminal=false
@@ -44,6 +58,13 @@ cat > "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$id.Tray.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Maprisma Hue Lights Tray
+Name[de]=Maprisma Hue Lights – Tray
+Name[fr]=Maprisma Hue Lights – Zone de notification
+Name[es]=Maprisma Hue Lights – Bandeja
+Name[it]=Maprisma Hue Lights – Area di notifica
+Name[pt]=Maprisma Hue Lights – Bandeja
+Name[nl]=Maprisma Hue Lights – Systeemvak
+Name[pl]=Maprisma Hue Lights – Zasobnik
 Exec=$tray_exec
 Icon=$id-symbolic
 Terminal=false

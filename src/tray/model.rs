@@ -1,8 +1,10 @@
+use maprisma_hue_lights::i18n::{tr, choices};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Activate,
     Open,
     Quit,
+    Language(usize),
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Item {
@@ -36,10 +38,18 @@ pub fn menu() -> Item {
     };
     let mut root = item(0, "", None);
     root.children = vec![
-        item(1, "Open Maprisma Hue Lights", Some(Action::Open)),
-        item(2, "Quit tray", Some(Action::Quit)),
+        item(1, &tr("Open Maprisma Hue Lights"), Some(Action::Open)),
+        item(2, &tr("Quit tray"), Some(Action::Quit)),
     ];
+    let mut languages = item(3, &tr("Language"), None);
+    languages.children = choices().iter().enumerate().map(|(i, (_, label))| item(10 + i as i32, label, Some(Action::Language(i)))).collect();
+    root.children.push(languages);
     root
+}
+pub fn menu_error() -> Item {
+    let mut menu = menu();
+    menu.children.push(Item { id: 30, label: tr("Could not save language setting."), enabled: false, separator: false, children: vec![], action: None });
+    menu
 }
 #[cfg(test)]
 mod tests {
@@ -47,7 +57,7 @@ mod tests {
     #[test]
     fn menu_actions() {
         let m = menu();
-        assert_eq!(m.children.len(), 2);
+        assert_eq!(m.children.len(), 3);
         assert_eq!(m.find(1).unwrap().label, "Open Maprisma Hue Lights");
         assert_eq!(m.activate(1), Some(Action::Open));
         assert_eq!(m.activate(2), Some(Action::Quit));
