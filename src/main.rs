@@ -8,7 +8,8 @@
 // It talks only to the bridge on the LAN, over pinned HTTPS; its app key stays
 // in ~/.config/hue-lights/config.json and never reaches this process.
 
-use maprisma_hue_lights::i18n::{tr, trf};
+use maprisma_hue_lights::i18n::{tr, trf, read_pref, write_pref};
+use maprisma_hue_lights::{corners, shot};
 use std::collections::{HashMap, HashSet};
 use maprisma_hue_lights::{script_path, TITLE, WINDOW_BUS};
 use std::process::Stdio;
@@ -44,6 +45,9 @@ impl WindowControl {
 // The installed desktop entry for this Wayland app ID supplies the window icon.
 const APP_ID: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights";
 static AUTOSIZE_ID: LazyLock<Id> = LazyLock::new(|| Id::new("hue-lights-autosize"));
+static NOTE_ID: LazyLock<Id> = LazyLock::new(|| Id::new("hue-lights-shot-note"));
+// F12 pictures go to ~/Pictures/<this>/ (the app's name, the same in every language).
+const SHOT_FOLDER: &str = TITLE;
 static BULB_ON: &[u8] = include_bytes!("../data/icons/io.github.ubruckhaus.CosmicMaprismaHueLights-symbolic.svg");
 static BULB_OFF: &[u8] = include_bytes!("../data/icons/hue-bulb-off-symbolic.svg");
 
@@ -226,7 +230,7 @@ fn card(tint: Option<Color>) -> theme::Container<'static> {
         };
         iced_container::Style {
             background: Some(Background::Color(bg)),
-            border: Border { radius: 12.0.into(), width: 1.0, color: border },
+            border: Border { radius: corners::now().radius.into(), width: 1.0, color: border },
             ..Default::default()
         }
     })
@@ -237,7 +241,7 @@ fn badge(tint: Option<Color>) -> theme::Container<'static> {
         let bg = tint.unwrap_or_else(|| with_alpha(Color::from(theme.cosmic().on_bg_color()), 0.1));
         iced_container::Style {
             background: Some(Background::Color(bg)),
-            border: Border { radius: 16.0.into(), ..Default::default() },
+            border: Border { radius: corners::now().small.into(), ..Default::default() },
             ..Default::default()
         }
     })
@@ -246,7 +250,7 @@ fn badge(tint: Option<Color>) -> theme::Container<'static> {
 fn pill_style() -> theme::Container<'static> {
     theme::Container::custom(|theme: &cosmic::Theme| iced_container::Style {
         background: Some(Background::Color(with_alpha(Color::from(theme.cosmic().on_bg_color()), 0.12))),
-        border: Border { radius: 10.0.into(), ..Default::default() },
+        border: Border { radius: corners::now().pill.into(), ..Default::default() },
         ..Default::default()
     })
 }
@@ -260,7 +264,7 @@ fn swatch<'a>(c: Option<Color>, reachable: bool) -> Element<'a, Message> {
             let fill = c.map_or(with_alpha(base, 0.08), |c| with_alpha(c, if reachable { 1.0 } else { 0.4 }));
             iced_container::Style {
                 background: Some(Background::Color(fill)),
-                border: Border { radius: 6.0.into(), width: 1.0, color: with_alpha(base, 0.3) },
+                border: Border { radius: corners::now().small.into(), width: 1.0, color: with_alpha(base, 0.3) },
                 ..Default::default()
             }
         }))
@@ -291,6 +295,12 @@ struct HueLights {
     ip: String,
     confirm_unpair: bool,
     language_error: bool,
+    // F12: the note's state, whether a capture is on its way, the settings.
+    shot: shot::Phase,
+    capturing: bool,
+    shot_key: bool,
+    corners: String,
+    setting_error: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -318,6 +328,38 @@ enum Message {
     CancelPair,
     Unpair,
     Language(String),
+    ShotKey(window::Id),
+    Escape,
+    Captured(window::Screenshot),
+    ShotSaved(Result<shot::Saved, String>),
+    NoteInput(String),
+    NoteDone,
+    NoteSaved(Result<(), String>),
+    SetShotKey(bool),
+    Corners(String),
+}
+
+// Runs `work` on its own thread (saving must not hold up the popup) and answers with `done`.
+fn off_thread<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+    done: fn(Result<T, String>) -> Message,
+) -> Task<Message> {
+    let (sender, receiver) = cosmic::iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    Task::perform(receiver, move |result| {
+        cosmic::Action::App(done(result.unwrap_or_else(|_| Err("the file could not be written".into()))))
+    })
+}
+
+// Settings › F12 saves a screenshot (on unless switched off) and Corners, from config.json.
+fn shot_key_setting() -> bool {
+    read_pref("screenshot_key").and_then(|v| v.as_bool()).unwrap_or(true)
+}
+
+fn corners_setting() -> String {
+    corners::normalize(read_pref("corners").as_ref().and_then(Value::as_str).unwrap_or("")).to_string()
 }
 
 impl HueLights {
@@ -610,14 +652,92 @@ impl HueLights {
         content.into()
     }
 
+    // Done, Enter or the popup closing (keep: the note typed so far is saved), Esc (skip).
+    fn finish_note(&mut self, keep: bool) -> Task<Message> {
+        match std::mem::take(&mut self.shot) {
+            shot::Phase::Note { path, text, .. } => {
+                if keep && shot::note_text(&text).is_some() {
+                    // Busy until the note is written, so a new F12 cannot replace it.
+                    self.shot = shot::Phase::Noting;
+                    return off_thread(
+                        move || shot::save_note(&path, SHOT_FOLDER, &text).map(|_| ()).map_err(|e| e.to_string()),
+                        Message::NoteSaved,
+                    );
+                }
+            }
+            shot::Phase::Error(_) => {}
+            other => self.shot = other,
+        }
+        Task::none()
+    }
+
+    // A capture still on its way is dropped with its popup; a typed note is kept (saved).
+    fn popup_closed(&mut self) -> Task<Message> {
+        if std::mem::take(&mut self.capturing) && self.shot == shot::Phase::Busy {
+            self.shot = shot::Phase::Idle;
+        }
+        if matches!(self.shot, shot::Phase::Note { .. }) { self.finish_note(true) } else { Task::none() }
+    }
+
+    // After F12: "Screenshot saved", where, the optional note and Done (or the error and Done).
+    fn shot_overlay(&self) -> Option<Element<'_, Message>> {
+        let body: Element<Message> = match &self.shot {
+            shot::Phase::Note { shown, text: note, .. } => column![
+                text::heading(tr("Screenshot saved")),
+                dim(trf("Saved as {0}", &[shown.clone()])),
+                text_input(tr("What is wrong? (optional)"), note.as_str())
+                    .id(NOTE_ID.clone())
+                    .on_input(Message::NoteInput)
+                    .on_submit(|_| Message::NoteDone),
+                row![space::horizontal().width(Length::Fill), button::suggested(tr("Done")).on_press(Message::NoteDone)],
+            ]
+            .spacing(10)
+            .into(),
+            shot::Phase::Error(reason) => column![
+                text::body(reason.clone()),
+                row![space::horizontal().width(Length::Fill), button::suggested(tr("Done")).on_press(Message::NoteDone)],
+            ]
+            .spacing(10)
+            .into(),
+            _ => return None,
+        };
+        let card = container(body).padding(16).width(Length::Fill).class(theme::Container::Card);
+        let card = container(card).padding(12).width(if self.window_mode { Length::Fill } else { Length::Fixed(POPUP_WIDTH) });
+        Some(card.into())
+    }
+
     fn popup_content(&self) -> Element<'_, Message> {
+        if let Some(overlay) = self.shot_overlay() {
+            return overlay;
+        }
         let choices = maprisma_hue_lights::i18n::choices();
         let selected = choices.iter().position(|(code, _)| code == &maprisma_hue_lights::i18n::setting());
         let labels: Vec<String> = choices.iter().map(|(_, label)| label.clone()).collect();
         let mut language_content = column![].spacing(4);
         if self.language_error { language_content = language_content.push(error_text(tr("Could not save language setting."))); }
         let language = row![text::body(tr("Language")), cosmic::widget::dropdown(labels, selected, move |i| Message::Language(choices[i].0.clone()))].spacing(8);
-        let content = column![padded_control(self.details()).padding([12, 16]), padded_control(language_content.push(language)), self.actions()]
+        let screenshot = row![
+            text::body(tr("F12 saves a screenshot")),
+            space::horizontal().width(Length::Fill),
+            toggler(self.shot_key).on_toggle(Message::SetShotKey),
+        ]
+        .align_y(Alignment::Center);
+        let corner_labels = vec![
+            trf("Like the desktop ({0} px)", &[corners::desktop_radius().round().to_string()]),
+            trf("Slightly rounded ({0} px)", &["6".into()]),
+            trf("Rounded ({0} px)", &["12".into()]),
+            tr("Square"),
+        ];
+        let corner_selected = corners::CHOICES.iter().position(|c| *c == self.corners);
+        let corners_row = row![
+            text::body(tr("Corners")),
+            cosmic::widget::dropdown(corner_labels, corner_selected, |i| Message::Corners(corners::CHOICES[i].into())),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        language_content = language_content.push(language).push(screenshot).push(corners_row);
+        if self.setting_error { language_content = language_content.push(error_text(tr("Could not save the setting."))); }
+        let content = column![padded_control(self.details()).padding([12, 16]), padded_control(language_content), self.actions()]
             .width(if self.window_mode { Length::Fill } else { Length::Fixed(POPUP_WIDTH) })
             .padding([0, 0, 8, 0]);
         if self.window_mode {
@@ -668,7 +788,9 @@ impl cosmic::Application for HueLights {
     fn init(mut core: Core, window_mode: bool) -> (Self, Task<Message>) {
         if window_mode { core.set_header_title(TITLE.into()); }
         let title = if window_mode { core.set_title(core.main_window_id(), TITLE.into()) } else { Task::none() };
-        (Self { core, window_mode, ..Default::default() }, title)
+        let app = Self { core, window_mode, shot_key: shot_key_setting(), corners: corners_setting(), ..Default::default() };
+        corners::set_current(&app.corners);
+        (app, title)
     }
 
     fn on_close_requested(&self, id: window::Id) -> Option<Message> {
@@ -691,7 +813,20 @@ impl cosmic::Application for HueLights {
         let rectangles = if self.window_mode { Subscription::none() } else {
             rectangle_tracker_subscription(0).map(|update| Message::Rectangle(update.1))
         };
-        Subscription::batch(vec![close, rectangles,
+        // F12 (no modifiers) in the popup or window; Esc skips the screenshot's note.
+        let keys = cosmic::iced::event::listen_with(|event, _, id| match event {
+            cosmic::iced::Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                if shot::is_shot_key(&key, modifiers) {
+                    Some(Message::ShotKey(id))
+                } else if matches!(key, cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Escape)) {
+                    Some(Message::Escape)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        });
+        Subscription::batch(vec![close, rectangles, keys,
             Subscription::run_with("hue-lights-helper", |_| {
                 stream::channel(8, |mut output| async move {
                     run_helper(&mut output).await;
@@ -719,6 +854,10 @@ impl cosmic::Application for HueLights {
                     self.confirm_unpair = false;
                 }
                 self.stats = stats;
+                // Settings changed in another interface (window, applet) take effect here too.
+                self.shot_key = shot_key_setting();
+                let corners = corners_setting();
+                if corners != self.corners { corners::set_current(&corners); self.corners = corners; }
             }
             Message::Rectangle(update) => match update {
                 RectangleUpdate::Rectangle(r) => self.rectangle = r.1,
@@ -730,6 +869,7 @@ impl cosmic::Application for HueLights {
                     self.popup = None;
                     self.confirm_unpair = false;
                     self.send(json!({"cmd": "closed"}));
+                    return self.popup_closed();
                 }
             }
             Message::TogglePopup => {
@@ -737,10 +877,15 @@ impl cosmic::Application for HueLights {
                 if let Some(popup) = self.popup.take() {
                     self.confirm_unpair = false;
                     self.send(json!({"cmd": "closed"}));
-                    return destroy_popup(popup);
+                    return Task::batch([self.popup_closed(), destroy_popup(popup)]);
                 }
                 self.send(json!({"cmd": "open"}));
-                return cosmic::surface::surface_task(cosmic::surface::action::app_popup(
+                let focus = if matches!(self.shot, shot::Phase::Note { .. }) {
+                    cosmic::widget::text_input::focus(NOTE_ID.clone())
+                } else {
+                    Task::none()
+                };
+                return Task::batch([cosmic::surface::surface_task(cosmic::surface::action::app_popup(
                     |_| Default::default(),
                     |app: &mut Self| {
                         let id = window::Id::unique();
@@ -758,7 +903,7 @@ impl cosmic::Application for HueLights {
                         settings
                     },
                     None,
-                ));
+                )), focus]);
             }
             Message::Expand(key) => {
                 if !self.expanded.remove(&key) {
@@ -807,6 +952,53 @@ impl cosmic::Application for HueLights {
             Message::Language(code) => {
                 self.language_error = maprisma_hue_lights::i18n::save(&code).is_err();
             }
+            Message::ShotKey(id) => {
+                let shown = if self.window_mode { self.core.main_window_id() == Some(id) } else { self.popup == Some(id) };
+                if self.shot_key && shown && self.shot == shot::Phase::Idle {
+                    self.shot = shot::Phase::Busy;
+                    self.capturing = true;
+                    return window::screenshot(id).map(|picture| cosmic::Action::App(Message::Captured(picture)));
+                }
+            }
+            Message::Captured(picture) => {
+                if !std::mem::take(&mut self.capturing) { return Task::none(); }
+                let (width, height) = (picture.size.width, picture.size.height);
+                return off_thread(move || shot::save_screenshot(SHOT_FOLDER, &picture.rgba, width, height), Message::ShotSaved);
+            }
+            Message::ShotSaved(result) => {
+                self.shot = match result {
+                    Ok(saved) => shot::Phase::Note { path: saved.path, shown: saved.shown, text: String::new() },
+                    Err(reason) => shot::Phase::Error(trf("The screenshot could not be saved: {0}", &[reason])),
+                };
+                if matches!(self.shot, shot::Phase::Note { .. }) {
+                    return cosmic::widget::text_input::focus(NOTE_ID.clone());
+                }
+            }
+            Message::NoteInput(value) => {
+                if let shot::Phase::Note { text, .. } = &mut self.shot {
+                    *text = value.chars().take(shot::NOTE_LIMIT).collect();
+                }
+            }
+            Message::NoteDone => return self.finish_note(true),
+            Message::Escape => {
+                if self.shot.open() { return self.finish_note(false); }
+            }
+            Message::NoteSaved(result) => match result {
+                Ok(()) => { if self.shot == shot::Phase::Noting { self.shot = shot::Phase::Idle; } }
+                Err(reason) => self.shot = shot::Phase::Error(trf("The note could not be saved: {0}", &[reason])),
+            },
+            Message::SetShotKey(on) => {
+                self.setting_error = write_pref("screenshot_key", Some(on.into())).is_err();
+                self.shot_key = on;
+            }
+            Message::Corners(choice) => {
+                let choice = corners::normalize(&choice);
+                // "Like the desktop" is the default: no key in config.json.
+                let value = (choice != "desktop").then(|| Value::from(choice));
+                self.setting_error = write_pref("corners", value).is_err();
+                self.corners = choice.to_string();
+                corners::set_current(choice);
+            }
             Message::Unpair => {
                 if self.confirm_unpair {
                     self.confirm_unpair = false;
@@ -820,7 +1012,7 @@ impl cosmic::Application for HueLights {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        if self.window_mode { return self.popup_content(); }
+        if self.window_mode { return corners::apply(&self.corners, self.popup_content()); }
         let horizontal = matches!(self.core.applet.anchor, PanelAnchor::Top | PanelAnchor::Bottom);
         let padding = self.core.applet.suggested_padding(true).0;
         let button = button::custom(self.panel_content())
@@ -838,8 +1030,8 @@ impl cosmic::Application for HueLights {
     }
 
     fn view_window(&self, _id: window::Id) -> Element<'_, Message> {
-        if self.window_mode { return self.popup_content(); }
-        self.core.applet.popup_container(self.popup_content()).into()
+        if self.window_mode { return corners::apply(&self.corners, self.popup_content()); }
+        corners::apply(&self.corners, self.core.applet.popup_container(self.popup_content()))
     }
 
     fn style(&self) -> Option<cosmic::iced::theme::Style> {

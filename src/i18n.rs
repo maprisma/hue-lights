@@ -30,6 +30,24 @@ pub fn save(code: &str) -> std::io::Result<()> {
     std::fs::write(&temp, serde_json::to_vec_pretty(&config)?)?;
     std::fs::rename(temp, path)
 }
+/// One interface setting from config.json (language, screenshot_key, corners); bridge
+/// credentials live elsewhere (the helper's own file).
+pub fn read_pref(key: &str) -> Option<Value> {
+    std::fs::read(path()).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| v.get(key).cloned())
+}
+/// Sets (Some) or removes (None) one setting; the other keys stay as they are.
+pub fn write_pref(key: &str, value: Option<Value>) -> std::io::Result<()> {
+    let path = path();
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let mut config = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).filter(Value::is_object).unwrap_or_else(|| serde_json::json!({}));
+    match value {
+        Some(value) => config[key] = value,
+        None => { config.as_object_mut().map(|o| o.remove(key)); }
+    }
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temp, serde_json::to_vec_pretty(&config)?)?;
+    std::fs::rename(temp, path)
+}
 pub fn translate(code: &str, key: &str) -> String {
     let value = &CATALOGS[code][key];
     value.as_str().or_else(|| value.as_array().and_then(|a| a.last()).and_then(Value::as_str)).unwrap_or(key).to_owned()

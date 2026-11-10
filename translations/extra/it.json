@@ -3,5 +3,18 @@
   "Quit tray": "Esci dall’area di notifica",
   "Philips Hue rooms, zones, lights and scenes in the panel": "Stanze, zone, luci e scene Philips Hue nel pannello",
   "Could not save language setting.": "Impossibile salvare la lingua.",
-  "Maprisma Hue Lights": "Maprisma Hue Lights"
+  "Maprisma Hue Lights": "Maprisma Hue Lights",
+  "F12 saves a screenshot": "F12 salva uno screenshot",
+  "Screenshot saved": "Screenshot salvato",
+  "Saved as {0}": "Salvato come {0}",
+  "What is wrong? (optional)": "Cosa non va? (facoltativo)",
+  "Done": "Fatto",
+  "The screenshot could not be saved: {0}": "Impossibile salvare lo screenshot: {0}",
+  "The note could not be saved: {0}": "Impossibile salvare la nota: {0}",
+  "Corners": "Angoli",
+  "Like the desktop ({0} px)": "Come il desktop ({0} px)",
+  "Slightly rounded ({0} px)": "Leggermente arrotondati ({0} px)",
+  "Rounded ({0} px)": "Arrotondati ({0} px)",
+  "Square": "Squadrati",
+  "Could not save the setting.": "Impossibile salvare l'impostazione."
 }
