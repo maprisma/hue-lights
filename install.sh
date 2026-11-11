@@ -68,7 +68,7 @@ Name[pl]=Maprisma Hue Lights – Zasobnik
 Exec=$tray_exec
 Icon=$id-symbolic
 Terminal=false
-OnlyShowIn=KDE;
+OnlyShowIn=KDE;Hyprland;
 EOF
 install -Dm644 scripts/hue-lights.py "$data/maprisma-hue-lights/scripts/hue-lights.py"
 install -Dm644 "data/icons/$id-symbolic.svg" "$data/icons/hicolor/scalable/apps/$id-symbolic.svg"
