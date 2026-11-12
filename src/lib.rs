@@ -1,6 +1,7 @@
 pub mod i18n;
 pub mod shot;
 pub mod corners;
+pub mod look;
 use i18n::{tr, trf};
 use serde_json::Value;
 use std::path::PathBuf;

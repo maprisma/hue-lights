@@ -56,7 +56,7 @@ const SEND_EVERY: Duration = Duration::from_millis(150); // between brightness c
 const SCENE_LIMIT: usize = 6; // scenes shown before "+N more"
 const POPUP_WIDTH: f32 = 430.0;
 const ROOMS_MAX_HEIGHT: f32 = 540.0;
-const LIT: Color = Color::from_rgb(0x33 as f32 / 255.0, 0xd1 as f32 / 255.0, 0x7a as f32 / 255.0);
+// A light's own colour when the bridge reports none: data (what the bulb shows), not the theme's.
 const WARM: Color = Color::from_rgb(1.0, 0xd2 as f32 / 255.0, 0x7a as f32 / 255.0);
 
 fn main() -> cosmic::iced::Result {
@@ -214,11 +214,21 @@ fn dim<'a>(content: impl Into<std::borrow::Cow<'a, str>> + 'a) -> Element<'a, Me
 }
 
 fn error_text<'a>(content: String) -> Element<'a, Message> {
-    text::caption(content).class(theme::Text::Color(Color::from_rgb8(0xe0, 0x1b, 0x24))).into()
+    text::caption(content)
+        .class(theme::Text::Custom(|theme: &cosmic::Theme| iced_text::Style {
+            color: Some(theme.cosmic().destructive_color().into()),
+            ..Default::default()
+        }))
+        .into()
 }
 
 fn tinted_svg(c: Color) -> theme::Svg {
     theme::Svg::custom(move |_| iced_svg::Style { color: Some(c) })
+}
+
+// The lit bulb: the desktop's green.
+fn lit_svg() -> theme::Svg {
+    theme::Svg::custom(|theme: &cosmic::Theme| iced_svg::Style { color: Some(theme.cosmic().success_color().into()) })
 }
 
 fn card(tint: Option<Color>) -> theme::Container<'static> {
@@ -427,7 +437,7 @@ impl HueLights {
         let size = self.core.applet.suggested_size(true).0;
         let mut bulb = icon::icon(bulb(lit)).size(size);
         if lit {
-            bulb = bulb.class(tinted_svg(LIT));
+            bulb = bulb.class(lit_svg());
         } else {
             bulb = bulb.opacity(0.6);
         }
@@ -437,14 +447,14 @@ impl HueLights {
     fn header(&self) -> Element<'_, Message> {
         let lit = self.on_count() > 0.0;
         let mut hero = icon::icon(bulb(lit)).size(32);
-        hero = if lit { hero.class(tinted_svg(LIT)) } else { hero.opacity(0.6) };
+        hero = if lit { hero.class(lit_svg()) } else { hero.opacity(0.6) };
         let meta = if self.paired() { bridge_text(&self.stats) } else { tr("No bridge paired") };
-        let mut header = row![hero, column![text::title4(tr("Maprisma Hue Lights")), dim(meta)].spacing(2), space::horizontal()]
+        let mut header = row![hero, column![text::title4(tr("Maprisma Hue Lights")), dim(meta)].spacing(4), space::horizontal()]
             .spacing(12)
             .align_y(Alignment::Center);
         if self.phase() == "ok" {
             let pill = trf("{0} of {1} on", &[self.on_count().to_string(), num(&self.stats, "light_count").to_string()]);
-            header = header.push(container(text::caption(pill)).padding([2, 10]).class(pill_style()));
+            header = header.push(container(text::caption(pill)).padding([4, 8]).class(pill_style()));
         }
         header.into()
     }
@@ -530,9 +540,9 @@ impl HueLights {
             .align_y(Alignment::Center)
             .class(badge(tint));
         let chevron = icon::from_name(if open { "pan-down-symbolic" } else { "pan-end-symbolic" }).size(16).symbolic(true);
-        let names = column![text::heading(room_name(room)), dim(room_status(room))].spacing(1);
+        let names = column![text::heading(room_name(room)), dim(room_status(room))].spacing(4);
         let expander = button::custom(
-            row![badge, names, space::horizontal(), chevron].spacing(10).align_y(Alignment::Center),
+            row![badge, names, space::horizontal(), chevron].spacing(12).align_y(Alignment::Center),
         )
         .padding(4)
         .width(Length::Fill)
@@ -542,7 +552,7 @@ impl HueLights {
         let head = row![expander, toggler(lit).on_toggle(move |on| Message::RoomOn(switch_key.clone(), on))]
             .spacing(8)
             .align_y(Alignment::Center);
-        let mut card_content = column![head].spacing(6);
+        let mut card_content = column![head].spacing(8);
 
         if lit {
             let target = format!("room:{key}");
@@ -585,10 +595,10 @@ impl HueLights {
                     pills.push(button::text(label).on_press(Message::AllScenes(key.clone())).into());
                 }
                 card_content =
-                    card_content.push(container(flex_row(pills).row_spacing(6).column_spacing(6)).padding([4, 4, 0, 4]));
+                    card_content.push(container(flex_row(pills).row_spacing(8).column_spacing(8)).padding([4, 4, 0, 4]));
             }
         }
-        container(card_content).padding(8).width(Length::Fill).class(card(tint)).into()
+        container(card_content).padding(12).width(Length::Fill).class(card(tint)).into()
     }
 
     fn light_row<'a>(&'a self, light: &'a Value) -> Element<'a, Message> {
@@ -602,7 +612,7 @@ impl HueLights {
         }
         let name: Element<Message> = if on && reachable { text::body(name).into() } else { dim(name) };
         let mut line = row![swatch(on.then_some(c), reachable), container(name).width(Length::Fill)]
-            .spacing(10)
+            .spacing(8)
             .align_y(Alignment::Center);
         if flag(light, "dimmable") {
             let target = format!("light:{id}");
@@ -617,11 +627,11 @@ impl HueLights {
         }
         let switch_id = id.clone();
         line = line.push(toggler(on).on_toggle(move |v| Message::LightOn(switch_id.clone(), v)));
-        container(line).padding([2, 4, 2, 12]).into()
+        container(line).padding([4, 4, 4, 12]).into()
     }
 
     fn details(&self) -> Element<'_, Message> {
-        let mut content = column![self.header()].spacing(10);
+        let mut content = column![self.header()].spacing(12);
         let error = s(&self.stats, "error");
         if !error.is_empty() {
             content = content.push(error_text(maprisma_hue_lights::i18n::error(&self.stats)));
@@ -641,7 +651,7 @@ impl HueLights {
             }));
             return content.into();
         }
-        let mut cards = column![].spacing(8);
+        let mut cards = column![].spacing(12);
         for room in rooms {
             cards = cards.push(self.room_card(room));
         }
@@ -691,13 +701,13 @@ impl HueLights {
                     .on_submit(|_| Message::NoteDone),
                 row![space::horizontal().width(Length::Fill), button::suggested(tr("Done")).on_press(Message::NoteDone)],
             ]
-            .spacing(10)
+            .spacing(12)
             .into(),
             shot::Phase::Error(reason) => column![
                 text::body(reason.clone()),
                 row![space::horizontal().width(Length::Fill), button::suggested(tr("Done")).on_press(Message::NoteDone)],
             ]
-            .spacing(10)
+            .spacing(12)
             .into(),
             _ => return None,
         };
@@ -715,7 +725,7 @@ impl HueLights {
         let labels: Vec<String> = choices.iter().map(|(_, label)| label.clone()).collect();
         let mut language_content = column![].spacing(4);
         if self.language_error { language_content = language_content.push(error_text(tr("Could not save language setting."))); }
-        let language = row![text::body(tr("Language")), cosmic::widget::dropdown(labels, selected, move |i| Message::Language(choices[i].0.clone()))].spacing(8);
+        let language = row![text::body(tr("Language")), cosmic::widget::dropdown(labels, selected, move |i| Message::Language(choices[i].0.clone()))].spacing(8).align_y(Alignment::Center);
         let screenshot = row![
             text::body(tr("F12 saves a screenshot")),
             space::horizontal().width(Length::Fill),
@@ -763,7 +773,7 @@ impl HueLights {
             menu_button(text::body(tr("Refresh"))).on_press(Message::Refresh),
             padded_control(
                 row![dim(tr("Bridge")), text::caption(bridge_text(&self.stats)), space::horizontal(), unpair]
-                    .spacing(10)
+                    .spacing(8)
                     .align_y(Alignment::Center)
             ),
         ]
@@ -790,7 +800,9 @@ impl cosmic::Application for HueLights {
         let title = if window_mode { core.set_title(core.main_window_id(), TITLE.into()) } else { Task::none() };
         let app = Self { core, window_mode, shot_key: shot_key_setting(), corners: corners_setting(), ..Default::default() };
         corners::set_current(&app.corners);
-        (app, title)
+        // The desktop's theme for the whole window (title bar too), see look.rs.
+        let theme = if window_mode { corners::set_app_theme(&app.corners) } else { Task::none() };
+        (app, Task::batch([title, theme]))
     }
 
     fn on_close_requested(&self, id: window::Id) -> Option<Message> {
@@ -857,7 +869,11 @@ impl cosmic::Application for HueLights {
                 // Settings changed in another interface (window, applet) take effect here too.
                 self.shot_key = shot_key_setting();
                 let corners = corners_setting();
-                if corners != self.corners { corners::set_current(&corners); self.corners = corners; }
+                let mut restyle = corners != self.corners;
+                if restyle { corners::set_current(&corners); self.corners = corners; }
+                // The desktop's colours and corners (Maprisma Theme can change them any time).
+                restyle |= maprisma_hue_lights::look::refresh();
+                if restyle && self.window_mode { return corners::set_app_theme(&self.corners); }
             }
             Message::Rectangle(update) => match update {
                 RectangleUpdate::Rectangle(r) => self.rectangle = r.1,
@@ -998,6 +1014,7 @@ impl cosmic::Application for HueLights {
                 self.setting_error = write_pref("corners", value).is_err();
                 self.corners = choice.to_string();
                 corners::set_current(choice);
+                if self.window_mode { return corners::set_app_theme(choice); }
             }
             Message::Unpair => {
                 if self.confirm_unpair {
@@ -1012,7 +1029,7 @@ impl cosmic::Application for HueLights {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        if self.window_mode { return corners::apply(&self.corners, self.popup_content()); }
+        if self.window_mode { return corners::apply_window(&self.corners, self.popup_content()); }
         let horizontal = matches!(self.core.applet.anchor, PanelAnchor::Top | PanelAnchor::Bottom);
         let padding = self.core.applet.suggested_padding(true).0;
         let button = button::custom(self.panel_content())
@@ -1030,7 +1047,8 @@ impl cosmic::Application for HueLights {
     }
 
     fn view_window(&self, _id: window::Id) -> Element<'_, Message> {
-        if self.window_mode { return corners::apply(&self.corners, self.popup_content()); }
+        if self.window_mode { return corners::apply_window(&self.corners, self.popup_content()); }
+
         corners::apply(&self.corners, self.core.applet.popup_container(self.popup_content()))
     }
 
