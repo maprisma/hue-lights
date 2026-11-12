@@ -60,6 +60,15 @@ const ROOMS_MAX_HEIGHT: f32 = 540.0;
 // A light's own colour when the bridge reports none: data (what the bulb shows), not the theme's.
 const WARM: Color = Color::from_rgb(1.0, 0xd2 as f32 / 255.0, 0x7a as f32 / 255.0);
 
+/// A second `--window` start toggles (layout rule 5a): the open window is told to close, the way
+/// its tray does, then this one ends. Every entry point (tray, Maprisma Shell's glyph, launcher)
+/// gets the same toggle.
+async fn close_running_window(bus: &str) {
+    if let Ok(connection) = zbus::Connection::session().await {
+        let _ = connection.call_method(Some(bus), "/Window", Some("io.github.ubruckhaus.HueLights.Window"), "Close", &()).await;
+    }
+}
+
 fn main() -> cosmic::iced::Result {
     if std::env::args().any(|arg| arg == "--window") {
         let runtime = tokio::runtime::Runtime::new().expect("window D-Bus runtime");
@@ -68,7 +77,11 @@ fn main() -> cosmic::iced::Result {
             c.request_name_with_flags(WINDOW_BUS, zbus::fdo::RequestNameFlags::DoNotQueue.into()).await?;
             Ok::<_, zbus::Error>(c)
         });
-        let _connection = match connection { Ok(c) => c, Err(e) => { eprintln!("Window unavailable or already open: {e}"); return Ok(()); } };
+        let _connection = match connection {
+            Ok(c) => c,
+            Err(zbus::Error::NameTaken) => { runtime.block_on(close_running_window(WINDOW_BUS)); return Ok(()); }
+            Err(e) => { eprintln!("Window unavailable: {e}"); return Ok(()); }
+        };
         cosmic::app::run::<HueLights>(cosmic::app::Settings::default()
             .size({ let (width, height) = window_start_size(); cosmic::iced::Size::new(width, height) })
             .resizable(Some(8.0)).exit_on_close(true).is_daemon(false), true)
