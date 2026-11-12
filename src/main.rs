@@ -10,6 +10,7 @@
 
 use maprisma_hue_lights::i18n::{tr, trf, read_pref, write_pref};
 use maprisma_hue_lights::{corners, shot};
+mod window_size;
 use std::collections::{HashMap, HashSet};
 use maprisma_hue_lights::{script_path, TITLE, WINDOW_BUS};
 use std::process::Stdio;
@@ -69,10 +70,41 @@ fn main() -> cosmic::iced::Result {
         });
         let _connection = match connection { Ok(c) => c, Err(e) => { eprintln!("Window unavailable or already open: {e}"); return Ok(()); } };
         cosmic::app::run::<HueLights>(cosmic::app::Settings::default()
-            .size(cosmic::iced::Size::new(POPUP_WIDTH, 650.0))
+            .size({ let (width, height) = window_start_size(); cosmic::iced::Size::new(width, height) })
             .resizable(Some(8.0)).exit_on_close(true).is_daemon(false), true)
     } else {
         cosmic::applet::run::<HueLights>(false)
+    }
+}
+
+// The `--window` size: the one the user left it at (layout rule 5a), else the popup's.
+fn window_start_size() -> window_size::Size {
+    window_size::parse(read_pref(window_size::KEY).as_ref()).unwrap_or((POPUP_WIDTH, 650.0))
+}
+
+/// What Esc does (layout rule 5a): the innermost open thing first, then the window or popup.
+/// (An open Language / Corners drop-down closes itself and keeps that Esc.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscStep {
+    /// Skip the screenshot's note (or close its error).
+    Note,
+    /// Drop the "Unpair?" question.
+    Confirm,
+    /// Close the window (`--window`) or the popup.
+    Close,
+    Nothing,
+}
+
+/// `shown`: Esc came from the window or the open popup (not the panel button).
+fn esc_step(shown: bool, note: bool, confirm: bool) -> EscStep {
+    if !shown {
+        EscStep::Nothing
+    } else if note {
+        EscStep::Note
+    } else if confirm {
+        EscStep::Confirm
+    } else {
+        EscStep::Close
     }
 }
 
@@ -311,10 +343,12 @@ struct HueLights {
     shot_key: bool,
     corners: String,
     setting_error: bool,
+    resize: window_size::Debounce,
 }
 
 #[derive(Debug, Clone)]
 enum Message {
+    SaveSize,
     Helper(mpsc::UnboundedSender<String>),
     Stats(Value),
     TogglePopup,
@@ -339,7 +373,7 @@ enum Message {
     Unpair,
     Language(String),
     ShotKey(window::Id),
-    Escape,
+    Escape(window::Id),
     Captured(window::Screenshot),
     ShotSaved(Result<shot::Saved, String>),
     NoteInput(String),
@@ -682,6 +716,16 @@ impl HueLights {
     }
 
     // A capture still on its way is dropped with its popup; a typed note is kept (saved).
+    // A resize that has settled (or, on `closing`, any waiting one) goes to config.json; not
+    // while maximised, fullscreen or tiled (libcosmic's sharp corners).
+    fn save_size(&mut self, closing: bool) {
+        let ignore = self.core.window.sharp_corners;
+        let size = if closing { self.resize.flush(ignore) } else { self.resize.due(Instant::now(), ignore) };
+        if let Some(size) = size {
+            self.setting_error = write_pref(window_size::KEY, Some(window_size::to_value(size))).is_err();
+        }
+    }
+
     fn popup_closed(&mut self) -> Task<Message> {
         if std::mem::take(&mut self.capturing) && self.shot == shot::Phase::Busy {
             self.shot = shot::Phase::Idle;
@@ -798,7 +842,8 @@ impl cosmic::Application for HueLights {
     fn init(mut core: Core, window_mode: bool) -> (Self, Task<Message>) {
         if window_mode { core.set_header_title(TITLE.into()); }
         let title = if window_mode { core.set_title(core.main_window_id(), TITLE.into()) } else { Task::none() };
-        let app = Self { core, window_mode, shot_key: shot_key_setting(), corners: corners_setting(), ..Default::default() };
+        let mut app = Self { core, window_mode, shot_key: shot_key_setting(), corners: corners_setting(), ..Default::default() };
+        if window_mode { app.resize = window_size::Debounce::new(window_start_size()); }
         corners::set_current(&app.corners);
         // The desktop's theme for the whole window (title bar too), see look.rs.
         let theme = if window_mode { corners::set_app_theme(&app.corners) } else { Task::none() };
@@ -807,6 +852,12 @@ impl cosmic::Application for HueLights {
 
     fn on_close_requested(&self, id: window::Id) -> Option<Message> {
         Some(Message::CloseRequested(id))
+    }
+
+    fn on_window_resize(&mut self, id: window::Id, width: f32, height: f32) {
+        if self.window_mode && self.core.main_window_id() == Some(id) {
+            self.resize.resized(width, height, Instant::now());
+        }
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -825,20 +876,26 @@ impl cosmic::Application for HueLights {
         let rectangles = if self.window_mode { Subscription::none() } else {
             rectangle_tracker_subscription(0).map(|update| Message::Rectangle(update.1))
         };
-        // F12 (no modifiers) in the popup or window; Esc skips the screenshot's note.
-        let keys = cosmic::iced::event::listen_with(|event, _, id| match event {
+        // F12 (no modifiers) in the popup or window; Esc closes the innermost thing (esc_step).
+        let keys = cosmic::iced::event::listen_with(|event, status, id| match event {
             cosmic::iced::Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                 if shot::is_shot_key(&key, modifiers) {
                     Some(Message::ShotKey(id))
-                } else if matches!(key, cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Escape)) {
-                    Some(Message::Escape)
+                } else if status == cosmic::iced::event::Status::Ignored
+                    && matches!(key, cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Escape))
+                {
+                    // Not one an open drop-down list took to close itself.
+                    Some(Message::Escape(id))
                 } else {
                     None
                 }
             }
             _ => None,
         });
-        Subscription::batch(vec![close, rectangles, keys,
+        let save_size = if self.window_mode && self.resize.waiting() {
+            cosmic::iced::time::every(Duration::from_millis(100)).map(|_| Message::SaveSize)
+        } else { Subscription::none() };
+        Subscription::batch(vec![close, rectangles, keys, save_size,
             Subscription::run_with("hue-lights-helper", |_| {
                 stream::channel(8, |mut output| async move {
                     run_helper(&mut output).await;
@@ -854,7 +911,8 @@ impl cosmic::Application for HueLights {
                     return Task::batch([window::set_mode(id, window::Mode::Windowed), window::gain_focus(id)]);
                 }
             }
-            Message::Quit => return cosmic::iced::exit(),
+            Message::Quit => { self.save_size(true); return cosmic::iced::exit(); }
+            Message::SaveSize => self.save_size(false),
             Message::Helper(sender) => {
                 self.helper = Some(sender);
                 if self.window_mode || self.popup.is_some() {
@@ -880,7 +938,7 @@ impl cosmic::Application for HueLights {
                 RectangleUpdate::Init(tracker) => self.tracker = Some(tracker),
             },
             Message::CloseRequested(id) => {
-                if self.window_mode { return cosmic::iced::exit(); }
+                if self.window_mode { self.save_size(true); return cosmic::iced::exit(); }
                 if self.popup == Some(id) {
                     self.popup = None;
                     self.confirm_unpair = false;
@@ -996,8 +1054,16 @@ impl cosmic::Application for HueLights {
                 }
             }
             Message::NoteDone => return self.finish_note(true),
-            Message::Escape => {
-                if self.shot.open() { return self.finish_note(false); }
+            Message::Escape(id) => {
+                let shown = if self.window_mode { self.core.main_window_id() == Some(id) } else { self.popup == Some(id) };
+                match esc_step(shown, self.shot.open(), self.confirm_unpair) {
+                    EscStep::Note => return self.finish_note(false),
+                    EscStep::Confirm => self.confirm_unpair = false,
+                    // Like the window's own close (the tray keeps running); the popup like a click on the icon.
+                    EscStep::Close if self.window_mode => return self.update(Message::CloseRequested(id)),
+                    EscStep::Close => return self.update(Message::TogglePopup),
+                    EscStep::Nothing => {}
+                }
             }
             Message::NoteSaved(result) => match result {
                 Ok(()) => { if self.shot == shot::Phase::Noting { self.shot = shot::Phase::Idle; } }
@@ -1110,5 +1176,20 @@ async fn run_helper(output: &mut mpsc::Sender<Message>) {
             }
         }
         tokio::time::sleep(RESTART_DELAY).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn esc_closes_the_innermost_thing_first() {
+        assert_eq!(esc_step(true, true, true), EscStep::Note);
+        assert_eq!(esc_step(true, false, true), EscStep::Confirm);
+        assert_eq!(esc_step(true, false, false), EscStep::Close);
+        // Not from the window or the open popup (e.g. the panel button): nothing.
+        assert_eq!(esc_step(false, true, true), EscStep::Nothing);
+        assert_eq!(esc_step(false, false, false), EscStep::Nothing);
     }
 }
