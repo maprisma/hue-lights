@@ -10,11 +10,11 @@ pub const ICON: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights-symbolic";
 /// The bulb when no light is on (data/icons/hue-bulb-off-symbolic.svg, installed under this name).
 pub const ICON_OFF: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights-off-symbolic";
 
-/// The lit bulb in the theme's green (data/icons/hue-bulb-active-symbolic.svg, class
-/// ColorScheme-PositiveText): every Maprisma bar icon is "on" in this one colour.
+/// The lit bulb in the theme accent (data/icons/hue-bulb-active-symbolic.svg, class
+/// ColorScheme-Highlight): every Maprisma bar icon is "on" in this one colour.
 pub const ICON_ACTIVE: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights-active-symbolic";
 
-/// The bar's bulb, as the applet draws it: lit and green while any light is on.
+/// The bar's bulb, as the applet draws it: lit in the accent while any light is on.
 pub fn icon_for(stats: &Value) -> &'static str {
     if number(stats, "on_count") > 0.0 { ICON_ACTIVE } else { ICON_OFF }
 }

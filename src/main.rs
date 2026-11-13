@@ -1,5 +1,5 @@
 // Hue Lights for COSMIC: Philips Hue rooms, zones, lights and scenes from the panel.
-// Lit bulb in green while any light is on, dim bulb when all are off or no bridge
+// Lit bulb in the accent while any light is on, dim bulb when all are off or no bridge
 // is paired. Left click opens the popup; right click switches every light off.
 //
 // All bridge traffic goes through scripts/hue-lights.py (the same helper as the
@@ -272,9 +272,9 @@ fn tinted_svg(c: Color) -> theme::Svg {
     theme::Svg::custom(move |_| iced_svg::Style { color: Some(c) })
 }
 
-// The lit bulb: the desktop's green.
+// The lit bulb: the theme accent.
 fn lit_svg() -> theme::Svg {
-    theme::Svg::custom(|theme: &cosmic::Theme| iced_svg::Style { color: Some(theme.cosmic().success_color().into()) })
+    theme::Svg::custom(|theme: &cosmic::Theme| iced_svg::Style { color: Some(theme.cosmic().accent_color().into()) })
 }
 
 fn card(tint: Option<Color>) -> theme::Container<'static> {

@@ -4,7 +4,7 @@ A native COSMIC panel applet (Rust/libcosmic) for Philips Hue: rooms, zones, lig
 scenes. One of the [Maprisma](https://github.com/maprisma) apps: the COSMIC port of the Omarchy
 plugin `ubruckhaus.hue-lights`, which stays as it is. Interface languages: English, Deutsch, Français, Español, Italiano, Português, Nederlands and Polski. Choose Language in the popup/window or tray menu. The default follows LC_ALL, LC_MESSAGES, then LANG (first non-empty value). Preferences are stored in `~/.config/maprisma-hue-lights/config.json` (or under XDG_CONFIG_HOME). Changes apply immediately; other running views refresh on their next UI update. Catalogs are bundled offline; regenerate them with `python3 tools/gen-translations` after editing translations.
 
-- **Panel:** a bulb, green while any light is on, dim when all are off or no bridge is
+- **Panel:** a bulb, in the theme accent while any light is on, dim when all are off or no bridge is
   paired. Left click opens the popup; right click switches every light off. The tooltip
   says how many lights are on.
 - **Popup:** the bridge and "n of m on"; one card per room and zone (icon from its name or

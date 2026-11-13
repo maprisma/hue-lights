@@ -3,7 +3,7 @@
 #   ~/.local/bin/maprisma-hue-lights                   the applet
 #   ~/.local/share/maprisma-hue-lights/scripts/        the bridge helper
 #   ~/.local/share/applications/…desktop             makes it an applet for the panel
-#   ~/.local/share/icons/hicolor/scalable/apps/…svg  the bulb icons (lit, lit green, off)
+#   ~/.local/share/icons/hicolor/scalable/apps/…svg  the bulb icons (lit, lit in the accent, off)
 # Then add it in COSMIC Settings › Desktop › Panel › Applets.
 set -euo pipefail
 cd "$(dirname "$0")"

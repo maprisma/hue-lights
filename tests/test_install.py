@@ -29,13 +29,13 @@ class TrayIconTests(unittest.TestCase):
                       installer)
         self.assertTrue((root / "data" / "icons" / "hue-bulb-off-symbolic.svg").is_file())
 
-    def test_lit_bulb_is_green_like_every_maprisma_bar_icon(self):
+    def test_lit_bulb_is_accent_like_every_maprisma_bar_icon(self):
         root = pathlib.Path(__file__).resolve().parents[1]
         installer = (root / "install.sh").read_text()
         self.assertIn('data/icons/hue-bulb-active-symbolic.svg "$data/icons/hicolor/scalable/apps/$id-active-symbolic.svg"',
                       installer)
         svg = (root / "data" / "icons" / "hue-bulb-active-symbolic.svg").read_text()
-        self.assertIn('class="ColorScheme-PositiveText"', svg)
+        self.assertIn('class="ColorScheme-Highlight"', svg)
         self.assertNotIn('ColorScheme-Text', svg)
 
 
