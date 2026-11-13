@@ -78,9 +78,10 @@ rooms, zones, individual lights, scenes and refresh. Only one window runs per se
 The installer also installs `maprisma-hue-lights-tray` and a KDE-only autostart entry
 (`~/.config/autostart/io.github.ubruckhaus.CosmicMaprismaHueLights.Tray.desktop`).
 Start the tray manually once, or log out and back in. Left click toggles the window;
-the menu offers **Open Maprisma Hue Lights** and **Quit tray**. Quitting the tray
-leaves an open window running. The tooltip uses the same bridge helper and status
-text as the COSMIC panel, polling at the helper's inexpensive closed-popup rate
+the menu offers **Open Maprisma Hue Lights** (brings an open window to the front, also
+a minimized one) and **Quit tray**. Quitting the tray leaves an open window running. The
+bulb is lit while any light is on, as in the COSMIC panel. The tooltip uses the same
+bridge helper and status text as the COSMIC panel, polling at the helper's inexpensive closed-popup rate
 (20 seconds). The tray reconnects when Plasma's StatusNotifierWatcher restarts.
 COSMIC continues to use the existing panel applet without `--window`.
 

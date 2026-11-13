@@ -1,6 +1,6 @@
 mod model;
 mod present;
-use maprisma_hue_lights::{ICON, TITLE, WINDOW_BUS, script_path, summary};
+use maprisma_hue_lights::{ICON, TITLE, WINDOW_BUS, icon_for, script_path, summary};
 use model::Action;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -199,8 +199,8 @@ impl Tray {
         0
     }
     #[zbus(property)]
-    fn icon_name(&self) -> &str {
-        ICON
+    async fn icon_name(&self) -> &str {
+        icon_for(&self.state.lock().await.stats)
     }
     #[zbus(property)]
     fn icon_pixmap(&self) -> Pixmaps {
@@ -255,6 +255,8 @@ impl Tray {
     async fn new_status(emitter: &SignalEmitter<'_>, status: &str) -> zbus::Result<()>;
     #[zbus(signal)]
     async fn new_tool_tip(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+    #[zbus(signal)]
+    async fn new_icon(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
 /// A window this tray started is still running (it may not have claimed its name yet).
 static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -328,12 +330,19 @@ async fn monitor(state: Shared, connection: Connection) {
                 while let Ok(Some(line)) = lines.next_line().await {
                     if let Ok(stats) = serde_json::from_str::<serde_json::Value>(&line) {
                         let mut s = state.lock().await;
-                        let before = s.tooltip();
+                        let before = (s.tooltip(), icon_for(&s.stats));
                         s.stats = stats;
-                        let changed = before != s.tooltip();
+                        let changed = before.0 != s.tooltip();
+                        let icon_changed = before.1 != icon_for(&s.stats);
                         drop(s);
                         if changed {
                             let _ = Tray::new_tool_tip(
+                                &SignalEmitter::new(&connection, "/StatusNotifierItem").unwrap(),
+                            )
+                            .await;
+                        }
+                        if icon_changed {
+                            let _ = Tray::new_icon(
                                 &SignalEmitter::new(&connection, "/StatusNotifierItem").unwrap(),
                             )
                             .await;

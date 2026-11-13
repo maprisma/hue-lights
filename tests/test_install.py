@@ -19,5 +19,16 @@ class DesktopExecTests(unittest.TestCase):
                 self.assertEqual(result, '"' + argument.replace('\\', '\\\\') + '"')
 
 
+class TrayIconTests(unittest.TestCase):
+    def test_off_bulb_is_installed_under_the_trays_name(self):
+        root = pathlib.Path(__file__).resolve().parents[1]
+        installer = (root / "install.sh").read_text()
+        lib = (root / "src" / "lib.rs").read_text()
+        self.assertIn('pub const ICON_OFF: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights-off-symbolic"', lib)
+        self.assertIn('data/icons/hue-bulb-off-symbolic.svg "$data/icons/hicolor/scalable/apps/$id-off-symbolic.svg"',
+                      installer)
+        self.assertTrue((root / "data" / "icons" / "hue-bulb-off-symbolic.svg").is_file())
+
+
 if __name__ == '__main__':
     unittest.main()
