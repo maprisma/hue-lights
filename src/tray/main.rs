@@ -1,4 +1,5 @@
 mod model;
+mod present;
 use maprisma_hue_lights::{ICON, TITLE, WINDOW_BUS, script_path, summary};
 use model::Action;
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -289,6 +290,10 @@ async fn execute(connection: &Connection, action: Action) {
                 "Show"
             };
             let _ = proxy.call::<_, _, ()>(method, &()).await;
+        }
+        if action != Action::Activate {
+            // "Show" can't raise a Wayland window by itself: the compositor brings it forward.
+            present::present(connection, owner.as_str()).await;
         }
     } else if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
