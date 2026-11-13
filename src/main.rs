@@ -45,6 +45,7 @@ impl WindowControl {
 
 // The installed desktop entry for this Wayland app ID supplies the window icon.
 const APP_ID: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights";
+const WINDOW_APP_ID: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights.Window";
 static AUTOSIZE_ID: LazyLock<Id> = LazyLock::new(|| Id::new("hue-lights-autosize"));
 static NOTE_ID: LazyLock<Id> = LazyLock::new(|| Id::new("hue-lights-shot-note"));
 // F12 pictures go to ~/Pictures/<this>/ (the app's name, the same in every language).
@@ -82,7 +83,7 @@ fn main() -> cosmic::iced::Result {
             Err(zbus::Error::NameTaken) => { runtime.block_on(close_running_window(WINDOW_BUS)); return Ok(()); }
             Err(e) => { eprintln!("Window unavailable: {e}"); return Ok(()); }
         };
-        cosmic::app::run::<HueLights>(cosmic::app::Settings::default()
+        cosmic::app::run::<HueLights<true>>(cosmic::app::Settings::default()
             .size({ let (width, height) = window_start_size(); cosmic::iced::Size::new(width, height) })
             .resizable(Some(8.0)).exit_on_close(true).is_daemon(false), true)
     } else {
@@ -335,7 +336,7 @@ fn bulb(on: bool) -> icon::Handle {
 // ------------------------------------------------------------------------- applet
 
 #[derive(Default)]
-struct HueLights {
+struct HueLights<const WINDOW_MODE: bool = false> {
     core: Core,
     window_mode: bool,
     popup: Option<window::Id>,
@@ -419,7 +420,7 @@ fn corners_setting() -> String {
     corners::normalize(read_pref("corners").as_ref().and_then(Value::as_str).unwrap_or("")).to_string()
 }
 
-impl HueLights {
+impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
     fn send(&self, command: Value) {
         if let Some(helper) = &self.helper {
             let _ = helper.unbounded_send(command.to_string());
@@ -839,11 +840,25 @@ impl HueLights {
     }
 }
 
-impl cosmic::Application for HueLights {
+impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
+    /// The `--window` toplevel's title (taskbars, Alt+Tab, window rules): libcosmic takes it from
+    /// the title it keeps per window (`set_window_title`); `Core::set_title` alone sends nothing,
+    /// which left the toplevel without a title on KDE and COSMIC.
+    fn name_window(&mut self) -> Task<Message> {
+        match self.core.main_window_id() {
+            Some(id) => cosmic::app::ApplicationExt::set_window_title(self, TITLE.into(), id),
+            None => Task::none(),
+        }
+    }
+}
+
+impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
     type Executor = cosmic::SingleThreadExecutor;
     type Flags = bool;
     type Message = Message;
-    const APP_ID: &'static str = APP_ID;
+    // Wayland's app id: the panel applet's, or the window's own (`<id>.Window`, the id of the
+    // `.Window.desktop` entry install.sh writes, so taskbars and window rules find it).
+    const APP_ID: &'static str = if WINDOW_MODE { WINDOW_APP_ID } else { APP_ID };
 
     fn core(&self) -> &Core {
         &self.core
@@ -855,8 +870,8 @@ impl cosmic::Application for HueLights {
 
     fn init(mut core: Core, window_mode: bool) -> (Self, Task<Message>) {
         if window_mode { core.set_header_title(TITLE.into()); }
-        let title = if window_mode { core.set_title(core.main_window_id(), TITLE.into()) } else { Task::none() };
         let mut app = Self { core, window_mode, shot_key: shot_key_setting(), corners: corners_setting(), ..Default::default() };
+        let title = if window_mode { app.name_window() } else { Task::none() };
         if window_mode { app.resize = window_size::Debounce::new(window_start_size()); }
         corners::set_current(&app.corners);
         // The desktop's theme for the whole window (title bar too), see look.rs.
@@ -1201,6 +1216,17 @@ async fn run_helper(output: &mut mpsc::Sender<Message>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_mode_names_its_toplevel() {
+        use cosmic::app::ApplicationExt;
+        let mut app = HueLights::<false>::default();
+        let id = cosmic::iced::window::Id::unique();
+        app.core.set_main_window_id(Some(id));
+        assert_eq!(app.title(id), "");
+        let _ = app.name_window();
+        assert_eq!(app.title(id), TITLE);
+    }
+
     use super::*;
 
     #[test]

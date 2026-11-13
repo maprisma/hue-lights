@@ -52,7 +52,7 @@ Icon=$id-symbolic
 Terminal=false
 NoDisplay=false
 Categories=Utility;
-StartupWMClass=$id
+StartupWMClass=$id.Window
 EOF
 cat > "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$id.Tray.desktop" <<EOF
 [Desktop Entry]
