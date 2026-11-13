@@ -10,9 +10,13 @@ pub const ICON: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights-symbolic";
 /// The bulb when no light is on (data/icons/hue-bulb-off-symbolic.svg, installed under this name).
 pub const ICON_OFF: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights-off-symbolic";
 
-/// The bar's bulb, as the applet draws it: lit while any light is on.
+/// The lit bulb in the theme's green (data/icons/hue-bulb-active-symbolic.svg, class
+/// ColorScheme-PositiveText): every Maprisma bar icon is "on" in this one colour.
+pub const ICON_ACTIVE: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights-active-symbolic";
+
+/// The bar's bulb, as the applet draws it: lit and green while any light is on.
 pub fn icon_for(stats: &Value) -> &'static str {
-    if number(stats, "on_count") > 0.0 { ICON } else { ICON_OFF }
+    if number(stats, "on_count") > 0.0 { ICON_ACTIVE } else { ICON_OFF }
 }
 pub const WINDOW_BUS: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights.Window";
 pub fn script_path() -> Option<PathBuf> {
@@ -56,7 +60,7 @@ mod tests {
     use serde_json::json;
     #[test]
     fn tray_bulb_follows_the_lights() {
-        assert_eq!(icon_for(&json!({"phase":"ok","on_count":2,"light_count":3})), ICON);
+        assert_eq!(icon_for(&json!({"phase":"ok","on_count":2,"light_count":3})), ICON_ACTIVE);
         assert_eq!(icon_for(&json!({"phase":"ok","on_count":0,"light_count":3})), ICON_OFF);
         assert_eq!(icon_for(&json!({"phase":"error"})), ICON_OFF);
         assert_eq!(icon_for(&Value::Null), ICON_OFF);

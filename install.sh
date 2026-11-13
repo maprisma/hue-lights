@@ -3,7 +3,7 @@
 #   ~/.local/bin/maprisma-hue-lights                   the applet
 #   ~/.local/share/maprisma-hue-lights/scripts/        the bridge helper
 #   ~/.local/share/applications/…desktop             makes it an applet for the panel
-#   ~/.local/share/icons/hicolor/scalable/apps/…svg  the bulb icons (lit, off)
+#   ~/.local/share/icons/hicolor/scalable/apps/…svg  the bulb icons (lit, lit green, off)
 # Then add it in COSMIC Settings › Desktop › Panel › Applets.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -74,6 +74,7 @@ install -Dm644 scripts/hue-lights.py "$data/maprisma-hue-lights/scripts/hue-ligh
 install -Dm644 "data/icons/$id-symbolic.svg" "$data/icons/hicolor/scalable/apps/$id-symbolic.svg"
 # The KDE/Hyprland tray's bulb while every light is off.
 install -Dm644 data/icons/hue-bulb-off-symbolic.svg "$data/icons/hicolor/scalable/apps/$id-off-symbolic.svg"
+install -Dm644 data/icons/hue-bulb-active-symbolic.svg "$data/icons/hicolor/scalable/apps/$id-active-symbolic.svg"
 # The panel starts applets without ~/.local/bin in PATH: the full path.
 while IFS= read -r line; do
     if [[ $line == Exec=* ]]; then
