@@ -83,10 +83,11 @@ fn main() -> cosmic::iced::Result {
             Err(zbus::Error::NameTaken) => { runtime.block_on(close_running_window(WINDOW_BUS)); return Ok(()); }
             Err(e) => { eprintln!("Window unavailable: {e}"); return Ok(()); }
         };
-        cosmic::app::run::<HueLights<true>>(cosmic::app::Settings::default()
+        cosmic::app::run::<HueLights<true>>(cosmic::app::Settings::default().default_font(maprisma_hue_lights::look::default_font())
             .size({ let (width, height) = window_start_size(); cosmic::iced::Size::new(width, height) })
             .resizable(Some(8.0)).exit_on_close(true).is_daemon(false), true)
     } else {
+        maprisma_hue_lights::look::keep_fonts();
         cosmic::applet::run::<HueLights>(false)
     }
 }
@@ -1131,6 +1132,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        maprisma_hue_lights::look::keep_fonts();
         if self.window_mode { return corners::apply_window(&self.corners, self.popup_content()); }
         let horizontal = matches!(self.core.applet.anchor, PanelAnchor::Top | PanelAnchor::Bottom);
         let padding = self.core.applet.suggested_padding(true).0;
@@ -1149,6 +1151,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
     }
 
     fn view_window(&self, _id: window::Id) -> Element<'_, Message> {
+        maprisma_hue_lights::look::keep_fonts();
         if self.window_mode { return corners::apply_window(&self.corners, self.popup_content()); }
 
         corners::apply(&self.corners, self.core.applet.popup_container(self.popup_content()))
