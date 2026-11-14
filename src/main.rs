@@ -740,6 +740,10 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         if let Some(size) = size {
             self.setting_error = write_pref(window_size::KEY, Some(window_size::to_value(size))).is_err();
         }
+        // Hyprland: where the user left it, for the next open (a move sends no event, so on close).
+        if closing && let Some(position) = window_size::current_position() {
+            self.setting_error |= write_pref(window_size::POSITION_KEY, Some(window_size::position_value(position))).is_err();
+        }
     }
 
     fn popup_closed(&mut self) -> Task<Message> {
@@ -874,7 +878,11 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
         if window_mode { core.set_header_title(TITLE.into()); }
         let mut app = Self { core, window_mode, shot_key: shot_key_setting(), corners: corners_setting(), ..Default::default() };
         let title = if window_mode { app.name_window() } else { Task::none() };
-        if window_mode { app.resize = window_size::Debounce::new(window_start_size()); }
+        if window_mode {
+            app.resize = window_size::Debounce::new(window_start_size());
+            // Hyprland: back where the user left it (the tray rule first puts it under the bar).
+            window_size::restore_position(window_size::parse_position(read_pref(window_size::POSITION_KEY).as_ref()), window_start_size());
+        }
         corners::set_current(&app.corners);
         // The desktop's theme for the whole window (title bar too), see look.rs.
         let theme = if window_mode { corners::set_app_theme(&app.corners) } else { Task::none() };
