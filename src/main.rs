@@ -869,6 +869,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
     }
 
     fn init(mut core: Core, window_mode: bool) -> (Self, Task<Message>) {
+        maprisma_hue_lights::look::solid(&mut core);
         if window_mode { core.set_header_title(TITLE.into()); }
         let mut app = Self { core, window_mode, shot_key: shot_key_setting(), corners: corners_setting(), ..Default::default() };
         let title = if window_mode { app.name_window() } else { Task::none() };
