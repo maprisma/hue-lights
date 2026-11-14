@@ -98,26 +98,35 @@ fn window_start_size() -> window_size::Size {
 }
 
 /// What Esc does (layout rule 5a): the innermost open thing first, then the window or popup.
-/// (An open Language / Corners drop-down closes itself and keeps that Esc.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscStep {
     /// Skip the screenshot's note (or close its error).
     Note,
     /// Drop the "Unpair?" question.
     Confirm,
+    /// Close the open Language / Corners list.
+    Menus,
+    /// Leave the settings page.
+    Back,
     /// Close the window (`--window`) or the popup.
     Close,
     Nothing,
 }
 
-/// `shown`: Esc came from the window or the open popup (not the panel button).
-fn esc_step(shown: bool, note: bool, confirm: bool) -> EscStep {
+/// `shown`: Esc came from the window or the open popup (not the panel button); `note`: the
+/// screenshot card shows; `confirm`: "Really unpair?" shows; `menus`: a Language / Corners list
+/// is open; `settings`: the settings page shows.
+fn esc_step(shown: bool, note: bool, confirm: bool, menus: bool, settings: bool) -> EscStep {
     if !shown {
         EscStep::Nothing
     } else if note {
         EscStep::Note
     } else if confirm {
         EscStep::Confirm
+    } else if menus {
+        EscStep::Menus
+    } else if settings {
+        EscStep::Back
     } else {
         EscStep::Close
     }
@@ -359,6 +368,10 @@ struct HueLights<const WINDOW_MODE: bool = false> {
     corners: String,
     setting_error: bool,
     resize: window_size::Debounce,
+    /// The settings page (Language, F12, Corners) is shown instead of the rooms.
+    settings_open: bool,
+    language_open: bool,
+    corners_open: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -396,6 +409,9 @@ enum Message {
     NoteSaved(Result<(), String>),
     SetShotKey(bool),
     Corners(String),
+    ToggleSettings,
+    ToggleLanguage,
+    ToggleCorners,
 }
 
 // Runs `work` on its own thread (saving must not hold up the popup) and answers with `done`.
@@ -505,6 +521,12 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             let pill = trf("{0} of {1} on", &[self.on_count().to_string(), num(&self.stats, "light_count").to_string()]);
             header = header.push(container(text::caption(pill)).padding([4, 8]).class(pill_style()));
         }
+        // Settings at the header's right end, as in Maprisma Launcher.
+        header = header.push(cosmic::widget::tooltip(
+            button::icon(icon::from_name("emblem-system-symbolic").symbolic(true)).on_press(Message::ToggleSettings),
+            text::body(tr("Settings")),
+            cosmic::widget::tooltip::Position::Bottom,
+        ));
         header.into()
     }
 
@@ -780,38 +802,64 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         Some(card.into())
     }
 
+    /// Settings (as Maprisma Launcher's page): ← Back and the title, then one row per setting,
+    /// words at the left and the control at the right; a list opens under its row.
+    fn settings_page(&self) -> Element<'_, Message> {
+        let header = row![
+            button::text(tr("Back")).leading_icon(icon::from_name("go-previous-symbolic").size(16)).on_press(Message::ToggleSettings),
+            space::horizontal().width(Length::Fill),
+            dim(tr("Settings").to_uppercase()),
+        ]
+        .align_y(Alignment::Center);
+        let choice = |label: String, open: bool, message: Message| -> Element<'static, Message> {
+            button::text(label)
+                .trailing_icon(icon::from_name(if open { "pan-up-symbolic" } else { "pan-down-symbolic" }).size(16))
+                .on_press(message)
+                .into()
+        };
+        let setting = |label: String, control: Element<'static, Message>| {
+            padded_control(row![text::body(label), space::horizontal().width(Length::Fill), control].spacing(12).align_y(Alignment::Center))
+        };
+        let language = maprisma_hue_lights::i18n::setting();
+        let choices = maprisma_hue_lights::i18n::choices();
+        let current = choices.iter().find(|(code, _)| *code == language).map(|(_, l)| l.clone()).unwrap_or_default();
+        let mut page = column![padded_control(header), divider::horizontal::default()];
+        page = page.push(setting(tr("Language"), choice(current, self.language_open, Message::ToggleLanguage)));
+        if self.language_open {
+            for (code, label) in choices {
+                let label = if code == language { format!("✓ {label}") } else { label };
+                page = page.push(menu_button(text::body(label)).on_press(Message::Language(code)));
+            }
+        }
+        page = page.push(setting(tr("F12 saves a screenshot"), toggler(self.shot_key).on_toggle(Message::SetShotKey).into()));
+        let corner_choices = [
+            ("desktop", trf("Like the desktop ({0} px)", &[corners::desktop_radius().round().to_string()])),
+            ("slight", trf("Slightly rounded ({0} px)", &["6".into()])),
+            ("rounded", trf("Rounded ({0} px)", &["12".into()])),
+            ("square", tr("Square")),
+        ];
+        let current = corner_choices.iter().find(|(c, _)| *c == self.corners).map(|(_, l)| l.clone()).unwrap_or_default();
+        page = page.push(setting(tr("Corners"), choice(current, self.corners_open, Message::ToggleCorners)));
+        if self.corners_open {
+            for (choice, label) in corner_choices {
+                let label = if self.corners == choice { format!("✓ {label}") } else { label };
+                page = page.push(menu_button(text::body(label)).on_press(Message::Corners(choice.into())));
+            }
+        }
+        if self.language_error { page = page.push(padded_control(error_text(tr("Could not save language setting.")))); }
+        if self.setting_error { page = page.push(padded_control(error_text(tr("Could not save the setting.")))); }
+        let page = page.width(if self.window_mode { Length::Fill } else { Length::Fixed(POPUP_WIDTH) }).padding([0, 0, 8, 0]);
+        scrollable(page).height(if self.window_mode { Length::Fill } else { Length::Shrink }).into()
+    }
+
     fn popup_content(&self) -> Element<'_, Message> {
         if let Some(overlay) = self.shot_overlay() {
             return overlay;
         }
-        let choices = maprisma_hue_lights::i18n::choices();
-        let selected = choices.iter().position(|(code, _)| code == &maprisma_hue_lights::i18n::setting());
-        let labels: Vec<String> = choices.iter().map(|(_, label)| label.clone()).collect();
-        let mut language_content = column![].spacing(4);
-        if self.language_error { language_content = language_content.push(error_text(tr("Could not save language setting."))); }
-        let language = row![text::body(tr("Language")), cosmic::widget::dropdown(labels, selected, move |i| Message::Language(choices[i].0.clone()))].spacing(8).align_y(Alignment::Center);
-        let screenshot = row![
-            text::body(tr("F12 saves a screenshot")),
-            space::horizontal().width(Length::Fill),
-            toggler(self.shot_key).on_toggle(Message::SetShotKey),
-        ]
-        .align_y(Alignment::Center);
-        let corner_labels = vec![
-            trf("Like the desktop ({0} px)", &[corners::desktop_radius().round().to_string()]),
-            trf("Slightly rounded ({0} px)", &["6".into()]),
-            trf("Rounded ({0} px)", &["12".into()]),
-            tr("Square"),
-        ];
-        let corner_selected = corners::CHOICES.iter().position(|c| *c == self.corners);
-        let corners_row = row![
-            text::body(tr("Corners")),
-            cosmic::widget::dropdown(corner_labels, corner_selected, |i| Message::Corners(corners::CHOICES[i].into())),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-        language_content = language_content.push(language).push(screenshot).push(corners_row);
-        if self.setting_error { language_content = language_content.push(error_text(tr("Could not save the setting."))); }
-        let content = column![padded_control(self.details()).padding([12, 16]), padded_control(language_content), self.actions()]
+        if self.settings_open {
+            return self.settings_page();
+        }
+        let content = column![padded_control(self.details()).padding([12, 16]), self.actions()]
             .width(if self.window_mode { Length::Fill } else { Length::Fixed(POPUP_WIDTH) })
             .padding([0, 0, 8, 0]);
         if self.window_mode {
@@ -877,6 +925,8 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
         maprisma_hue_lights::look::solid(&mut core);
         if window_mode { core.set_header_title(TITLE.into()); }
         let mut app = Self { core, window_mode, shot_key: shot_key_setting(), corners: corners_setting(), ..Default::default() };
+        // Debug builds only: start on the settings page (for off-screen screenshots).
+        app.settings_open = cfg!(debug_assertions) && std::env::var("MAPRISMA_SHOT_PAGE").as_deref() == Ok("settings");
         let title = if window_mode { app.name_window() } else { Task::none() };
         if window_mode {
             app.resize = window_size::Debounce::new(window_start_size());
@@ -1070,6 +1120,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             Message::CancelPair => self.send(json!({"cmd": "cancel_pair"})),
             Message::Language(code) => {
                 self.language_error = maprisma_hue_lights::i18n::save(&code).is_err();
+                self.language_open = false;
             }
             Message::ShotKey(id) => {
                 let shown = if self.window_mode { self.core.main_window_id() == Some(id) } else { self.popup == Some(id) };
@@ -1101,9 +1152,11 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             Message::NoteDone => return self.finish_note(true),
             Message::Escape(id) => {
                 let shown = if self.window_mode { self.core.main_window_id() == Some(id) } else { self.popup == Some(id) };
-                match esc_step(shown, self.shot.open(), self.confirm_unpair) {
+                match esc_step(shown, self.shot.open(), self.confirm_unpair, self.language_open || self.corners_open, self.settings_open) {
                     EscStep::Note => return self.finish_note(false),
                     EscStep::Confirm => self.confirm_unpair = false,
+                    EscStep::Menus => { self.language_open = false; self.corners_open = false; }
+                    EscStep::Back => self.settings_open = false,
                     // Like the window's own close (the tray keeps running); the popup like a click on the icon.
                     EscStep::Close if self.window_mode => return self.update(Message::CloseRequested(id)),
                     EscStep::Close => return self.update(Message::TogglePopup),
@@ -1125,8 +1178,17 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                 self.setting_error = write_pref("corners", value).is_err();
                 self.corners = choice.to_string();
                 corners::set_current(choice);
+                self.corners_open = false;
                 if self.window_mode { return corners::set_app_theme(choice); }
             }
+            Message::ToggleSettings => {
+                self.settings_open = !self.settings_open;
+                self.language_open = false;
+                self.corners_open = false;
+                self.confirm_unpair = false;
+            }
+            Message::ToggleLanguage => { self.language_open = !self.language_open; self.corners_open = false; }
+            Message::ToggleCorners => { self.corners_open = !self.corners_open; self.language_open = false; }
             Message::Unpair => {
                 if self.confirm_unpair {
                     self.confirm_unpair = false;
@@ -1243,11 +1305,13 @@ mod tests {
 
     #[test]
     fn esc_closes_the_innermost_thing_first() {
-        assert_eq!(esc_step(true, true, true), EscStep::Note);
-        assert_eq!(esc_step(true, false, true), EscStep::Confirm);
-        assert_eq!(esc_step(true, false, false), EscStep::Close);
+        assert_eq!(esc_step(true, true, true, true, true), EscStep::Note);
+        assert_eq!(esc_step(true, false, true, true, true), EscStep::Confirm);
+        assert_eq!(esc_step(true, false, false, true, true), EscStep::Menus);
+        assert_eq!(esc_step(true, false, false, false, true), EscStep::Back);
+        assert_eq!(esc_step(true, false, false, false, false), EscStep::Close);
         // Not from the window or the open popup (e.g. the panel button): nothing.
-        assert_eq!(esc_step(false, true, true), EscStep::Nothing);
-        assert_eq!(esc_step(false, false, false), EscStep::Nothing);
+        assert_eq!(esc_step(false, true, true, true, true), EscStep::Nothing);
+        assert_eq!(esc_step(false, false, false, false, false), EscStep::Nothing);
     }
 }
