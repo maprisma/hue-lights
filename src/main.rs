@@ -13,11 +13,16 @@ use maprisma_hue_lights::{corners, shot};
 mod model;
 mod window_size;
 use model::{
-    COLOR_PRESETS, CONFIRM_ALL_ON_KEY, DAYS_ORDER, EXCLUDE_ALL_ON_KEY, FAVORITES_KEY, Favorite, RoomFilter, RuleDraft,
-    ScheduleDraft, Tab, TargetOption, WARMTH_PRESETS, all_targets, belongs_to_rule, clamp_mirek, day_short_toggle,
-    effect_label, favorites_to_value, format_unix_ts, has_active_schedule, is_favorite, parse_favorites,
-    parse_string_set, resolve_name, room_matches_filter, schedule_action_summary, schedule_trigger_summary,
-    sorted_exclude_list, string_set_to_value, toggle_favorite,
+    COLOR_PRESETS, CONFIRM_ALL_ON_KEY, DAYS_ORDER, EXCLUDE_ALL_ON_KEY, FAVORITES_KEY, FONT_SCALES, FONT_SCALE_KEY,
+    Favorite, PANEL_ICONS, PANEL_ICON_KEY, RoomFilter, RuleDraft, SCHEDULE_MODES, SCHEDULE_MODE_KEY, SHOW_COUNT_KEY,
+    SKINS, SKIN_KEY, SYNTH_BANDS, SYNTH_MODES, SYNTH_PALETTES, SYNTH_SOURCES, ScheduleDraft, Tab, TargetOption,
+    ThemeDraft, WARMTH_PRESETS, all_targets, belongs_to_rule, clamp_mirek, day_short_toggle, effect_label,
+    favorites_to_value, font_scale_factor, font_scale_label, format_unix_ts, has_active_schedule, is_favorite,
+    normalize_font_scale, normalize_panel_icon, normalize_schedule_mode, normalize_skin, panel_icon_glyph,
+    panel_icon_label, panel_icon_svg, parse_favorites, parse_string_set, resolve_name, room_matches_filter,
+    schedule_action_summary, schedule_mode_label, schedule_trigger_summary, skin_label, skin_style,
+    sorted_exclude_list, string_set_to_value, synth_band_label, synth_mode_label, synth_palette_label,
+    synth_palette_swatch, synth_source_label, synth_target_lights, toggle_favorite,
 };
 use std::collections::{HashMap, HashSet};
 use maprisma_hue_lights::{TITLE, WINDOW_BUS, script_path};
@@ -299,32 +304,43 @@ fn tinted_svg(c: Color) -> theme::Svg {
     theme::Svg::custom(move |_| iced_svg::Style { color: Some(c) })
 }
 
-// The lit bulb: the theme accent.
-fn lit_svg() -> theme::Svg {
-    theme::Svg::custom(|theme: &cosmic::Theme| iced_svg::Style { color: Some(theme.cosmic().accent_color().into()) })
+// The lit bulb/icon: skin accent if active, else the theme accent.
+fn lit_svg_for(skin: &str) -> theme::Svg {
+    let custom = skin_style(skin).map(|st| st.accent);
+    theme::Svg::custom(move |theme: &cosmic::Theme| iced_svg::Style {
+        color: Some(custom.unwrap_or_else(|| theme.cosmic().accent_color().into())),
+    })
 }
 
-fn card(tint: Option<Color>) -> theme::Container<'static> {
+fn card(tint: Option<Color>, skin: &str) -> theme::Container<'static> {
+    let skin_st = skin_style(skin);
     theme::Container::custom(move |theme: &cosmic::Theme| {
         let base = Color::from(theme.cosmic().on_bg_color());
-        let (bg, border) = match tint {
-            Some(t) => (with_alpha(t, 0.12), with_alpha(t, 0.4)),
-            None => (with_alpha(base, 0.05), with_alpha(base, 0.1)),
+        let (bg, border, width) = match (tint, skin_st) {
+            (Some(t), Some(st)) => (with_alpha(t, 0.13), with_alpha(t, 0.50), st.border_width),
+            (Some(t), None) => (with_alpha(t, 0.12), with_alpha(t, 0.4), 1.0),
+            (None, Some(st)) => (with_alpha(st.bg_tint, 0.14), with_alpha(st.border_tint, 0.35), st.border_width),
+            (None, None) => (with_alpha(base, 0.05), with_alpha(base, 0.1), 1.0),
         };
         iced_container::Style {
             background: Some(Background::Color(bg)),
-            border: Border { radius: corners::now().radius.into(), width: 1.0, color: border },
+            border: Border { radius: corners::now().radius.into(), width, color: border },
             ..Default::default()
         }
     })
 }
 
-fn sub_card() -> theme::Container<'static> {
-    theme::Container::custom(|theme: &cosmic::Theme| {
+fn sub_card(skin: &str) -> theme::Container<'static> {
+    let skin_st = skin_style(skin);
+    theme::Container::custom(move |theme: &cosmic::Theme| {
         let base = Color::from(theme.cosmic().on_bg_color());
+        let (bg, border) = match skin_st {
+            Some(st) => (with_alpha(st.bg_tint, 0.10), with_alpha(st.border_tint, 0.28)),
+            None => (with_alpha(base, 0.04), with_alpha(base, 0.12)),
+        };
         iced_container::Style {
-            background: Some(Background::Color(with_alpha(base, 0.04))),
-            border: Border { radius: corners::now().small.into(), width: 1.0, color: with_alpha(base, 0.12) },
+            background: Some(Background::Color(bg)),
+            border: Border { radius: corners::now().small.into(), width: 1.0, color: border },
             ..Default::default()
         }
     })
@@ -341,20 +357,88 @@ fn badge(tint: Option<Color>) -> theme::Container<'static> {
     })
 }
 
-fn pill_style() -> theme::Container<'static> {
-    theme::Container::custom(|theme: &cosmic::Theme| iced_container::Style {
-        background: Some(Background::Color(with_alpha(Color::from(theme.cosmic().on_bg_color()), 0.12))),
-        border: Border { radius: corners::now().pill.into(), ..Default::default() },
-        ..Default::default()
+fn pill_style(skin: &str) -> theme::Container<'static> {
+    let skin_st = skin_style(skin);
+    theme::Container::custom(move |theme: &cosmic::Theme| match skin_st {
+        Some(st) => iced_container::Style {
+            background: Some(Background::Color(with_alpha(st.accent, 0.18))),
+            border: Border { radius: corners::now().pill.into(), width: 1.0, color: with_alpha(st.border_tint, 0.30) },
+            ..Default::default()
+        },
+        None => iced_container::Style {
+            background: Some(Background::Color(with_alpha(Color::from(theme.cosmic().on_bg_color()), 0.12))),
+            border: Border { radius: corners::now().pill.into(), ..Default::default() },
+            ..Default::default()
+        },
     })
 }
 
-fn segmented_bar_style() -> theme::Container<'static> {
-    theme::Container::custom(|theme: &cosmic::Theme| {
-        let base = Color::from(theme.cosmic().on_bg_color());
+fn beat_pill_style(active: bool) -> theme::Container<'static> {
+    theme::Container::custom(move |theme: &cosmic::Theme| {
+        let bg = if active {
+            Color::from_rgb(0.95, 0.25, 0.45)
+        } else {
+            with_alpha(Color::from(theme.cosmic().on_bg_color()), 0.10)
+        };
         iced_container::Style {
-            background: Some(Background::Color(with_alpha(base, 0.06))),
-            border: Border { radius: corners::now().small.into(), width: 1.0, color: with_alpha(base, 0.12) },
+            background: Some(Background::Color(bg)),
+            border: Border { radius: corners::now().pill.into(), ..Default::default() },
+            ..Default::default()
+        }
+    })
+}
+
+fn meter_bar<'a>(label: String, value: f64, fill: Color) -> Element<'a, Message> {
+    let clamped = value.clamp(0.0, 1.0);
+    let pct = (clamped * 100.0).round() as u16;
+    let fill_el = container(space::horizontal())
+        .height(Length::Fill)
+        .class(theme::Container::custom(move |_| iced_container::Style {
+            background: Some(Background::Color(fill)),
+            border: Border { radius: corners::now().pill.into(), ..Default::default() },
+            ..Default::default()
+        }));
+    let track_inner: Element<Message> = if pct == 0 {
+        space::horizontal().into()
+    } else if pct >= 100 {
+        fill_el.width(Length::Fill).into()
+    } else {
+        row![
+            fill_el.width(Length::FillPortion(pct)),
+            space::horizontal().width(Length::FillPortion(100 - pct)),
+        ]
+        .height(Length::Fill)
+        .into()
+    };
+    let track = container(track_inner)
+        .width(Length::Fill)
+        .height(Length::Fixed(10.0))
+        .class(theme::Container::custom(|theme: &cosmic::Theme| iced_container::Style {
+            background: Some(Background::Color(with_alpha(Color::from(theme.cosmic().on_bg_color()), 0.12))),
+            border: Border { radius: corners::now().pill.into(), ..Default::default() },
+            ..Default::default()
+        }));
+    row![
+        container(dim(label)).width(Length::Fixed(54.0)),
+        track,
+        container(dim(format!("{pct}%"))).width(Length::Fixed(36.0)).align_x(Alignment::End),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn segmented_bar_style(skin: &str) -> theme::Container<'static> {
+    let skin_st = skin_style(skin);
+    theme::Container::custom(move |theme: &cosmic::Theme| {
+        let base = Color::from(theme.cosmic().on_bg_color());
+        let (bg, border, width) = match skin_st {
+            Some(st) => (with_alpha(st.bg_tint, 0.14), with_alpha(st.border_tint, 0.35), st.border_width),
+            None => (with_alpha(base, 0.06), with_alpha(base, 0.12), 1.0),
+        };
+        iced_container::Style {
+            background: Some(Background::Color(bg)),
+            border: Border { radius: corners::now().small.into(), width, color: border },
             ..Default::default()
         }
     })
@@ -376,14 +460,25 @@ fn swatch_sized<'a>(c: Option<Color>, reachable: bool, size: f32) -> Element<'a,
         .into()
 }
 
-fn mini_badge<'a>(label: String) -> Element<'a, Message> {
-    container(dim(label)).padding([1, 6]).class(pill_style()).into()
+fn mini_badge<'a>(label: String, skin: &str) -> Element<'a, Message> {
+    container(dim(label)).padding([1, 6]).class(pill_style(skin)).into()
 }
 
 fn bulb(on: bool) -> icon::Handle {
     let mut handle = icon::from_svg_bytes(if on { BULB_ON } else { BULB_OFF });
     handle.symbolic = true;
     handle
+}
+
+fn panel_icon_handle(icon_key: &str, lit: bool) -> icon::Handle {
+    match panel_icon_svg(icon_key) {
+        Some(bytes) => {
+            let mut handle = icon::from_svg_bytes(bytes);
+            handle.symbolic = true;
+            handle
+        }
+        None => bulb(lit),
+    }
 }
 
 // ------------------------------------------------------------------------- applet
@@ -409,9 +504,13 @@ struct HueLights<const WINDOW_MODE: bool = false> {
     confirm_all_on: bool,
     schedule_draft: Option<ScheduleDraft>,
     rule_draft: Option<RuleDraft>,
+    theme_draft: Option<ThemeDraft>,
     activity_open: bool,
     // A slider being dragged: its value, and when it was last sent.
     dragging: HashMap<String, (u8, Instant)>,
+    synth_sens_drag: Option<(f32, Instant)>,
+    synth_smooth_drag: Option<(f32, Instant)>,
+    synth_room_picker_open: bool,
     ip: String,
     confirm_unpair: bool,
     language_error: bool,
@@ -420,12 +519,21 @@ struct HueLights<const WINDOW_MODE: bool = false> {
     capturing: bool,
     shot_key: bool,
     corners: String,
+    schedule_mode: String,
+    skin: String,
+    panel_icon: String,
+    show_count: bool,
+    font_scale: String,
     setting_error: bool,
     resize: window_size::Debounce,
-    /// The settings page (Language, F12, Corners, Confirm All On) is shown instead of the tabs.
+    /// The settings page is shown instead of the tabs.
     settings_open: bool,
     language_open: bool,
     corners_open: bool,
+    skin_open: bool,
+    panel_icon_open: bool,
+    font_scale_open: bool,
+    schedule_mode_open: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -448,6 +556,13 @@ enum Message {
     LightMirek(String, u16),
     LightXy(String, [f64; 2]),
     LightEffect(String, String),
+    // Light themes
+    ThemeApply(String, String),
+    ThemeDelete(String),
+    StartSaveTheme(String),
+    ThemeDraftName(String),
+    ThemeDraftSave,
+    ThemeDraftCancel,
     RoomOn(String, bool),
     LightOn(String, bool),
     // "room:<key>" or "light:<id>", the value
@@ -497,6 +612,19 @@ enum Message {
     RuleToggle(String, bool),
     RuleDelete(String),
     ToggleActivity,
+    // Synth
+    SynthStart,
+    SynthStop,
+    SynthSource(String),
+    SynthMode(String),
+    SynthPalette(String),
+    SynthToggleRoomPicker,
+    SynthPickRoom(String),
+    SynthSensitivity(u16),
+    SynthSensitivityDone,
+    SynthSmoothness(u16),
+    SynthSmoothnessDone,
+    SynthLightBand(String, String),
     // Pairing & settings
     Ip(String),
     Pair(String),
@@ -514,9 +642,18 @@ enum Message {
     SetShotKey(bool),
     SetConfirmAllOnPref(bool),
     Corners(String),
+    SetScheduleMode(String),
+    SetSkin(String),
+    SetPanelIcon(String),
+    SetShowCount(bool),
+    SetFontScale(String),
     ToggleSettings,
     ToggleLanguage,
     ToggleCorners,
+    ToggleSkin,
+    TogglePanelIcon,
+    ToggleFontScale,
+    ToggleScheduleMode,
 }
 
 // Runs `work` on its own thread (saving must not hold up the popup) and answers with `done`.
@@ -544,6 +681,26 @@ fn confirm_all_on_setting() -> bool {
 
 fn corners_setting() -> String {
     corners::normalize(read_pref("corners").as_ref().and_then(Value::as_str).unwrap_or("")).to_string()
+}
+
+fn schedule_mode_setting() -> String {
+    normalize_schedule_mode(read_pref(SCHEDULE_MODE_KEY).as_ref().and_then(Value::as_str).unwrap_or("")).to_string()
+}
+
+fn skin_setting() -> String {
+    normalize_skin(read_pref(SKIN_KEY).as_ref().and_then(Value::as_str).unwrap_or("")).to_string()
+}
+
+fn panel_icon_setting() -> String {
+    normalize_panel_icon(read_pref(PANEL_ICON_KEY).as_ref().and_then(Value::as_str).unwrap_or("")).to_string()
+}
+
+fn show_count_setting() -> bool {
+    read_pref(SHOW_COUNT_KEY).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+fn font_scale_setting() -> String {
+    normalize_font_scale(read_pref(FONT_SCALE_KEY).as_ref().and_then(Value::as_str).unwrap_or("")).to_string()
 }
 
 fn favorites_setting() -> Vec<Favorite> {
@@ -629,11 +786,13 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
     }
 
     fn any_picker_open(&self) -> bool {
-        self.schedule_draft.as_ref().is_some_and(|d| d.target_picker_open)
+        self.synth_room_picker_open
+            || self.schedule_draft.as_ref().is_some_and(|d| d.target_picker_open)
             || self.rule_draft.as_ref().is_some_and(|d| d.trigger_picker_open || d.target_picker_open)
     }
 
     fn close_pickers(&mut self) {
+        self.synth_room_picker_open = false;
         if let Some(d) = &mut self.schedule_draft {
             d.target_picker_open = false;
         }
@@ -643,33 +802,76 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         }
     }
 
+    fn close_settings_menus(&mut self) {
+        self.language_open = false;
+        self.corners_open = false;
+        self.skin_open = false;
+        self.panel_icon_open = false;
+        self.font_scale_open = false;
+        self.schedule_mode_open = false;
+    }
+
+    fn any_settings_menu_open(&self) -> bool {
+        self.language_open
+            || self.corners_open
+            || self.skin_open
+            || self.panel_icon_open
+            || self.font_scale_open
+            || self.schedule_mode_open
+    }
+
     fn any_drawer_open(&self) -> bool {
-        self.open_light_drawer.is_some() || self.schedule_draft.is_some() || self.rule_draft.is_some()
+        self.open_light_drawer.is_some()
+            || self.theme_draft.is_some()
+            || self.schedule_draft.is_some()
+            || self.rule_draft.is_some()
+    }
+
+    fn apply_window_theme(&self) -> Task<Message> {
+        if !self.window_mode {
+            return Task::none();
+        }
+        let scale = maprisma_hue_lights::look::text_scale() * font_scale_factor(&self.font_scale);
+        Task::batch([
+            corners::set_app_theme(&self.corners),
+            cosmic::command::set_scaling_factor(scale),
+        ])
     }
 
     fn panel_content(&self) -> Element<'_, Message> {
         let lit = self.on_count() > 0.0;
         let size = self.core.applet.suggested_size(true).0;
-        let mut bulb = icon::icon(bulb(lit)).size(size);
+        let mut glyph = icon::icon(panel_icon_handle(&self.panel_icon, lit)).size(size);
         if lit {
-            bulb = bulb.class(lit_svg());
+            glyph = glyph.class(lit_svg_for(&self.skin));
         } else {
-            bulb = bulb.opacity(0.6);
+            glyph = glyph.opacity(0.6);
         }
-        bulb.into()
+        if self.show_count && self.phase() == "ok" {
+            let count = (self.on_count().round().max(0.0) as u64).to_string();
+            let label: Element<Message> = if lit { text::caption(count).into() } else { dim(count) };
+            let horizontal = matches!(self.core.applet.anchor, PanelAnchor::Top | PanelAnchor::Bottom);
+            if horizontal {
+                row![glyph, label].spacing(4).align_y(Alignment::Center).into()
+            } else {
+                column![glyph, label].spacing(2).align_x(Alignment::Center).into()
+            }
+        } else {
+            glyph.into()
+        }
     }
 
     fn header(&self) -> Element<'_, Message> {
         let lit = self.on_count() > 0.0;
-        let mut hero = icon::icon(bulb(lit)).size(32);
-        hero = if lit { hero.class(lit_svg()) } else { hero.opacity(0.6) };
+        let mut hero = icon::icon(panel_icon_handle(&self.panel_icon, lit)).size(32);
+        hero = if lit { hero.class(lit_svg_for(&self.skin)) } else { hero.opacity(0.6) };
         let meta = if self.paired() { bridge_text(&self.stats) } else { tr("No bridge paired") };
         let mut header = row![hero, column![text::title4(tr("Maprisma Hue Lights")), dim(meta)].spacing(4), space::horizontal()]
             .spacing(12)
             .align_y(Alignment::Center);
         if self.phase() == "ok" {
             let pill = trf("{0} of {1} on", &[self.on_count().to_string(), num(&self.stats, "light_count").to_string()]);
-            header = header.push(container(text::caption(pill)).padding([4, 8]).class(pill_style()));
+            header = header.push(container(text::caption(pill)).padding([4, 8]).class(pill_style(&self.skin)));
         }
         // Settings at the header's right end, as in Maprisma Launcher.
         header = header.push(cosmic::widget::tooltip(
@@ -684,24 +886,28 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         let sch_count = list(&self.stats, "schedules").len();
         let rule_count = list(&self.stats, "rules").len();
         let paused = flag(&self.stats, "rules_paused");
+        let synth_running = self.stats.get("synth").is_some_and(|sy| flag(sy, "running"));
 
-        let tab_btn = |tab: Tab, label: String, count: usize, dimmed: bool| -> Element<'_, Message> {
+        let tab_btn = |tab: Tab, label: String, count: usize, dimmed: bool, live: bool| -> Element<'_, Message> {
             let active = self.tab == tab;
             let text_el: Element<Message> = if dimmed && !active {
                 dim(label)
             } else {
                 text::caption(label).into()
             };
-            let mut inner = row![text_el].spacing(6).align_y(Alignment::Center);
+            let mut inner = row![text_el].spacing(4).align_y(Alignment::Center);
             if count > 0 {
-                inner = inner.push(container(text::caption(count.to_string())).padding([1, 6]).class(pill_style()));
+                inner = inner.push(container(text::caption(count.to_string())).padding([1, 5]).class(pill_style(&self.skin)));
+            }
+            if live {
+                inner = inner.push(swatch_sized(Some(Color::from_rgb(0.95, 0.25, 0.45)), true, 7.0));
             }
             if dimmed {
                 inner = inner.push(dim("⏸"));
             }
             button::custom(container(inner).width(Length::Fill).align_x(Alignment::Center))
                 .width(Length::FillPortion(1))
-                .padding([6, 8])
+                .padding([6, 6])
                 .class(if active { theme::Button::Suggested } else { theme::Button::MenuItem })
                 .on_press(Message::SelectTab(tab))
                 .into()
@@ -709,15 +915,16 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
 
         container(
             row![
-                tab_btn(Tab::Lights, tr("Lights"), 0, false),
-                tab_btn(Tab::Schedules, tr("Schedules"), sch_count, false),
-                tab_btn(Tab::Rules, tr("Rules"), rule_count, paused),
+                tab_btn(Tab::Lights, tr("Lights"), 0, false, false),
+                tab_btn(Tab::Schedules, tr("Schedules"), sch_count, false, false),
+                tab_btn(Tab::Rules, tr("Rules"), rule_count, paused, false),
+                tab_btn(Tab::Synth, tr("Synth"), 0, false, synth_running),
             ]
             .spacing(4),
         )
         .padding(4)
         .width(Length::Fill)
-        .class(segmented_bar_style())
+        .class(segmented_bar_style(&self.skin))
         .into()
     }
 
@@ -1030,7 +1237,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                 );
             }
         }
-        container(card_content).padding(12).width(Length::Fill).class(card(tint)).into()
+        container(card_content).padding(12).width(Length::Fill).class(card(tint, &self.skin)).into()
     }
 
     fn light_row<'a>(&'a self, light: &'a Value) -> Element<'a, Message> {
@@ -1050,10 +1257,10 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         let label_col: Element<Message> = if has_sched || has_rule {
             let mut badges = row![].spacing(4).align_y(Alignment::Center);
             if has_sched {
-                badges = badges.push(mini_badge(tr("Schedule")));
+                badges = badges.push(mini_badge(tr("Schedule"), &self.skin));
             }
             if has_rule {
-                badges = badges.push(mini_badge(tr("Rule")));
+                badges = badges.push(mini_badge(tr("Rule"), &self.skin));
             }
             column![name_el, badges].spacing(2).into()
         } else {
@@ -1153,6 +1360,63 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             }
         }
 
+        // Per-lamp Light themes
+        let themes = list(&self.stats, "themes");
+        if !themes.is_empty() || self.theme_draft.as_ref().is_some_and(|d| d.light_id == id) {
+            let mut theme_chips: Vec<Element<Message>> = Vec::new();
+            for th in themes {
+                let tid = s(th, "id").to_string();
+                let tname = s(th, "name").to_string();
+                let tcol = color(th.get("hex").unwrap_or(&Value::Null));
+                let built_in = flag(th, "built_in");
+                let apply_btn = button::custom(
+                    row![swatch_sized(Some(tcol), true, 10.0), text::caption(tname)]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                )
+                .padding([4, 8])
+                .class(theme::Button::Standard)
+                .on_press(Message::ThemeApply(tid.clone(), id.clone()));
+                if built_in {
+                    theme_chips.push(apply_btn.into());
+                } else {
+                    let del_btn = button::custom(text::caption("×"))
+                        .padding([4, 6])
+                        .class(theme::Button::Destructive)
+                        .on_press(Message::ThemeDelete(tid));
+                    theme_chips.push(row![apply_btn, del_btn].spacing(2).align_y(Alignment::Center).into());
+                }
+            }
+            let mut theme_sec = column![dim(tr("Light themes"))].spacing(4);
+            if !theme_chips.is_empty() {
+                theme_sec = theme_sec.push(flex_row(theme_chips).row_spacing(6).column_spacing(6));
+            }
+            if let Some(draft) = self.theme_draft.as_ref().filter(|d| d.light_id == id) {
+                let mut form = column![
+                    row![
+                        text_input(tr("Theme name"), &draft.name)
+                            .on_input(Message::ThemeDraftName)
+                            .on_submit(|_| Message::ThemeDraftSave)
+                            .width(Length::Fill),
+                        button::suggested(tr("Save")).on_press(Message::ThemeDraftSave),
+                        button::standard(tr("Cancel")).on_press(Message::ThemeDraftCancel),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                ]
+                .spacing(4);
+                if let Some(err) = &draft.error {
+                    form = form.push(error_text(err.clone()));
+                }
+                theme_sec = theme_sec.push(form);
+            } else {
+                theme_sec = theme_sec.push(
+                    button::standard(tr("Save current as theme")).on_press(Message::StartSaveTheme(id.clone())),
+                );
+            }
+            drawer = drawer.push(theme_sec);
+        }
+
         let quick: Vec<Element<Message>> = vec![
             button::standard(if pinned { tr("Unpin") } else { tr("Pin") })
                 .on_press(Message::ToggleFavorite("light".into(), id.clone()))
@@ -1166,7 +1430,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         ];
         drawer = drawer.push(flex_row(quick).row_spacing(6).column_spacing(6));
 
-        container(container(drawer).padding(10).width(Length::Fill).class(sub_card()))
+        container(container(drawer).padding(10).width(Length::Fill).class(sub_card(&self.skin)))
             .padding([0, 4, 4, 16])
             .into()
     }
@@ -1227,8 +1491,10 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         let source = s(sch, "source");
 
         let mut head_left = row![text::heading(name)].spacing(8).align_y(Alignment::Center);
-        if source == "bridge" {
-            head_left = head_left.push(mini_badge(tr("Bridge")));
+        match source {
+            "bridge" => head_left = head_left.push(mini_badge(tr("Bridge"), &self.skin)),
+            "local" => head_left = head_left.push(mini_badge(tr("Local"), &self.skin)),
+            _ => {}
         }
 
         let toggle_id = id.clone();
@@ -1252,7 +1518,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         container(column![head, dim(meta), foot].spacing(6))
             .padding(12)
             .width(Length::Fill)
-            .class(card(None))
+            .class(card(None, &self.skin))
             .into()
     }
 
@@ -1290,26 +1556,30 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                     .max_height(160.0)
                     .padding(4)
                     .width(Length::Fill)
-                    .class(sub_card()),
+                    .class(sub_card(&self.skin)),
             );
         }
 
-        // Trigger kind pills
-        let trigger_pills: Vec<Element<Message>> = [
-            ("time", tr("Time")),
-            ("sunrise", tr("Sunrise")),
-            ("sunset", tr("Sunset")),
-        ]
-        .into_iter()
-        .map(|(k, label)| {
-            let b = if draft.trigger_kind == k { button::suggested(label) } else { button::standard(label) };
-            b.on_press(Message::ScheduleTriggerKind(k.into())).into()
-        })
-        .collect();
-        form = form.push(column![dim(tr("Trigger")), flex_row(trigger_pills).row_spacing(6).column_spacing(6)].spacing(4));
+        // Trigger kind pills (local PC schedules support clock time only; Bridge supports solar too)
+        let local_mode = self.schedule_mode == "local";
+        let effective_trigger = if local_mode { "time" } else { draft.trigger_kind.as_str() };
+        if !local_mode {
+            let trigger_pills: Vec<Element<Message>> = [
+                ("time", tr("Time")),
+                ("sunrise", tr("Sunrise")),
+                ("sunset", tr("Sunset")),
+            ]
+            .into_iter()
+            .map(|(k, label)| {
+                let b = if effective_trigger == k { button::suggested(label) } else { button::standard(label) };
+                b.on_press(Message::ScheduleTriggerKind(k.into())).into()
+            })
+            .collect();
+            form = form.push(column![dim(tr("Trigger")), flex_row(trigger_pills).row_spacing(6).column_spacing(6)].spacing(4));
+        }
 
         // Time or solar offset
-        if draft.trigger_kind == "time" {
+        if effective_trigger == "time" {
             form = form.push(
                 row![
                     dim(tr("Time")),
@@ -1409,7 +1679,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             .align_y(Alignment::Center),
         );
 
-        container(form).padding(12).width(Length::Fill).class(card(None)).into()
+        container(form).padding(12).width(Length::Fill).class(card(None, &self.skin)).into()
     }
 
     // --------------------------------------------------------------------- Rules tab
@@ -1454,7 +1724,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             .symbolic(true);
         let mut act_head = row![text::body(tr("Recent activity"))].spacing(8).align_y(Alignment::Center);
         if !log.is_empty() {
-            act_head = act_head.push(mini_badge(log.len().to_string()));
+            act_head = act_head.push(mini_badge(log.len().to_string(), &self.skin));
         }
         act_head = act_head.push(space::horizontal()).push(chevron);
         body = body.push(divider::horizontal::default());
@@ -1486,7 +1756,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                         )
                         .padding([6, 8])
                         .width(Length::Fill)
-                        .class(sub_card()),
+                        .class(sub_card(&self.skin)),
                     );
                 }
                 body = body.push(entries);
@@ -1557,7 +1827,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         };
         let head = row![
             title_el,
-            mini_badge(kind_label),
+            mini_badge(kind_label, &self.skin),
             space::horizontal(),
             toggler(enabled).on_toggle(move |v| Message::RuleToggle(toggle_id.clone(), v)),
         ]
@@ -1576,7 +1846,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             .align_y(Alignment::Center),
         );
 
-        container(col).padding(12).width(Length::Fill).class(card(None)).into()
+        container(col).padding(12).width(Length::Fill).class(card(None, &self.skin)).into()
     }
 
     fn rule_builder<'a>(&'a self, draft: &'a RuleDraft) -> Element<'a, Message> {
@@ -1628,7 +1898,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                     .max_height(150.0)
                     .padding(4)
                     .width(Length::Fill)
-                    .class(sub_card()),
+                    .class(sub_card(&self.skin)),
             );
         }
 
@@ -1670,7 +1940,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                     .max_height(150.0)
                     .padding(4)
                     .width(Length::Fill)
-                    .class(sub_card()),
+                    .class(sub_card(&self.skin)),
             );
         }
 
@@ -1712,7 +1982,255 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             .align_y(Alignment::Center),
         );
 
-        container(form).padding(12).width(Length::Fill).class(card(None)).into()
+        container(form).padding(12).width(Length::Fill).class(card(None, &self.skin)).into()
+    }
+
+    // --------------------------------------------------------------------- Synth tab
+
+    fn synth_tab(&self) -> Element<'_, Message> {
+        let null = Value::Null;
+        let synth = self.stats.get("synth").unwrap_or(&null);
+        let running = flag(synth, "running");
+        let source = match s(synth, "source") {
+            "" => "system",
+            v => v,
+        };
+        let mode = match s(synth, "mode") {
+            "" => "club",
+            v => v,
+        };
+        let palette = match s(synth, "palette") {
+            "" => "neon",
+            v => v,
+        };
+        let room_id = s(synth, "room_id");
+        let sensitivity = self
+            .synth_sens_drag
+            .map(|(v, _)| v as f64)
+            .unwrap_or_else(|| {
+                synth.get("sensitivity").and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(1.0)
+            })
+            .clamp(0.4, 2.5);
+        let smoothness = self
+            .synth_smooth_drag
+            .map(|(v, _)| v as f64)
+            .unwrap_or_else(|| {
+                synth.get("smoothness").and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(0.45)
+            })
+            .clamp(0.0, 0.9);
+        let bass = num(synth, "bass");
+        let mids = num(synth, "mids");
+        let treble = num(synth, "treble");
+        let beat = flag(synth, "beat") && running;
+        let synth_err = s(synth, "error");
+        let light_bands = synth.get("light_bands").and_then(Value::as_object);
+
+        // Live visualizer & transport card
+        let beat_label: Element<Message> = if beat {
+            text::caption(tr("Beat"))
+                .class(theme::Text::Custom(|_| iced_text::Style { color: Some(Color::WHITE), ..Default::default() }))
+                .into()
+        } else {
+            dim(tr("Beat"))
+        };
+        let beat_pill = container(beat_label).padding([3, 10]).class(beat_pill_style(beat));
+        let transport_btn = if running {
+            button::destructive(tr("Stop")).on_press(Message::SynthStop)
+        } else {
+            button::suggested(tr("Start")).on_press(Message::SynthStart)
+        };
+        let mut live_col = column![
+            row![text::heading(tr("Audio-reactive lights")), beat_pill, space::horizontal(), transport_btn]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            meter_bar(tr("Bass"), bass, Color::from_rgb(0.95, 0.25, 0.45)),
+            meter_bar(tr("Mids"), mids, Color::from_rgb(0.15, 0.78, 0.95)),
+            meter_bar(tr("Treble"), treble, Color::from_rgb(1.0, 0.78, 0.18)),
+        ]
+        .spacing(8);
+        if !synth_err.is_empty() {
+            live_col = live_col.push(error_text(synth_err.to_string()));
+        }
+        let live_tint = running.then(|| synth_palette_swatch(palette));
+        let live_card = container(live_col)
+            .padding(12)
+            .width(Length::Fill)
+            .class(card(live_tint, &self.skin));
+
+        // Controls card
+        let source_pills: Vec<Element<Message>> = SYNTH_SOURCES
+            .iter()
+            .map(|src| {
+                let label = synth_source_label(src);
+                let b = if source == *src { button::suggested(label) } else { button::standard(label) };
+                b.on_press(Message::SynthSource((*src).to_string())).into()
+            })
+            .collect();
+
+        let mode_pills: Vec<Element<Message>> = SYNTH_MODES
+            .iter()
+            .map(|m| {
+                let label = synth_mode_label(m);
+                let b = if mode == *m { button::suggested(label) } else { button::standard(label) };
+                b.on_press(Message::SynthMode((*m).to_string())).into()
+            })
+            .collect();
+
+        let palette_pills: Vec<Element<Message>> = SYNTH_PALETTES
+            .iter()
+            .map(|p| {
+                let inner = row![
+                    swatch_sized(Some(synth_palette_swatch(p)), true, 10.0),
+                    text::caption(synth_palette_label(p)),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center);
+                button::custom(inner)
+                    .padding([4, 8])
+                    .class(if palette == *p { theme::Button::Suggested } else { theme::Button::Standard })
+                    .on_press(Message::SynthPalette((*p).to_string()))
+                    .into()
+            })
+            .collect();
+
+        let room_label = if room_id.is_empty() {
+            tr("All lights")
+        } else {
+            list(&self.stats, "rooms")
+                .iter()
+                .find(|r| s(r, "id") == room_id)
+                .map(room_name)
+                .unwrap_or_else(|| tr("All lights"))
+        };
+
+        let mut controls = column![
+            column![
+                dim(tr("Source")),
+                flex_row(source_pills).row_spacing(6).column_spacing(6),
+                dim(tr("Audio is analyzed strictly locally in memory and never recorded or sent anywhere.")),
+            ]
+            .spacing(4),
+            column![dim(tr("Mode")), flex_row(mode_pills).row_spacing(6).column_spacing(6)].spacing(4),
+            column![dim(tr("Palette")), flex_row(palette_pills).row_spacing(6).column_spacing(6)].spacing(4),
+            row![
+                dim(tr("Target room")),
+                space::horizontal(),
+                button::text(room_label)
+                    .trailing_icon(
+                        icon::from_name(if self.synth_room_picker_open { "pan-up-symbolic" } else { "pan-down-symbolic" })
+                            .size(16),
+                    )
+                    .on_press(Message::SynthToggleRoomPicker),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(10);
+
+        if self.synth_room_picker_open {
+            let mut opts = column![].spacing(2);
+            let all_lbl = if room_id.is_empty() { format!("✓ {}", tr("All lights")) } else { tr("All lights") };
+            opts = opts.push(menu_button(text::caption(all_lbl)).on_press(Message::SynthPickRoom(String::new())));
+            for room in list(&self.stats, "rooms") {
+                let rid = s(room, "id");
+                if rid.is_empty() || !matches!(s(room, "kind"), "room" | "zone") {
+                    continue;
+                }
+                let rname = room_name(room);
+                let lbl = if room_id == rid { format!("✓ {rname}") } else { rname };
+                opts = opts.push(menu_button(text::caption(lbl)).on_press(Message::SynthPickRoom(rid.to_string())));
+            }
+            controls = controls.push(
+                container(scrollable(opts).height(Length::Shrink))
+                    .max_height(150.0)
+                    .padding(4)
+                    .width(Length::Fill)
+                    .class(sub_card(&self.skin)),
+            );
+        }
+
+        let sens_val = (sensitivity * 100.0).round().clamp(40.0, 250.0) as u16;
+        let smooth_val = (smoothness * 100.0).round().clamp(0.0, 90.0) as u16;
+        controls = controls.push(
+            row![
+                container(dim(tr("Sensitivity"))).width(Length::Fixed(86.0)),
+                slider(40u16..=250u16, sens_val, Message::SynthSensitivity)
+                    .step(5u16)
+                    .on_release(Message::SynthSensitivityDone)
+                    .width(Length::Fill),
+                container(text::caption(format!("{:.2}×", sens_val as f32 / 100.0)))
+                    .width(Length::Fixed(44.0))
+                    .align_x(Alignment::End),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        controls = controls.push(
+            row![
+                container(dim(tr("Smoothness"))).width(Length::Fixed(86.0)),
+                slider(0u16..=90u16, smooth_val, Message::SynthSmoothness)
+                    .step(5u16)
+                    .on_release(Message::SynthSmoothnessDone)
+                    .width(Length::Fill),
+                container(text::caption(format!("{smooth_val}%")))
+                    .width(Length::Fixed(44.0))
+                    .align_x(Alignment::End),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+
+        let controls_card = container(controls)
+            .padding(12)
+            .width(Length::Fill)
+            .class(card(None, &self.skin));
+
+        let mut body = column![live_card, controls_card].spacing(10);
+
+        // Per-light frequency band routing
+        let target_lights = synth_target_lights(&self.stats, room_id);
+        if !target_lights.is_empty() {
+            let mut routing = column![dim(tr("Light bands"))].spacing(6);
+            for (lid, lname) in target_lights {
+                let active_band = light_bands
+                    .and_then(|m| m.get(&lid))
+                    .and_then(Value::as_str)
+                    .unwrap_or("all");
+                let band_pills: Vec<Element<Message>> = SYNTH_BANDS
+                    .iter()
+                    .map(|b| {
+                        let lbl = synth_band_label(b);
+                        let btn = if active_band == *b {
+                            button::suggested(lbl)
+                        } else {
+                            button::standard(lbl)
+                        };
+                        btn.on_press(Message::SynthLightBand(lid.clone(), (*b).to_string())).into()
+                    })
+                    .collect();
+                routing = routing.push(
+                    column![
+                        text::caption(lname),
+                        flex_row(band_pills).row_spacing(4).column_spacing(4),
+                    ]
+                    .spacing(4),
+                );
+            }
+            body = body.push(
+                container(routing)
+                    .padding(12)
+                    .width(Length::Fill)
+                    .class(card(None, &self.skin)),
+            );
+        }
+
+        if self.window_mode {
+            body.into()
+        } else {
+            container(scrollable(container(body).padding([0, 12, 0, 0])).height(Length::Shrink))
+                .max_height(ROOMS_MAX_HEIGHT)
+                .into()
+        }
     }
 
     // --------------------------------------------------------------------- Main details
@@ -1733,6 +2251,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             Tab::Lights => self.lights_tab(),
             Tab::Schedules => self.schedules_tab(),
             Tab::Rules => self.rules_tab(),
+            Tab::Synth => self.synth_tab(),
         });
         content.into()
     }
@@ -1760,15 +2279,21 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
     // A resize that has settled (or, on `closing`, any waiting one) goes to config.json; not
     // while maximised, fullscreen or tiled (libcosmic's sharp corners).
     fn save_size(&mut self, closing: bool) {
+        if !self.window_mode {
+            return;
+        }
         let sharp = self.core.window.sharp_corners;
         let ignore = || window_size::not_users_size(sharp);
         let size = if closing { self.resize.flush(ignore) } else { self.resize.due(Instant::now(), ignore) };
         if let Some(size) = size {
             self.setting_error = write_pref(window_size::KEY, Some(window_size::to_value(size))).is_err();
         }
-        // Hyprland: where the user left it, for the next open (a move sends no event, so on close).
-        if closing && let Some(position) = window_size::current_position() {
-            self.setting_error |= write_pref(window_size::POSITION_KEY, Some(window_size::position_value(position))).is_err();
+        // Hyprland: where the user left it, for the next open (saved on resize settle and on close/quit).
+        if (closing || size.is_some())
+            && let Some(position) = window_size::current_position()
+        {
+            self.setting_error |=
+                write_pref(window_size::POSITION_KEY, Some(window_size::position_value(position))).is_err();
         }
     }
 
@@ -1807,7 +2332,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
     }
 
     /// Settings (as Maprisma Launcher's page): ← Back and the title, then one row per setting,
-    /// words at the left and the control at the right; a list opens under its row.
+    /// words + short description at the left and the control at the right; a list opens under its row.
     fn settings_page(&self) -> Element<'_, Message> {
         let header = row![
             button::text(tr("Back")).leading_icon(icon::from_name("go-previous-symbolic").size(16)).on_press(Message::ToggleSettings),
@@ -1821,39 +2346,140 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                 .on_press(message)
                 .into()
         };
-        let setting = |label: String, control: Element<'static, Message>| {
-            padded_control(row![text::body(label), space::horizontal().width(Length::Fill), control].spacing(12).align_y(Alignment::Center))
+        let setting = |label: String, desc: String, control: Element<'static, Message>| {
+            padded_control(
+                row![
+                    column![text::body(label), dim(desc)].spacing(2).width(Length::Fill),
+                    control,
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            )
         };
-        let language = maprisma_hue_lights::i18n::setting();
-        let choices = maprisma_hue_lights::i18n::choices();
-        let current = choices.iter().find(|(code, _)| *code == language).map(|(_, l)| l.clone()).unwrap_or_default();
         let mut page = column![padded_control(header), divider::horizontal::default()];
-        page = page.push(setting(tr("Language"), choice(current, self.language_open, Message::ToggleLanguage)));
-        if self.language_open {
-            for (code, label) in choices {
-                let label = if code == language { format!("✓ {label}") } else { label };
-                page = page.push(menu_button(text::body(label)).on_press(Message::Language(code)));
+
+        // App skin (6 fun skins)
+        page = page.push(setting(
+            tr("App skin"),
+            tr("Visual accent for cards and borders; Native keeps your desktop theme untouched."),
+            choice(skin_label(&self.skin), self.skin_open, Message::ToggleSkin),
+        ));
+        if self.skin_open {
+            for skin in SKINS {
+                let name = skin_label(skin);
+                let label = if self.skin == skin { format!("✓ {name}") } else { name };
+                let row_inner: Element<Message> = if let Some(st) = skin_style(skin) {
+                    row![swatch_sized(Some(st.accent), true, 10.0), text::body(label)]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into()
+                } else {
+                    text::body(label).into()
+                };
+                page = page.push(menu_button(row_inner).on_press(Message::SetSkin(skin.into())));
             }
         }
+
+        // Panel icon (8 selectable icons)
+        let current_icon = format!("{} {}", panel_icon_glyph(&self.panel_icon), panel_icon_label(&self.panel_icon));
+        page = page.push(setting(
+            tr("Panel icon"),
+            tr("Choose the icon shown in your desktop panel."),
+            choice(current_icon, self.panel_icon_open, Message::TogglePanelIcon),
+        ));
+        if self.panel_icon_open {
+            for icon_key in PANEL_ICONS {
+                let text_lbl = format!("{} {}", panel_icon_glyph(icon_key), panel_icon_label(icon_key));
+                let label = if self.panel_icon == icon_key { format!("✓ {text_lbl}") } else { text_lbl };
+                page = page.push(menu_button(text::body(label)).on_press(Message::SetPanelIcon(icon_key.into())));
+            }
+        }
+
+        // Show lit count in panel
+        page = page.push(setting(
+            tr("Show lit count in panel"),
+            tr("Show the number of active lights next to the panel icon."),
+            toggler(self.show_count).on_toggle(Message::SetShowCount).into(),
+        ));
+
+        // Text size (font scale)
+        page = page.push(setting(
+            tr("Text size"),
+            tr("Adjust interface text scale in window mode."),
+            choice(font_scale_label(&self.font_scale), self.font_scale_open, Message::ToggleFontScale),
+        ));
+        if self.font_scale_open {
+            for sc in FONT_SCALES {
+                let name = font_scale_label(sc);
+                let label = if self.font_scale == sc { format!("✓ {name}") } else { name };
+                page = page.push(menu_button(text::body(label)).on_press(Message::SetFontScale(sc.into())));
+            }
+        }
+
+        // Schedule mode (On Hue Bridge vs On this PC (live))
+        page = page.push(setting(
+            tr("Schedule mode"),
+            tr("Bridge schedules run 24/7 even when your PC is off; PC schedules run while Maprisma Hue is open."),
+            choice(schedule_mode_label(&self.schedule_mode), self.schedule_mode_open, Message::ToggleScheduleMode),
+        ));
+        if self.schedule_mode_open {
+            for mode in SCHEDULE_MODES {
+                let name = schedule_mode_label(mode);
+                let label = if self.schedule_mode == mode { format!("✓ {name}") } else { name };
+                page = page.push(menu_button(text::body(label)).on_press(Message::SetScheduleMode(mode.into())));
+            }
+        }
+
+        // Confirm before All On
         page = page.push(setting(
             tr("Confirm before All On"),
+            tr("Ask for confirmation before turning on every light."),
             toggler(self.confirm_all_on_pref).on_toggle(Message::SetConfirmAllOnPref).into(),
         ));
-        page = page.push(setting(tr("F12 saves a screenshot"), toggler(self.shot_key).on_toggle(Message::SetShotKey).into()));
+
+        // Corners
         let corner_choices = [
             ("desktop", trf("Like the desktop ({0} px)", &[corners::desktop_radius().round().to_string()])),
             ("slight", trf("Slightly rounded ({0} px)", &["6".into()])),
             ("rounded", trf("Rounded ({0} px)", &["12".into()])),
             ("square", tr("Square")),
         ];
-        let current = corner_choices.iter().find(|(c, _)| *c == self.corners).map(|(_, l)| l.clone()).unwrap_or_default();
-        page = page.push(setting(tr("Corners"), choice(current, self.corners_open, Message::ToggleCorners)));
+        let current_corner = corner_choices.iter().find(|(c, _)| *c == self.corners).map(|(_, l)| l.clone()).unwrap_or_default();
+        page = page.push(setting(
+            tr("Corners"),
+            tr("Adjust corner rounding for cards and buttons."),
+            choice(current_corner, self.corners_open, Message::ToggleCorners),
+        ));
         if self.corners_open {
-            for (choice, label) in corner_choices {
-                let label = if self.corners == choice { format!("✓ {label}") } else { label };
-                page = page.push(menu_button(text::body(label)).on_press(Message::Corners(choice.into())));
+            for (c, label) in corner_choices {
+                let label = if self.corners == c { format!("✓ {label}") } else { label };
+                page = page.push(menu_button(text::body(label)).on_press(Message::Corners(c.into())));
             }
         }
+
+        // Language
+        let language = maprisma_hue_lights::i18n::setting();
+        let choices = maprisma_hue_lights::i18n::choices();
+        let current_lang = choices.iter().find(|(code, _)| *code == language).map(|(_, l)| l.clone()).unwrap_or_default();
+        page = page.push(setting(
+            tr("Language"),
+            tr("Choose the display language for Maprisma Hue Lights."),
+            choice(current_lang, self.language_open, Message::ToggleLanguage),
+        ));
+        if self.language_open {
+            for (code, label) in choices {
+                let label = if code == language { format!("✓ {label}") } else { label };
+                page = page.push(menu_button(text::body(label)).on_press(Message::Language(code)));
+            }
+        }
+
+        // F12 saves a screenshot
+        page = page.push(setting(
+            tr("F12 saves a screenshot"),
+            tr("Press F12 to save a screenshot to your Pictures folder."),
+            toggler(self.shot_key).on_toggle(Message::SetShotKey).into(),
+        ));
+
         if self.language_error { page = page.push(padded_control(error_text(tr("Could not save language setting.")))); }
         if self.setting_error { page = page.push(padded_control(error_text(tr("Could not save the setting.")))); }
         let page = page.width(if self.window_mode { Length::Fill } else { Length::Fixed(POPUP_WIDTH) }).padding([0, 0, 8, 0]);
@@ -1964,6 +2590,11 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             shot_key: shot_key_setting(),
             confirm_all_on_pref: confirm_all_on_setting(),
             corners: corners_setting(),
+            schedule_mode: schedule_mode_setting(),
+            skin: skin_setting(),
+            panel_icon: panel_icon_setting(),
+            show_count: show_count_setting(),
+            font_scale: font_scale_setting(),
             favorites: favorites_setting(),
             exclude_all_on: exclude_all_on_setting(),
             ..Default::default()
@@ -1978,7 +2609,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
         }
         corners::set_current(&app.corners);
         // The desktop's theme for the whole window (title bar too), see look.rs.
-        let theme = if window_mode { corners::set_app_theme(&app.corners) } else { Task::none() };
+        let theme = app.apply_window_theme();
         (app, Task::batch([title, theme]))
     }
 
@@ -2054,6 +2685,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             Message::SaveSize => self.save_size(false),
             Message::Helper(sender) => {
                 self.helper = Some(sender);
+                self.send(json!({"cmd": "schedule_mode", "mode": self.schedule_mode}));
                 if self.window_mode || self.popup.is_some() {
                     self.send(json!({"cmd": "open"}));
                 }
@@ -2067,17 +2699,29 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                 // Settings changed in another interface (window, applet) take effect here too.
                 self.shot_key = shot_key_setting();
                 self.confirm_all_on_pref = confirm_all_on_setting();
+                self.schedule_mode = schedule_mode_setting();
+                self.skin = skin_setting();
+                self.panel_icon = panel_icon_setting();
+                self.show_count = show_count_setting();
+                let font_scale = font_scale_setting();
+                let font_changed = font_scale != self.font_scale;
+                if font_changed {
+                    self.font_scale = font_scale;
+                }
                 self.favorites = favorites_setting();
                 self.exclude_all_on = exclude_all_on_setting();
                 if self.filter == RoomFilter::Favorites && self.favorites.is_empty() {
                     self.filter = RoomFilter::All;
                 }
                 let corners = corners_setting();
-                let mut restyle = corners != self.corners;
-                if restyle { corners::set_current(&corners); self.corners = corners; }
+                let mut restyle = corners != self.corners || font_changed;
+                if corners != self.corners {
+                    corners::set_current(&corners);
+                    self.corners = corners;
+                }
                 // The desktop's colours and corners (Maprisma Theme can change them any time).
                 restyle |= maprisma_hue_lights::look::refresh();
-                if restyle && self.window_mode { return corners::set_app_theme(&self.corners); }
+                if restyle && self.window_mode { return self.apply_window_theme(); }
             }
             Message::Rectangle(update) => match update {
                 RectangleUpdate::Rectangle(r) => self.rectangle = r.1,
@@ -2147,8 +2791,10 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             Message::ToggleLightDrawer(id) => {
                 if self.open_light_drawer.as_deref() == Some(id.as_str()) {
                     self.open_light_drawer = None;
+                    self.theme_draft = None;
                 } else {
                     self.open_light_drawer = Some(id);
+                    self.theme_draft = None;
                 }
             }
             Message::ToggleFavorite(kind, id) => {
@@ -2176,6 +2822,37 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             }
             Message::LightEffect(id, effect) => {
                 self.send(json!({"cmd": "light", "id": id, "effect": effect}));
+            }
+            Message::ThemeApply(theme_id, light_id) => {
+                self.send(json!({"cmd": "theme_apply", "theme_id": theme_id, "light_id": light_id}));
+            }
+            Message::ThemeDelete(theme_id) => {
+                self.send(json!({"cmd": "theme_delete", "id": theme_id}));
+            }
+            Message::StartSaveTheme(light_id) => {
+                if let Some(light) = self.find_light(&light_id) {
+                    self.theme_draft = Some(ThemeDraft::from_light(light));
+                }
+            }
+            Message::ThemeDraftName(name) => {
+                if let Some(d) = &mut self.theme_draft {
+                    d.name = name.chars().take(60).collect();
+                    d.error = None;
+                }
+            }
+            Message::ThemeDraftSave => {
+                if let Some(d) = &mut self.theme_draft {
+                    match d.to_command() {
+                        Ok(cmd) => {
+                            self.send(cmd);
+                            self.theme_draft = None;
+                        }
+                        Err(err) => d.error = Some(err),
+                    }
+                }
+            }
+            Message::ThemeDraftCancel => {
+                self.theme_draft = None;
             }
             Message::RoomOn(key, on) => self.set_room(&key, "on", json!(on)),
             Message::LightOn(id, on) => self.send(json!({"cmd": "light", "id": id, "on": on})),
@@ -2291,6 +2968,9 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             }
             Message::ScheduleSave => {
                 if let Some(d) = &mut self.schedule_draft {
+                    if self.schedule_mode == "local" {
+                        d.trigger_kind = "time".into();
+                    }
                     match d.to_command() {
                         Ok(cmd) => {
                             self.send(cmd);
@@ -2419,6 +3099,67 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                 self.activity_open = !self.activity_open;
             }
 
+            // Synth
+            Message::SynthStart => {
+                self.send(json!({"cmd": "synth_start"}));
+            }
+            Message::SynthStop => {
+                self.send(json!({"cmd": "synth_stop"}));
+            }
+            Message::SynthSource(source) => {
+                self.send(json!({"cmd": "synth_config", "source": source}));
+            }
+            Message::SynthMode(mode) => {
+                self.send(json!({"cmd": "synth_config", "mode": mode}));
+            }
+            Message::SynthPalette(palette) => {
+                self.send(json!({"cmd": "synth_config", "palette": palette}));
+            }
+            Message::SynthToggleRoomPicker => {
+                self.synth_room_picker_open = !self.synth_room_picker_open;
+            }
+            Message::SynthPickRoom(room_id) => {
+                self.synth_room_picker_open = false;
+                self.send(json!({"cmd": "synth_config", "room_id": room_id}));
+            }
+            Message::SynthSensitivity(raw) => {
+                let val = (raw.clamp(40, 250) as f32) / 100.0;
+                let now = Instant::now();
+                let due = self.synth_sens_drag.is_none_or(|(_, sent)| now.duration_since(sent) >= SEND_EVERY);
+                let sent = if due {
+                    self.send(json!({"cmd": "synth_config", "sensitivity": val}));
+                    now
+                } else {
+                    self.synth_sens_drag.map_or(now, |(_, s)| s)
+                };
+                self.synth_sens_drag = Some((val, sent));
+            }
+            Message::SynthSensitivityDone => {
+                if let Some((val, _)) = self.synth_sens_drag.take() {
+                    self.send(json!({"cmd": "synth_config", "sensitivity": val}));
+                }
+            }
+            Message::SynthSmoothness(raw) => {
+                let val = (raw.clamp(0, 90) as f32) / 100.0;
+                let now = Instant::now();
+                let due = self.synth_smooth_drag.is_none_or(|(_, sent)| now.duration_since(sent) >= SEND_EVERY);
+                let sent = if due {
+                    self.send(json!({"cmd": "synth_config", "smoothness": val}));
+                    now
+                } else {
+                    self.synth_smooth_drag.map_or(now, |(_, s)| s)
+                };
+                self.synth_smooth_drag = Some((val, sent));
+            }
+            Message::SynthSmoothnessDone => {
+                if let Some((val, _)) = self.synth_smooth_drag.take() {
+                    self.send(json!({"cmd": "synth_config", "smoothness": val}));
+                }
+            }
+            Message::SynthLightBand(light_id, band) => {
+                self.send(json!({"cmd": "synth_config", "light_id": light_id, "band": band}));
+            }
+
             // Pairing & settings
             Message::Ip(ip) => self.ip = ip.chars().take(64).collect(),
             Message::Pair(ip) => {
@@ -2463,7 +3204,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             Message::Escape(id) => {
                 let shown = if self.window_mode { self.core.main_window_id() == Some(id) } else { self.popup == Some(id) };
                 let confirm = self.confirm_unpair || self.confirm_all_on;
-                let menus = self.language_open || self.corners_open || self.any_picker_open();
+                let menus = self.any_settings_menu_open() || self.any_picker_open();
                 let drawer = self.any_drawer_open();
                 match esc_step(shown, self.shot.open(), confirm, menus, drawer, self.settings_open) {
                     EscStep::Note => return self.finish_note(false),
@@ -2472,12 +3213,12 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                         self.confirm_all_on = false;
                     }
                     EscStep::Menus => {
-                        self.language_open = false;
-                        self.corners_open = false;
+                        self.close_settings_menus();
                         self.close_pickers();
                     }
                     EscStep::Drawer => {
                         self.open_light_drawer = None;
+                        self.theme_draft = None;
                         self.schedule_draft = None;
                         self.rule_draft = None;
                     }
@@ -2512,17 +3253,82 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                 self.corners = choice.to_string();
                 corners::set_current(choice);
                 self.corners_open = false;
-                if self.window_mode { return corners::set_app_theme(choice); }
+                if self.window_mode { return self.apply_window_theme(); }
+            }
+            Message::SetScheduleMode(mode) => {
+                let mode = normalize_schedule_mode(&mode);
+                let value = (mode != "bridge").then(|| Value::from(mode));
+                self.setting_error = write_pref(SCHEDULE_MODE_KEY, value).is_err();
+                self.schedule_mode = mode.to_string();
+                self.schedule_mode_open = false;
+                if mode == "local" && let Some(d) = &mut self.schedule_draft {
+                    d.trigger_kind = "time".into();
+                }
+                self.send(json!({"cmd": "schedule_mode", "mode": mode}));
+            }
+            Message::SetSkin(skin) => {
+                let skin = normalize_skin(&skin);
+                let value = (skin != "native").then(|| Value::from(skin));
+                self.setting_error = write_pref(SKIN_KEY, value).is_err();
+                self.skin = skin.to_string();
+                self.skin_open = false;
+            }
+            Message::SetPanelIcon(icon_key) => {
+                let icon_key = normalize_panel_icon(&icon_key);
+                let value = (icon_key != "bulb").then(|| Value::from(icon_key));
+                self.setting_error = write_pref(PANEL_ICON_KEY, value).is_err();
+                self.panel_icon = icon_key.to_string();
+                self.panel_icon_open = false;
+            }
+            Message::SetShowCount(on) => {
+                let value = on.then(|| Value::from(true));
+                self.setting_error = write_pref(SHOW_COUNT_KEY, value).is_err();
+                self.show_count = on;
+            }
+            Message::SetFontScale(scale) => {
+                let scale = normalize_font_scale(&scale);
+                let value = (scale != "normal").then(|| Value::from(scale));
+                self.setting_error = write_pref(FONT_SCALE_KEY, value).is_err();
+                self.font_scale = scale.to_string();
+                self.font_scale_open = false;
+                if self.window_mode { return self.apply_window_theme(); }
             }
             Message::ToggleSettings => {
                 self.settings_open = !self.settings_open;
-                self.language_open = false;
-                self.corners_open = false;
+                self.close_settings_menus();
                 self.confirm_unpair = false;
                 self.confirm_all_on = false;
             }
-            Message::ToggleLanguage => { self.language_open = !self.language_open; self.corners_open = false; }
-            Message::ToggleCorners => { self.corners_open = !self.corners_open; self.language_open = false; }
+            Message::ToggleLanguage => {
+                let next = !self.language_open;
+                self.close_settings_menus();
+                self.language_open = next;
+            }
+            Message::ToggleCorners => {
+                let next = !self.corners_open;
+                self.close_settings_menus();
+                self.corners_open = next;
+            }
+            Message::ToggleSkin => {
+                let next = !self.skin_open;
+                self.close_settings_menus();
+                self.skin_open = next;
+            }
+            Message::TogglePanelIcon => {
+                let next = !self.panel_icon_open;
+                self.close_settings_menus();
+                self.panel_icon_open = next;
+            }
+            Message::ToggleFontScale => {
+                let next = !self.font_scale_open;
+                self.close_settings_menus();
+                self.font_scale_open = next;
+            }
+            Message::ToggleScheduleMode => {
+                let next = !self.schedule_mode_open;
+                self.close_settings_menus();
+                self.schedule_mode_open = next;
+            }
             Message::Unpair => {
                 if self.confirm_unpair {
                     self.confirm_unpair = false;

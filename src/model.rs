@@ -11,8 +11,22 @@ use serde_json::{Value, json};
 pub const FAVORITES_KEY: &str = "favorites";
 pub const EXCLUDE_ALL_ON_KEY: &str = "exclude_all_on";
 pub const CONFIRM_ALL_ON_KEY: &str = "confirm_all_on";
+pub const SCHEDULE_MODE_KEY: &str = "schedule_mode";
+pub const SKIN_KEY: &str = "skin";
+pub const PANEL_ICON_KEY: &str = "panel_icon";
+pub const SHOW_COUNT_KEY: &str = "show_count";
+pub const FONT_SCALE_KEY: &str = "font_scale";
 
 pub const DAYS_ORDER: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+pub const SCHEDULE_MODES: [&str; 2] = ["bridge", "local"];
+pub const SKINS: [&str; 6] = ["native", "synthwave", "cozy", "terminal", "disco", "zen"];
+pub const PANEL_ICONS: [&str; 8] = ["bulb", "lamp", "sun", "sparkle", "bolt", "flame", "moon", "dot"];
+pub const FONT_SCALES: [&str; 3] = ["small", "normal", "large"];
+
+pub const SYNTH_SOURCES: [&str; 3] = ["system", "mic", "demo"];
+pub const SYNTH_MODES: [&str; 4] = ["club", "chill", "ambient", "strobe"];
+pub const SYNTH_PALETTES: [&str; 6] = ["neon", "sunset", "ocean", "aurora", "fire", "pastel"];
+pub const SYNTH_BANDS: [&str; 4] = ["all", "bass", "mids", "treble"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tab {
@@ -20,6 +34,7 @@ pub enum Tab {
     Lights,
     Schedules,
     Rules,
+    Synth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -645,6 +660,279 @@ impl RuleDraft {
     }
 }
 
+// ------------------------------------------------------------------------- Light theme draft
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeDraft {
+    pub light_id: String,
+    pub name: String,
+    pub hex: String,
+    pub mirek: Option<u16>,
+    pub bri: u8,
+    pub effect: String,
+    pub error: Option<String>,
+}
+
+fn is_valid_hex(hex: &str) -> bool {
+    let s = hex.trim();
+    s.len() == 7 && s.starts_with('#') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+impl ThemeDraft {
+    /// Captures a light's current color, warmth (mirek), brightness, and effect as a theme draft.
+    pub fn from_light(light: &Value) -> Self {
+        let light_id = j_str(light, "id").to_string();
+        let raw_hex = j_str(light, "color").trim();
+        let hex = if is_valid_hex(raw_hex) {
+            raw_hex.to_ascii_lowercase()
+        } else {
+            "#ffd27a".to_string()
+        };
+        let mirek = light
+            .get("mirek")
+            .and_then(Value::as_i64)
+            .filter(|m| (153..=500).contains(m))
+            .map(|m| m as u16);
+        let bri = light
+            .get("bri")
+            .and_then(Value::as_f64)
+            .filter(|b| b.is_finite())
+            .map(|b| b.round().clamp(1.0, 100.0) as u8)
+            .unwrap_or(80);
+        let raw_effect = j_str(light, "effect");
+        let effect = if raw_effect.is_empty() { "no_effect".to_string() } else { raw_effect.to_string() };
+        Self { light_id, name: String::new(), hex, mirek, bri, effect, error: None }
+    }
+
+    pub fn to_command(&self) -> Result<Value, String> {
+        let trimmed = self.name.trim();
+        if trimmed.is_empty() {
+            return Err(tr("Enter a theme name"));
+        }
+        let hex = if is_valid_hex(&self.hex) { self.hex.to_ascii_lowercase() } else { "#ffd27a".to_string() };
+        let mirek_val = self.mirek.map(|m| json!(m.clamp(153, 500))).unwrap_or(Value::Null);
+        let eff = if self.effect.trim().is_empty() { "no_effect" } else { self.effect.trim() };
+        Ok(json!({
+            "cmd": "theme_save",
+            "theme": {
+                "name": trimmed,
+                "hex": hex,
+                "mirek": mirek_val,
+                "bri": self.bri.clamp(1, 100),
+                "effect": eff,
+            }
+        }))
+    }
+}
+
+// ------------------------------------------------------------------------- Schedule mode
+
+pub fn normalize_schedule_mode(mode: &str) -> &'static str {
+    SCHEDULE_MODES.iter().find(|m| **m == mode).copied().unwrap_or("bridge")
+}
+
+pub fn schedule_mode_label(mode: &str) -> String {
+    match normalize_schedule_mode(mode) {
+        "local" => tr("On this PC (live)"),
+        _ => tr("On Hue Bridge"),
+    }
+}
+
+// ------------------------------------------------------------------------- Skins, panel icons & font scale
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SkinStyle {
+    pub accent: Color,
+    pub border_tint: Color,
+    pub bg_tint: Color,
+    pub border_width: f32,
+}
+
+pub fn normalize_skin(skin: &str) -> &'static str {
+    SKINS.iter().find(|s| **s == skin).copied().unwrap_or("native")
+}
+
+/// Visual accent palette for non-native skins; `None` for `"native"` so the desktop theme stays untouched.
+pub fn skin_style(skin: &str) -> Option<SkinStyle> {
+    match normalize_skin(skin) {
+        "synthwave" => Some(SkinStyle {
+            accent: Color::from_rgb(1.0, 0.18, 0.62),
+            border_tint: Color::from_rgb(0.0, 0.88, 1.0),
+            bg_tint: Color::from_rgb(0.38, 0.10, 0.54),
+            border_width: 1.5,
+        }),
+        "cozy" => Some(SkinStyle {
+            accent: Color::from_rgb(0.98, 0.65, 0.24),
+            border_tint: Color::from_rgb(0.95, 0.56, 0.22),
+            bg_tint: Color::from_rgb(0.48, 0.26, 0.08),
+            border_width: 1.25,
+        }),
+        "terminal" => Some(SkinStyle {
+            accent: Color::from_rgb(0.20, 0.92, 0.42),
+            border_tint: Color::from_rgb(0.18, 0.85, 0.38),
+            bg_tint: Color::from_rgb(0.06, 0.28, 0.12),
+            border_width: 1.25,
+        }),
+        "disco" => Some(SkinStyle {
+            accent: Color::from_rgb(0.86, 0.30, 1.0),
+            border_tint: Color::from_rgb(1.0, 0.78, 0.18),
+            bg_tint: Color::from_rgb(0.40, 0.14, 0.52),
+            border_width: 1.5,
+        }),
+        "zen" => Some(SkinStyle {
+            accent: Color::from_rgb(0.42, 0.78, 0.66),
+            border_tint: Color::from_rgb(0.48, 0.76, 0.65),
+            bg_tint: Color::from_rgb(0.16, 0.32, 0.27),
+            border_width: 1.0,
+        }),
+        _ => None,
+    }
+}
+
+pub fn skin_label(skin: &str) -> String {
+    match normalize_skin(skin) {
+        "synthwave" => tr("Synthwave"),
+        "cozy" => tr("Cozy"),
+        "terminal" => tr("Terminal"),
+        "disco" => tr("Disco"),
+        "zen" => tr("Zen"),
+        _ => tr("Native"),
+    }
+}
+
+pub fn normalize_panel_icon(icon_key: &str) -> &'static str {
+    PANEL_ICONS.iter().find(|k| **k == icon_key).copied().unwrap_or("bulb")
+}
+
+pub fn panel_icon_label(icon_key: &str) -> String {
+    match normalize_panel_icon(icon_key) {
+        "lamp" => tr("Lamp"),
+        "sun" => tr("icon_sun"),
+        "sparkle" => tr("Sparkle"),
+        "bolt" => tr("Bolt"),
+        "flame" => tr("Flame"),
+        "moon" => tr("Moon"),
+        "dot" => tr("Dot"),
+        _ => tr("Bulb"),
+    }
+}
+
+pub fn panel_icon_glyph(icon_key: &str) -> &'static str {
+    match normalize_panel_icon(icon_key) {
+        "lamp" => "⌅",
+        "sun" => "☀",
+        "sparkle" => "✦",
+        "bolt" => "⚡",
+        "flame" => "▲",
+        "moon" => "☾",
+        "dot" => "●",
+        _ => "◉",
+    }
+}
+
+/// Symbolic 16×16 SVG bytes for non-bulb panel icons (`None` for `"bulb"`, which uses the bundled bulb SVGs).
+pub fn panel_icon_svg(icon_key: &str) -> Option<&'static [u8]> {
+    match normalize_panel_icon(icon_key) {
+        "lamp" => Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M4.5 2h7l2.5 7H2L4.5 2zm2.75 8h1.5v3h2.25v1.5h-6V13h2.25v-3z"/></svg>"#),
+        "sun" => Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M8 4.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zM7.25 1h1.5v2h-1.5V1zm0 12h1.5v2h-1.5v-2zM1 7.25h2v1.5H1v-1.5zm12 0h2v1.5h-2v-1.5zM2.5 3.56l1.06-1.06 1.41 1.41-1.06 1.06L2.5 3.56zm8.53 8.53 1.06-1.06 1.41 1.41-1.06 1.06-1.41-1.41zM12.44 2.5l1.06 1.06-1.41 1.41-1.06-1.06 1.41-1.41zM3.91 11.03l1.06 1.06-1.41 1.41-1.06-1.06 1.41-1.41z"/></svg>"#),
+        "sparkle" => Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M8 1l1.8 5.2L15 8l-5.2 1.8L8 15l-1.8-5.2L1 8l5.2-1.8L8 1z"/></svg>"#),
+        "bolt" => Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M9.5 1L3 9h4.5L6.5 15 13 7H8.5L9.5 1z"/></svg>"#),
+        "flame" => Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M8.5 1.2C10.8 3.6 13 6 13 9.2A5 5 0 0 1 3 9.2c0-1.9.9-3.6 2.1-4.8.1 1.2.6 2 1.4 2.4-.3-2 .7-4.1 2-5.6z"/></svg>"#),
+        "moon" => Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M10.8 1.5A6.5 6.5 0 1 0 14.5 11a5.3 5.3 0 0 1-3.7-9.5z"/></svg>"#),
+        "dot" => Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><circle fill="currentColor" cx="8" cy="8" r="5"/></svg>"#),
+        _ => None,
+    }
+}
+
+pub fn normalize_font_scale(scale: &str) -> &'static str {
+    FONT_SCALES.iter().find(|s| **s == scale).copied().unwrap_or("normal")
+}
+
+pub fn font_scale_factor(scale: &str) -> f32 {
+    match normalize_font_scale(scale) {
+        "small" => 0.9,
+        "large" => 1.15,
+        _ => 1.0,
+    }
+}
+
+pub fn font_scale_label(scale: &str) -> String {
+    match normalize_font_scale(scale) {
+        "small" => tr("Small"),
+        "large" => tr("Large"),
+        _ => tr("Normal"),
+    }
+}
+
+// ------------------------------------------------------------------------- Synth helpers
+
+pub fn synth_palette_swatch(palette: &str) -> Color {
+    match palette {
+        "sunset" => Color::from_rgb(1.0, 0.35, 0.25),
+        "ocean" => Color::from_rgb(0.0, 0.70, 0.86),
+        "aurora" => Color::from_rgb(0.0, 0.90, 0.55),
+        "fire" => Color::from_rgb(1.0, 0.42, 0.0),
+        "pastel" => Color::from_rgb(0.88, 0.73, 1.0),
+        _ => Color::from_rgb(1.0, 0.0, 0.50), // neon
+    }
+}
+
+pub fn synth_source_label(source: &str) -> String {
+    match source {
+        "mic" => tr("Microphone"),
+        "demo" => tr("Demo beat"),
+        _ => tr("System audio"),
+    }
+}
+
+pub fn synth_mode_label(mode: &str) -> String {
+    match mode {
+        "chill" => tr("Chill"),
+        "ambient" => tr("Ambient"),
+        "strobe" => tr("Strobe"),
+        _ => tr("Club"),
+    }
+}
+
+pub fn synth_palette_label(palette: &str) -> String {
+    match palette {
+        "sunset" => tr("Sunset"),
+        "ocean" => tr("Ocean"),
+        "aurora" => tr("Aurora"),
+        "fire" => tr("Fire"),
+        "pastel" => tr("Pastel"),
+        _ => tr("Neon"),
+    }
+}
+
+pub fn synth_band_label(band: &str) -> String {
+    match band {
+        "bass" => tr("Bass"),
+        "mids" => tr("Mids"),
+        "treble" => tr("Treble"),
+        _ => tr("All"),
+    }
+}
+
+/// Returns `(light_id, light_name)` pairs targeted by the synth for `room_id` (`""` = all lights).
+pub fn synth_target_lights(stats: &Value, room_id: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for room in j_list(stats, "rooms") {
+        if !room_id.is_empty() && j_str(room, "id") != room_id {
+            continue;
+        }
+        for light in j_list(room, "lights") {
+            let lid = j_str(light, "id");
+            if lid.is_empty() || !seen.insert(lid.to_string()) {
+                continue;
+            }
+            out.push((lid.to_string(), j_str(light, "name").to_string()));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,5 +1095,112 @@ mod tests {
         assert_eq!(clamp_mirek(&light, 154), 200);
         assert_eq!(clamp_mirek(&light, 500), 450);
         assert_eq!(clamp_mirek(&light, 370), 370);
+    }
+
+    #[test]
+    fn skins_normalize_and_style() {
+        assert_eq!(normalize_skin(""), "native");
+        assert_eq!(normalize_skin("bogus"), "native");
+        assert_eq!(skin_style("native"), None);
+        for skin in SKINS {
+            assert_eq!(normalize_skin(skin), skin);
+            assert!(!skin_label(skin).is_empty());
+            if skin == "native" {
+                assert!(skin_style(skin).is_none());
+            } else {
+                let st = skin_style(skin).expect("non-native skin should have a style");
+                assert!(st.border_width >= 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn panel_icons_normalize_glyphs_and_svgs() {
+        assert_eq!(normalize_panel_icon(""), "bulb");
+        assert_eq!(normalize_panel_icon("invalid"), "bulb");
+        assert!(panel_icon_svg("bulb").is_none());
+        for icon in PANEL_ICONS {
+            assert_eq!(normalize_panel_icon(icon), icon);
+            assert!(!panel_icon_label(icon).is_empty());
+            assert!(!panel_icon_glyph(icon).is_empty());
+            if icon != "bulb" {
+                let svg = panel_icon_svg(icon).expect("non-bulb panel icon must have symbolic SVG");
+                let text = std::str::from_utf8(svg).expect("valid utf8 svg");
+                assert!(text.contains("<svg") && text.contains("currentColor"));
+            }
+        }
+    }
+
+    #[test]
+    fn font_scale_and_schedule_mode_helpers() {
+        assert_eq!(normalize_font_scale(""), "normal");
+        assert_eq!(normalize_font_scale("huge"), "normal");
+        assert_eq!(normalize_font_scale("small"), "small");
+        assert_eq!(normalize_font_scale("large"), "large");
+        assert!(font_scale_factor("small") < font_scale_factor("normal"));
+        assert!(font_scale_factor("normal") < font_scale_factor("large"));
+        for sc in FONT_SCALES {
+            assert!(!font_scale_label(sc).is_empty());
+        }
+
+        assert_eq!(normalize_schedule_mode(""), "bridge");
+        assert_eq!(normalize_schedule_mode("cloud"), "bridge");
+        assert_eq!(normalize_schedule_mode("bridge"), "bridge");
+        assert_eq!(normalize_schedule_mode("local"), "local");
+        assert!(!schedule_mode_label("bridge").is_empty());
+        assert!(!schedule_mode_label("local").is_empty());
+    }
+
+    #[test]
+    fn theme_draft_captures_light_and_builds_command() {
+        let ct_light = json!({
+            "id": "l-1",
+            "color": "#FFD9A0",
+            "mirek": 320,
+            "bri": 72.4,
+            "effect": "candle"
+        });
+        let mut draft = ThemeDraft::from_light(&ct_light);
+        assert_eq!(draft.light_id, "l-1");
+        assert_eq!(draft.hex, "#ffd9a0");
+        assert_eq!(draft.mirek, Some(320));
+        assert_eq!(draft.bri, 72);
+        assert_eq!(draft.effect, "candle");
+        assert!(draft.to_command().is_err()); // empty name rejected
+
+        draft.name = "  Cozy Desk  ".into();
+        let cmd = draft.to_command().unwrap();
+        assert_eq!(cmd["cmd"], "theme_save");
+        assert_eq!(cmd["theme"]["name"], "Cozy Desk");
+        assert_eq!(cmd["theme"]["hex"], "#ffd9a0");
+        assert_eq!(cmd["theme"]["mirek"], 320);
+        assert_eq!(cmd["theme"]["bri"], 72);
+        assert_eq!(cmd["theme"]["effect"], "candle");
+
+        // Color-only light without mirek or effect falls back cleanly.
+        let color_light = json!({"id": "l-2", "color": "#ff2e93", "bri": 100});
+        let mut draft2 = ThemeDraft::from_light(&color_light);
+        draft2.name = "Neon Pink".into();
+        let cmd2 = draft2.to_command().unwrap();
+        assert_eq!(cmd2["theme"]["hex"], "#ff2e93");
+        assert_eq!(cmd2["theme"]["mirek"], Value::Null);
+        assert_eq!(cmd2["theme"]["bri"], 100);
+        assert_eq!(cmd2["theme"]["effect"], "no_effect");
+    }
+
+    #[test]
+    fn synth_target_lights_filters_and_deduplicates() {
+        let stats = json!({
+            "rooms": [
+                {"id": "r1", "kind": "room", "lights": [{"id": "l1", "name": "Desk"}, {"id": "l2", "name": "Floor"}]},
+                {"id": "z1", "kind": "zone", "lights": [{"id": "l1", "name": "Desk"}, {"id": "l3", "name": "Strip"}]}
+            ]
+        });
+        let all = synth_target_lights(&stats, "");
+        assert_eq!(all.len(), 3);
+        let r1 = synth_target_lights(&stats, "r1");
+        assert_eq!(r1, vec![("l1".into(), "Desk".into()), ("l2".into(), "Floor".into())]);
+        let missing = synth_target_lights(&stats, "r999");
+        assert!(missing.is_empty());
     }
 }

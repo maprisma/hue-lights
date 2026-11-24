@@ -1,10 +1,13 @@
-"""Unit tests for richer light control, all_on, SSE eventstream, bridge schedules, and dependency rules."""
+"""Unit tests for richer light control, all_on, SSE eventstream, schedules, dependency rules, themes, and audio synth."""
+import datetime
 import importlib.util
 import json
+import math
 import os
 import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import tempfile
 import threading
@@ -784,6 +787,384 @@ class RuleEngineTests(Base):
         self.assertFalse(hue.load_rules()["rules"][0]["enabled"])
         h.handle({"cmd": "rule_delete", "id": r["id"]})
         self.assertEqual(hue.load_rules()["rules"], [])
+
+    def test_state_aware_echo_suppression(self):
+        h = self.make_hue()
+        # A ON -> B ON, B ON -> C ON (should be suppressed on B's ON echo),
+        # B OFF -> C ON (opposite external toggle within 1.5s MUST fire!)
+        r_ab = self.make_rule(
+            id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaab01", name="A->B",
+            trigger_id=L1, trigger_state="on",
+            targets=[{"kind": "light", "id": L2, "action": "on", "bri": None, "scene_id": ""}],
+        )
+        r_bc_on = self.make_rule(
+            id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaab02", name="B ON->C",
+            trigger_id=L2, trigger_state="on",
+            targets=[{"kind": "light", "id": L3, "action": "on", "bri": None, "scene_id": ""}],
+        )
+        r_bc_off = self.make_rule(
+            id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaab03", name="B OFF->C",
+            trigger_id=L2, trigger_state="off",
+            targets=[{"kind": "light", "id": L3, "action": "on", "bri": None, "scene_id": ""}],
+        )
+        for r in (r_ab, r_bc_on, r_bc_off):
+            h.handle({"cmd": "rule_save", "rule": r})
+
+        # L1 turns on at t=800.0 -> A->B fires and stores (801.5, True)
+        ev_a = "data: " + json.dumps([{"type": "update", "data": [{"id": L1, "type": "light", "on": {"on": True}}]}])
+        h.handle_sse_line(ev_a, now_mono=800.0)
+        self.assertEqual(h.pending, {("light", L2): {"on": {"on": True}}})
+        self.assertEqual(h.echo_suppress[("light", L2)], (800.0 + hue.RULE_ECHO_WINDOW, True))
+
+        # Same-state ON echo 0.2s later -> suppressed (B ON->C does NOT fire)
+        h.pending.clear()
+        h.apply_optimistic("light", L2, {"on": {"on": False}})
+        ev_b_on = "data: " + json.dumps([{"type": "update", "data": [{"id": L2, "type": "light", "on": {"on": True}}]}])
+        h.handle_sse_line(ev_b_on, now_mono=800.2)
+        self.assertEqual(h.pending, {})
+
+        # Opposite external toggle (B OFF) 0.4s later -> NOT suppressed (B OFF->C FIRES!)
+        ev_b_off = "data: " + json.dumps([{"type": "update", "data": [{"id": L2, "type": "light", "on": {"on": False}}]}])
+        h.handle_sse_line(ev_b_off, now_mono=800.4)
+        self.assertEqual(h.pending, {("light", L3): {"on": {"on": True}}})
+
+        # Backward compatibility: legacy bare float timestamp still suppresses any transition
+        h.pending.clear()
+        h.rule_last_fired.clear()
+        h.apply_optimistic("light", L2, {"on": {"on": True}})
+        h.echo_suppress[("light", L2)] = 905.0
+        h.handle_sse_line(ev_b_off, now_mono=900.0)
+        self.assertEqual(h.pending, {})
+
+
+class LightThemeTests(Base):
+    def test_hex_to_xy_and_builtins(self):
+        self.assertEqual(len(hue.BUILTIN_THEMES), 8)
+        ids = [t["id"] for t in hue.BUILTIN_THEMES]
+        self.assertEqual(ids, ["reading", "relax", "focus", "sunset", "ocean", "cyberpunk", "fireplace", "nightlight"])
+        self.assertTrue(all(t["built_in"] is True for t in hue.BUILTIN_THEMES))
+
+        for color in ("#ff0000", "#00ff00", "#0000ff", "#ffffff", "#000000", "ff6b35", "#FFD9A0"):
+            xy = hue.hex_to_xy(color)
+            self.assertIsNotNone(xy, color)
+            self.assertEqual(len(xy), 2)
+            self.assertTrue(0.0 <= xy[0] <= 1.0 and 0.0 <= xy[1] <= 1.0)
+        # Red has higher x than blue; blue has lower y than green
+        red = hue.hex_to_xy("#ff0000")
+        green = hue.hex_to_xy("#00ff00")
+        blue = hue.hex_to_xy("#0000ff")
+        self.assertGreater(red[0], blue[0])
+        self.assertGreater(green[1], blue[1])
+
+        for bad in (None, "", "#123", "#1234567", "#gggggg", "not-hex", 12345):
+            self.assertIsNone(hue.hex_to_xy(bad), bad)
+
+    def test_theme_save_delete_persistence_and_builtin_protection(self):
+        h = self.make_hue()
+        self.assertEqual(len(h.snapshot()["themes"]), 8)
+
+        # Save custom theme (auto-UUID)
+        h.handle({"cmd": "theme_save", "theme": {
+            "name": "Cozy Purple", "hex": "#9b59b6", "mirek": None, "bri": 68, "effect": "no_effect",
+        }})
+        self.assertEqual(len(h.custom_themes), 1)
+        tid = h.custom_themes[0]["id"]
+        self.assertFalse(h.custom_themes[0]["built_in"])
+        self.assertEqual(len(h.snapshot()["themes"]), 9)
+        self.assertEqual(os.stat(os.path.join(hue.CONFIG_DIR, "themes.json")).st_mode & 0o777, 0o600)
+
+        # Upsert existing custom theme by id
+        h.handle({"cmd": "theme_save", "theme": {
+            "id": tid, "name": "Cozy Violet", "hex": "#8e44ad", "mirek": None, "bri": 75, "effect": "candle",
+        }})
+        self.assertEqual(len(h.custom_themes), 1)
+        self.assertEqual(h.custom_themes[0]["name"], "Cozy Violet")
+        self.assertEqual(hue.load_themes()[0]["bri"], 75)
+
+        # Cannot overwrite or delete a built-in theme
+        h.handle({"cmd": "theme_save", "theme": {
+            "id": "reading", "name": "Hacked", "hex": "#000000", "mirek": 200, "bri": 50, "effect": "no_effect",
+        }})
+        self.assertEqual(len(h.custom_themes), 1)
+        h.handle({"cmd": "theme_delete", "id": "reading"})
+        self.assertEqual(len(h.snapshot()["themes"]), 9)
+
+        # Delete custom theme persists
+        h.handle({"cmd": "theme_delete", "id": tid})
+        self.assertEqual(h.custom_themes, [])
+        self.assertEqual(hue.load_themes(), [])
+
+        # Symlinked themes.json rejected
+        other = os.path.join(self.dir, "other_themes.json")
+        with open(other, "w") as fh:
+            json.dump([{"id": "custom1", "name": "Sneaky", "hex": "#112233", "bri": 50}], fh)
+        os.unlink(os.path.join(hue.CONFIG_DIR, "themes.json"))
+        os.symlink(other, os.path.join(hue.CONFIG_DIR, "themes.json"))
+        self.assertEqual(hue.load_themes(), [])
+
+    def test_theme_apply_ct_vs_color_and_effects(self):
+        h = self.make_hue()
+
+        # Nightlight (mirek=500) on L1 (supports_ct=True, mirek_max=454) clamps mirek to 454
+        h.handle({"cmd": "theme_apply", "theme_id": "nightlight", "light_id": L1})
+        self.assertEqual(h.pending[("light", L1)], {
+            "on": {"on": True},
+            "dimming": {"brightness": 12.0},
+            "color_temperature": {"mirek": 454},
+            "effects": {"effect": "no_effect"},
+        })
+
+        # Fireplace (mirek=450, effect="candle") on L1 includes candle effect
+        h.pending.clear()
+        h.handle({"cmd": "theme_apply", "theme_id": "fireplace", "light_id": L1})
+        self.assertEqual(h.pending[("light", L1)], {
+            "on": {"on": True},
+            "dimming": {"brightness": 60.0},
+            "color_temperature": {"mirek": 450},
+            "effects": {"effect": "candle"},
+        })
+
+        # Fireplace on L2 (supports_ct=True, available_effects=[]) omits unsupported "candle" effect
+        h.pending.clear()
+        h.handle({"cmd": "theme_apply", "theme_id": "fireplace", "light_id": L2})
+        self.assertEqual(h.pending[("light", L2)], {
+            "on": {"on": True},
+            "dimming": {"brightness": 60.0},
+            "color_temperature": {"mirek": 450},
+        })
+
+        # Cyberpunk (mirek=None) on L1 (supports_color=True) uses color.xy
+        h.pending.clear()
+        h.handle({"cmd": "theme_apply", "theme_id": "cyberpunk", "light_id": L1})
+        xy = hue.hex_to_xy("#ff2e93")
+        self.assertEqual(h.pending[("light", L1)], {
+            "on": {"on": True},
+            "dimming": {"brightness": 85.0},
+            "color": {"xy": {"x": xy[0], "y": xy[1]}},
+            "effects": {"effect": "no_effect"},
+        })
+
+        # Cyberpunk on L3 (dimmable-only: no CT, no color) omits color and CT
+        h.pending.clear()
+        h.handle({"cmd": "theme_apply", "theme_id": "cyberpunk", "light_id": L3})
+        self.assertEqual(h.pending[("light", L3)], {
+            "on": {"on": True},
+            "dimming": {"brightness": 85.0},
+            "effects": {"effect": "no_effect"},
+        })
+
+        # Unknown light or unknown theme ignored
+        h.pending.clear()
+        h.handle({"cmd": "theme_apply", "theme_id": "nonexistent", "light_id": L1})
+        h.handle({"cmd": "theme_apply", "theme_id": "reading", "light_id": "99999999-9999-9999-9999-999999999999"})
+        self.assertEqual(h.pending, {})
+
+
+class LocalScheduleTests(Base):
+    def test_schedule_mode_persistence_and_local_crud(self):
+        res = sample_resources() + [{
+            "id": SCHED1, "type": "behavior_instance", "enabled": True,
+            "metadata": {"name": "Bridge Morning"},
+            "configuration": {
+                "where": [{"group": {"rid": R1, "rtype": "room"}}],
+                "when": {"time_point": {"type": "time", "time": {"hour": 7, "minute": 0}}},
+                "what": [{"on": {"on": True}}],
+            },
+        }]
+        h = self.make_hue(res)
+        self.assertEqual(h.snapshot()["schedule_mode"], "bridge")
+        self.assertEqual(len(h.schedules), 1)
+
+        # Switch schedule_mode to local and verify persistence + 0600 mode
+        h.handle({"cmd": "schedule_mode", "mode": "local"})
+        self.assertEqual(h.snapshot()["schedule_mode"], "local")
+        self.assertEqual(hue.load_local_schedules()["mode"], "local")
+        self.assertEqual(os.stat(os.path.join(hue.CONFIG_DIR, "local_schedules.json")).st_mode & 0o777, 0o600)
+        # Invalid mode ignored
+        h.handle({"cmd": "schedule_mode", "mode": "cloud"})
+        self.assertEqual(h.schedule_mode, "local")
+
+        # Create local schedule -> saved locally, combined in h.schedules, api_queue stays empty
+        h.handle({
+            "cmd": "schedule_create", "name": "Desk Wake", "target_kind": "light", "target_id": L1,
+            "trigger_kind": "time", "time": "08:15", "days": ["mon", "wed", "fri"],
+            "action": "on", "bri": 80, "fade_min": 2,
+        })
+        self.assertEqual(h.api_queue, [])
+        self.assertEqual(len(h.local_schedules), 1)
+        self.assertEqual(len(h.schedules), 2)
+        local_s = h.local_schedules[0]
+        self.assertEqual(local_s["source"], "local")
+        self.assertEqual(local_s["target_name"], "Desk")
+        self.assertEqual(local_s["time"], "08:15")
+        self.assertEqual(local_s["days"], ["mon", "wed", "fri"])
+
+        # Toggle local schedule locally (does NOT touch bridge api_queue)
+        h.handle({"cmd": "schedule_toggle", "id": local_s["id"], "enabled": False})
+        self.assertEqual(h.api_queue, [])
+        self.assertFalse(h.local_schedules[0]["enabled"])
+        self.assertFalse(hue.load_local_schedules()["schedules"][0]["enabled"])
+
+        # Toggle bridge schedule still queues PUT to Bridge
+        h.handle({"cmd": "schedule_toggle", "id": SCHED1, "enabled": False})
+        self.assertEqual(len(h.api_queue), 1)
+        self.assertEqual(h.api_queue[0][0], "PUT")
+
+        # Delete local schedule locally
+        h.api_queue.clear()
+        h.handle({"cmd": "schedule_delete", "id": local_s["id"]})
+        self.assertEqual(h.api_queue, [])
+        self.assertEqual(h.local_schedules, [])
+        self.assertEqual(len(h.schedules), 1)
+        self.assertEqual(hue.load_local_schedules()["schedules"], [])
+
+    def test_check_local_schedules_weekday_and_dedup(self):
+        h = self.make_hue()
+        h.handle({"cmd": "schedule_mode", "mode": "local"})
+        # Schedule 1: Monday 08:30 -> L1 ON @ 75%
+        h.handle({
+            "cmd": "schedule_create", "name": "Mon Desk", "target_kind": "light", "target_id": L1,
+            "time": "08:30", "days": ["mon"], "action": "on", "bri": 75,
+        })
+        # Schedule 2: Every day 22:00 -> R1 scene SCENE1
+        h.handle({
+            "cmd": "schedule_create", "name": "Night Scene", "target_kind": "room", "target_id": R1,
+            "time": "22:00", "days": [], "action": "scene", "scene_id": SCENE1,
+        })
+
+        # Tuesday 08:30 -> Monday-only schedule must NOT fire
+        tue_0830 = datetime.datetime(2026, 11, 24, 8, 30)  # 2026-11-24 is Tuesday
+        self.assertEqual(tue_0830.weekday(), 1)
+        self.assertEqual(h.check_local_schedules(now=tue_0830), 0)
+        self.assertEqual(h.pending, {})
+
+        # Monday 08:30 -> fires once
+        mon_0830 = datetime.datetime(2026, 11, 23, 8, 30)  # Monday
+        self.assertEqual(mon_0830.weekday(), 0)
+        self.assertEqual(h.check_local_schedules(now=mon_0830), 1)
+        self.assertEqual(h.pending[("light", L1)], {"on": {"on": True}, "dimming": {"brightness": 75.0}})
+
+        # Calling again in the same minute is deduplicated!
+        h.pending.clear()
+        self.assertEqual(h.check_local_schedules(now=mon_0830), 0)
+        self.assertEqual(h.pending, {})
+
+        # Next Monday at 08:30 fires again
+        next_mon_0830 = datetime.datetime(2026, 11, 30, 8, 30)
+        self.assertEqual(h.check_local_schedules(now=next_mon_0830), 1)
+        self.assertIn(("light", L1), h.pending)
+
+        # Everyday 22:00 scene fires on Tuesday
+        h.pending.clear()
+        tue_2200 = datetime.datetime(2026, 11, 24, 22, 0)
+        self.assertEqual(h.check_local_schedules(now=tue_2200), 1)
+        self.assertEqual(h.pending[("scene", SCENE1)], {"recall": {"action": "active"}})
+
+
+class AudioSynthTests(Base):
+    def _sine_samples(self, freq, n=512, sr=16000, amp=0.9):
+        return [amp * math.sin(2.0 * math.pi * freq * i / sr) for i in range(n)]
+
+    def test_analyze_pcm_bands_and_beat_tracker(self):
+        # 100 Hz sine -> bass dominates
+        b1, m1, t1 = hue.analyze_pcm_bands(self._sine_samples(100.0), sample_rate=16000)
+        self.assertGreater(b1, 0.7)
+        self.assertGreater(b1, m1 * 3.0)
+        self.assertGreater(b1, t1 * 3.0)
+
+        # 4000 Hz sine (raw s16le bytes) -> treble dominates
+        s4k = [int(28000 * math.sin(2.0 * math.pi * 4000.0 * i / 16000.0)) for i in range(512)]
+        raw_bytes = struct.pack("<%dh" % len(s4k), *s4k)
+        b2, m2, t2 = hue.analyze_pcm_bands(raw_bytes, sample_rate=16000)
+        self.assertGreater(t2, 0.3)
+        self.assertGreater(t2, b2 * 3.0)
+        self.assertGreater(t2, m2 * 2.0)
+
+        # Empty -> zeros
+        self.assertEqual(hue.analyze_pcm_bands([]), (0.0, 0.0, 0.0))
+
+        # AudioBeatTracker detects sudden bass hit and respects min_beat_gap
+        tracker = hue.AudioBeatTracker()
+        for i in range(6):
+            _, _, _, beat = tracker.update(0.05, 0.05, 0.05, now_mono=10.0 + i * 0.05)
+            self.assertFalse(beat)
+        b, m, t, beat = tracker.update(0.9, 0.2, 0.1, now_mono=10.5)
+        self.assertTrue(beat)
+        self.assertTrue(0.0 <= b <= 1.0 and 0.0 <= m <= 1.0 and 0.0 <= t <= 1.0)
+        # Immediate second hit within min_beat_gap suppressed
+        _, _, _, beat2 = tracker.update(0.95, 0.2, 0.1, now_mono=10.55)
+        self.assertFalse(beat2)
+
+    def test_demo_beat_levels_and_map_synth_frame(self):
+        b0, m0, t0, beat0 = hue.demo_beat_levels(0.0, bpm=120.0)
+        b1, m1, t1, beat1 = hue.demo_beat_levels(0.25, bpm=120.0)
+        b2, m2, t2, beat2 = hue.demo_beat_levels(0.50, bpm=120.0)
+        self.assertTrue(beat0)
+        self.assertFalse(beat1)
+        self.assertTrue(beat2)
+        self.assertGreater(b0, b1)
+        for v in (b0, m0, t0, b1, m1, t1):
+            self.assertTrue(0.0 <= v <= 1.0)
+
+        for mode in hue.SYNTH_MODES:
+            for palette in hue.SYNTH_PALETTES:
+                for band in hue.SYNTH_BANDS:
+                    frame = hue.map_synth_frame(1, (0.8, 0.4, 0.6, True), mode, palette, band, 1.2, 0.4, 1.5)
+                    self.assertTrue(1 <= frame["bri"] <= 100)
+                    self.assertEqual(len(frame["xy"]), 2)
+                    self.assertTrue(0.0 <= frame["xy"][0] <= 1.0 and 0.0 <= frame["xy"][1] <= 1.0)
+                    self.assertRegex(frame["hex"], r"^#[0-9a-f]{6}$")
+
+    def test_synth_demo_lifecycle_and_missing_parec(self):
+        h = self.make_hue()
+        try:
+            h.handle({
+                "cmd": "synth_config", "source": "demo", "mode": "club", "palette": "aurora",
+                "room_id": R1, "sensitivity": 1.3, "smoothness": 0.3,
+                "light_bands": {L1: "bass", L2: "treble"},
+            })
+            snap = h.snapshot()["synth"]
+            self.assertEqual(snap["source"], "demo")
+            self.assertEqual(snap["palette"], "aurora")
+            self.assertEqual(snap["room_id"], R1)
+            self.assertEqual(snap["light_bands"], {L1: "bass", L2: "treble"})
+            self.assertFalse(snap["running"])
+
+            # Start demo synth -> queues lights in R1 (L1, L2) and suppresses echo
+            h.handle({"cmd": "synth_start"})
+            self.assertTrue(h.snapshot()["synth"]["running"])
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline and ("light", L1) not in h.pending:
+                time.sleep(0.03)
+            self.assertIn(("light", L1), h.pending)
+            self.assertIn(("light", L2), h.pending)
+            self.assertNotIn(("light", L3), h.pending)  # outside room R1
+            self.assertIn("color", h.pending[("light", L1)])  # L1 supports color
+            self.assertNotIn("color", h.pending[("light", L2)])  # L2 is CT-only
+            self.assertIn(("light", L1), h.echo_suppress)
+
+            # Stop cleanly
+            h.handle({"cmd": "synth_stop"})
+            snap_stopped = h.snapshot()["synth"]
+            self.assertFalse(snap_stopped["running"])
+            self.assertEqual((snap_stopped["bass"], snap_stopped["mids"], snap_stopped["treble"]), (0.0, 0.0, 0.0))
+
+            # Missing `parec` sets error cleanly and stops without crashing
+            real_which = hue.shutil.which
+            try:
+                hue.shutil.which = lambda _: None
+                h.handle({"cmd": "synth_config", "source": "system"})
+                h.handle({"cmd": "synth_start"})
+                deadline = time.monotonic() + 1.5
+                while time.monotonic() < deadline and h.snapshot()["synth"]["running"]:
+                    time.sleep(0.02)
+                snap_err = h.snapshot()["synth"]
+                self.assertFalse(snap_err["running"])
+                self.assertTrue(bool(snap_err["error"]))
+            finally:
+                hue.shutil.which = real_which
+        finally:
+            h.synth.stop(emit=False)
 
 
 if __name__ == "__main__":

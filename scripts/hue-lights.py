@@ -11,6 +11,7 @@ never leaves this process.
 """
 
 import atexit
+import fcntl
 import hashlib
 import http.client
 import ipaddress
@@ -24,6 +25,7 @@ import signal
 import socket
 import ssl
 import stat
+import struct
 import tempfile
 import subprocess
 import sys
@@ -70,6 +72,8 @@ MAX_MEMBERSHIPS = 1000
 MAX_GROUP_SCENES = 100
 MAX_SCENES = 1000
 MAX_SCHEDULES = 100
+MAX_LOCAL_SCHEDULES = 50
+MAX_THEMES = 40
 MAX_RULES = 100
 MAX_RULE_TARGETS = 16
 MAX_RULE_LOG = 20
@@ -80,6 +84,7 @@ RULE_COOLDOWN = 2.0
 MAX_CASCADE_DEPTH = 3
 SSE_BACKOFF = (2.0, 5.0, 15.0, 30.0)
 SSE_READ_TIMEOUT = 15.0
+LOCAL_SCHEDULE_POLL_CAP = 15.0
 DEFAULT_SCHEDULE_SCRIPT_ID = "7e571ac6-f363-42e1-809a-49656328a7a7"
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -88,6 +93,8 @@ APP_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,100}")     # the bridge's application 
 CLIENT_KEY_RE = re.compile(r"[0-9A-Fa-f]{1,64}")    # the entertainment client key
 EFFECT_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 TIME_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+THEME_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+HEX_COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
 DAY_SHORT_TO_FULL = {
     "mon": "monday", "tue": "tuesday", "wed": "wednesday",
     "thu": "thursday", "fri": "friday", "sat": "saturday", "sun": "sunday",
@@ -95,7 +102,38 @@ DAY_SHORT_TO_FULL = {
 DAY_FULL_TO_SHORT = {v: k for k, v in DAY_SHORT_TO_FULL.items()}
 DAY_ORDER = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 RULE_KINDS = ("follow", "exclusive", "companion", "desktop")
+SCHEDULE_MODES = ("bridge", "local")
 MAX_SECRETS = 8
+
+BUILTIN_THEMES = [
+    {"id": "reading", "name": "Reading", "hex": "#ffd9a0", "mirek": 320, "bri": 85, "effect": "no_effect", "built_in": True},
+    {"id": "relax", "name": "Relax", "hex": "#ffb86b", "mirek": 420, "bri": 55, "effect": "no_effect", "built_in": True},
+    {"id": "focus", "name": "Focus", "hex": "#e8f2ff", "mirek": 210, "bri": 100, "effect": "no_effect", "built_in": True},
+    {"id": "sunset", "name": "Sunset Glow", "hex": "#ff6b35", "mirek": None, "bri": 70, "effect": "no_effect", "built_in": True},
+    {"id": "ocean", "name": "Deep Ocean", "hex": "#1e88e5", "mirek": None, "bri": 65, "effect": "no_effect", "built_in": True},
+    {"id": "cyberpunk", "name": "Cyberpunk", "hex": "#ff2e93", "mirek": None, "bri": 85, "effect": "no_effect", "built_in": True},
+    {"id": "fireplace", "name": "Fireplace", "hex": "#ff7b29", "mirek": 450, "bri": 60, "effect": "candle", "built_in": True},
+    {"id": "nightlight", "name": "Nightlight", "hex": "#ff9e44", "mirek": 500, "bri": 12, "effect": "no_effect", "built_in": True},
+]
+BUILTIN_THEME_IDS = frozenset(t["id"] for t in BUILTIN_THEMES)
+
+SYNTH_SOURCES = ("system", "mic", "demo")
+SYNTH_MODES = ("club", "chill", "ambient", "strobe")
+SYNTH_BANDS = ("all", "bass", "mids", "treble")
+SYNTH_PALETTES = {
+    "neon": ("#ff007f", "#00f5ff", "#8a2be2", "#39ff14"),
+    "sunset": ("#ff4e50", "#fc913a", "#f9d423", "#c94b4b"),
+    "ocean": ("#005c97", "#00b4db", "#38ef7d", "#1e3c72"),
+    "aurora": ("#00f260", "#0575e6", "#7f00ff", "#00d2ff"),
+    "fire": ("#ff1e00", "#ff6a00", "#ffb300", "#ff3d00"),
+    "pastel": ("#ffb3ba", "#bae1ff", "#baffc9", "#e0bbff"),
+}
+SYNTH_LIGHT_INTERVAL = 0.22
+SYNTH_EMIT_OPEN = 0.10
+SYNTH_EMIT_CLOSED = 0.50
+SYNTH_BASS_FREQS = (60.0, 100.0, 150.0)
+SYNTH_MIDS_FREQS = (400.0, 800.0, 1500.0)
+SYNTH_TREBLE_FREQS = (3000.0, 5000.0, 7000.0)
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +230,35 @@ def xy_to_hex(x, y):
     if peak > 1:
         r, g, b = r / peak, g / peak, b / peak
     return "#%02x%02x%02x" % tuple(int(round(_gamma(c) * 255)) for c in (r, g, b))
+
+
+def _inv_gamma(c):
+    c = clamp(c, 0.0, 1.0)
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def hex_to_xy(hex_str):
+    """Convert '#rrggbb' (or 'rrggbb') sRGB hex to Hue CIE [x, y] clamped to [0, 1], or None."""
+    if not isinstance(hex_str, str):
+        return None
+    s = hex_str.strip()
+    if not HEX_COLOR_RE.fullmatch(s):
+        return None
+    if s.startswith("#"):
+        s = s[1:]
+    r = _inv_gamma(int(s[0:2], 16) / 255.0)
+    g = _inv_gamma(int(s[2:4], 16) / 255.0)
+    b = _inv_gamma(int(s[4:6], 16) / 255.0)
+    # Wide RGB D65 matrix (inverse of xy_to_hex)
+    X = r * 0.664511 + g * 0.154324 + b * 0.162028
+    Y = r * 0.283881 + g * 0.668433 + b * 0.047685
+    Z = r * 0.000088 + g * 0.072310 + b * 0.986039
+    total = X + Y + Z
+    if total <= 0.0:
+        return [0.3127, 0.329]
+    x = clamp(X / total, 0.0, 1.0)
+    y = clamp(Y / total, 0.0, 1.0)
+    return [round(x, 4), round(y, 4)]
 
 
 def mirek_to_hex(mirek):
@@ -996,6 +1063,381 @@ def in_time_window(time_start, time_end, now=None):
     return cur >= s_min or cur < e_min
 
 
+def _echo_entry(entry):
+    """Decode echo_suppress entry (expires, expected_on) or legacy bare float timestamp."""
+    if isinstance(entry, tuple) and len(entry) == 2:
+        return float(entry[0]), entry[1]
+    return float(entry), None
+
+
+def validate_theme(raw):
+    """Validate and normalize a custom per-lamp light theme dict, or return None."""
+    if not isinstance(raw, dict):
+        return None
+    tid = raw.get("id")
+    if tid is None or tid == "":
+        tid = str(uuid.uuid4())
+    elif not isinstance(tid, str) or THEME_ID_RE.match(tid) is None or tid in BUILTIN_THEME_IDS:
+        return None
+    name = clean(raw.get("name") or "", 60) or "Theme"
+    raw_mirek = raw.get("mirek")
+    mirek = None
+    if raw_mirek is not None:
+        if isinstance(raw_mirek, bool) or not isinstance(raw_mirek, (int, float)):
+            return None
+        m = finite(raw_mirek, None, 153.0, 500.0)
+        if m is None:
+            return None
+        mirek = int(round(m))
+    raw_hex = raw.get("hex")
+    if raw_hex is None or raw_hex == "":
+        if mirek is None:
+            return None
+        hex_val = mirek_to_hex(mirek)
+    elif isinstance(raw_hex, str) and HEX_COLOR_RE.fullmatch(raw_hex.strip()):
+        s = raw_hex.strip()
+        hex_val = (s if s.startswith("#") else "#" + s).lower()
+    else:
+        return None
+    raw_bri = raw.get("bri", 80)
+    if isinstance(raw_bri, bool) or not isinstance(raw_bri, (int, float)):
+        return None
+    b = finite(raw_bri, None, 1.0, 100.0)
+    if b is None:
+        return None
+    bri = int(round(b))
+    raw_eff = raw.get("effect", "no_effect")
+    if raw_eff is None or raw_eff == "":
+        effect = "no_effect"
+    elif isinstance(raw_eff, str) and EFFECT_RE.match(raw_eff):
+        effect = raw_eff
+    else:
+        return None
+    return {
+        "id": tid,
+        "name": name,
+        "hex": hex_val,
+        "mirek": mirek,
+        "bri": bri,
+        "effect": effect,
+        "built_in": False,
+    }
+
+
+def validate_local_schedule(raw):
+    """Validate and normalize a local schedule dict, or return None."""
+    if not isinstance(raw, dict):
+        return None
+    sid = raw.get("id")
+    if sid is None or sid == "":
+        sid = str(uuid.uuid4())
+    elif not valid_uuid(sid):
+        return None
+    name = clean(raw.get("name") or "", 60) or "Schedule"
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        return None
+    target_kind = raw.get("target_kind")
+    target_id = raw.get("target_id")
+    if target_kind not in ("light", "room", "zone") or not valid_uuid(target_id):
+        return None
+    target_name = clean(raw.get("target_name") or "", 60)
+    trigger_kind = raw.get("trigger_kind", "time")
+    if trigger_kind != "time":
+        return None
+    hm = _parse_hhmm(raw.get("time"))
+    if hm is None:
+        return None
+    raw_days = raw.get("days", [])
+    if raw_days is None:
+        raw_days = []
+    if not isinstance(raw_days, list):
+        return None
+    seen_days = set()
+    for d in raw_days:
+        if not isinstance(d, str):
+            return None
+        low = d.strip().lower()
+        if low in DAY_SHORT_TO_FULL:
+            seen_days.add(low)
+        elif low in DAY_FULL_TO_SHORT:
+            seen_days.add(DAY_FULL_TO_SHORT[low])
+        else:
+            return None
+    days = [d for d in DAY_ORDER if d in seen_days]
+    action = raw.get("action")
+    if action not in ("on", "off", "scene"):
+        return None
+    bri = None
+    scene_id = ""
+    if action == "scene":
+        scene_id = raw.get("scene_id")
+        if not valid_uuid(scene_id):
+            return None
+    elif action == "on":
+        raw_bri = raw.get("bri")
+        if raw_bri is not None:
+            if isinstance(raw_bri, bool) or not isinstance(raw_bri, (int, float)):
+                return None
+            b = finite(raw_bri, None, 1.0, 100.0)
+            if b is None:
+                return None
+            bri = int(round(b))
+    raw_fade = raw.get("fade_min", 0)
+    if raw_fade is None:
+        raw_fade = 0
+    if isinstance(raw_fade, bool) or not isinstance(raw_fade, (int, float)):
+        return None
+    fade = finite(raw_fade, None, 0.0, 60.0)
+    if fade is None:
+        return None
+    last_fired = raw.get("last_fired")
+    if not isinstance(last_fired, str) or len(last_fired) > 16:
+        last_fired = ""
+    out = {
+        "id": sid,
+        "name": name,
+        "enabled": enabled,
+        "target_kind": target_kind,
+        "target_id": target_id,
+        "target_name": target_name,
+        "trigger_kind": "time",
+        "time": "%02d:%02d" % hm,
+        "offset_min": 0,
+        "days": days,
+        "action": action,
+        "bri": bri,
+        "scene_id": scene_id,
+        "fade_min": int(round(fade)),
+        "source": "local",
+    }
+    if last_fired:
+        out["last_fired"] = last_fired
+    return out
+
+
+_HANN_CACHE = {}
+
+
+def _hann_window(length):
+    win = _HANN_CACHE.get(length)
+    if win is None:
+        denom = float(length - 1) if length > 1 else 1.0
+        win = tuple(0.5 * (1.0 - math.cos(2.0 * math.pi * i / denom)) for i in range(length))
+        if len(_HANN_CACHE) < 32:
+            _HANN_CACHE[length] = win
+    return win
+
+
+def _goertzel_mag(samples, freq, sample_rate, block_len=None):
+    """Hann-windowed Goertzel RMS magnitude normalized to ~1.0 for a unit-amplitude sine."""
+    n = len(samples)
+    if n == 0 or sample_rate <= 0 or freq <= 0 or freq >= sample_rate * 0.5:
+        return 0.0
+    m = n if block_len is None else min(n, max(8, int(block_len)))
+    if m < 4:
+        return 0.0
+    omega = 2.0 * math.pi * freq / sample_rate
+    coeff = 2.0 * math.cos(omega)
+    win = _hann_window(m)
+    norm = m * 0.25
+    norm_sq = norm * norm
+    acc = 0.0
+    blocks = 0
+    for start in range(0, n - m + 1, m):
+        s1 = 0.0
+        s2 = 0.0
+        for i in range(m):
+            s0 = samples[start + i] * win[i] + coeff * s1 - s2
+            s2 = s1
+            s1 = s0
+        power = s1 * s1 + s2 * s2 - coeff * s1 * s2
+        if power > 0.0:
+            acc += power / norm_sq
+        blocks += 1
+    return math.sqrt(acc / blocks) if blocks else 0.0
+
+
+def analyze_pcm_bands(samples, sample_rate=16000):
+    """Pure-Python constant-Q Goertzel energy across Bass, Mids, and Treble -> (bass, mids, treble) in 0..1."""
+    if not samples or sample_rate <= 0:
+        return (0.0, 0.0, 0.0)
+    if isinstance(samples, (bytes, bytearray, memoryview)):
+        count = len(samples) // 2
+        if count == 0:
+            return (0.0, 0.0, 0.0)
+        raw = struct.unpack("<%dh" % count, samples[:count * 2])
+        norm = [v / 32768.0 for v in raw]
+    else:
+        norm = [float(v) for v in samples]
+        if not norm:
+            return (0.0, 0.0, 0.0)
+        peak = max(abs(v) for v in norm)
+        if peak > 1.5:
+            norm = [v / 32768.0 for v in norm]
+
+    bass_block = max(64, int(round(sample_rate * 0.032)))   # 512 @ 16 kHz -> covers 30..200 Hz
+    mids_block = max(32, int(round(sample_rate * 0.006)))   #  96 @ 16 kHz -> covers 250..1800 Hz
+    treble_block = max(8, int(round(sample_rate * 0.001)))  #  16 @ 16 kHz -> covers 2000..8000 Hz
+
+    def band_energy(freqs, block_len):
+        total_sq = 0.0
+        for f in freqs:
+            m = _goertzel_mag(norm, f, sample_rate, block_len=block_len)
+            total_sq += m * m
+        return round(clamp(math.sqrt(total_sq), 0.0, 1.0), 4)
+
+    return (
+        band_energy(SYNTH_BASS_FREQS, bass_block),
+        band_energy(SYNTH_MIDS_FREQS, mids_block),
+        band_energy(SYNTH_TREBLE_FREQS, treble_block),
+    )
+
+
+class AudioBeatTracker:
+    """Rolling energy history + beat detector + exponential band smoother."""
+
+    def __init__(self, history_size=24, beat_ratio=1.35, beat_floor=0.12, min_beat_gap=0.22):
+        self.history = []
+        self.history_size = max(4, int(history_size))
+        self.beat_ratio = float(beat_ratio)
+        self.beat_floor = float(beat_floor)
+        self.min_beat_gap = float(min_beat_gap)
+        self.bass = 0.0
+        self.mids = 0.0
+        self.treble = 0.0
+        self.last_beat = -1e9
+
+    def reset(self):
+        self.history.clear()
+        self.bass = 0.0
+        self.mids = 0.0
+        self.treble = 0.0
+        self.last_beat = -1e9
+
+    def update(self, bass, mids, treble, sensitivity=1.0, smoothness=0.45, now_mono=None):
+        sens = finite(sensitivity, 1.0, 0.2, 3.0)
+        smooth = finite(smoothness, 0.45, 0.0, 0.95)
+        now_mono = time.monotonic() if now_mono is None else float(now_mono)
+        b_in = clamp(finite(bass, 0.0, 0.0, 1.0) * sens, 0.0, 1.0)
+        m_in = clamp(finite(mids, 0.0, 0.0, 1.0) * sens, 0.0, 1.0)
+        t_in = clamp(finite(treble, 0.0, 0.0, 1.0) * sens, 0.0, 1.0)
+        energy = b_in * 0.65 + m_in * 0.25 + t_in * 0.10
+        avg = (sum(self.history) / len(self.history)) if self.history else energy
+        is_beat = (
+            len(self.history) >= 4
+            and energy >= self.beat_floor
+            and energy > avg * self.beat_ratio
+            and (now_mono - self.last_beat) >= self.min_beat_gap
+        )
+        if is_beat:
+            self.last_beat = now_mono
+        self.history.append(energy)
+        if len(self.history) > self.history_size:
+            self.history.pop(0)
+        alpha = 1.0 - smooth
+        self.bass = self.bass * smooth + b_in * alpha
+        self.mids = self.mids * smooth + m_in * alpha
+        self.treble = self.treble * smooth + t_in * alpha
+        return (
+            round(clamp(self.bass, 0.0, 1.0), 4),
+            round(clamp(self.mids, 0.0, 1.0), 4),
+            round(clamp(self.treble, 0.0, 1.0), 4),
+            bool(is_beat),
+        )
+
+
+def demo_beat_levels(elapsed_sec, bpm=120.0):
+    """Synthesize musical (bass, mids, treble, is_beat) levels with zero audio hardware."""
+    t = max(0.0, finite(elapsed_sec, 0.0, 0.0, 1e9))
+    bpm = finite(bpm, 120.0, 40.0, 240.0)
+    beat_period = 60.0 / bpm
+    beat_pos = (t % beat_period) / beat_period
+    bar_pos = (t % (beat_period * 4.0)) / (beat_period * 4.0)
+    bass = clamp(math.exp(-beat_pos * 5.5) * 0.92 + 0.08, 0.0, 1.0)
+    snare_pos = ((bar_pos * 4.0) - 1.0) % 2.0
+    snare = math.exp(-snare_pos * 6.0) * 0.45
+    mids = clamp(0.32 + 0.28 * math.sin(bar_pos * 2.0 * math.pi) + snare, 0.0, 1.0)
+    hat_pos = (beat_pos * 2.0) % 1.0
+    treble = clamp(math.exp(-hat_pos * 6.5) * 0.65 + 0.12 + 0.15 * abs(math.sin(t * 3.1)), 0.0, 1.0)
+    is_beat = beat_pos < 0.18
+    return (round(bass, 4), round(mids, 4), round(treble, 4), is_beat)
+
+
+def _lerp_hex(c1, c2, t):
+    t = clamp(float(t), 0.0, 1.0)
+    r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+    r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+    r = int(round(r1 + (r2 - r1) * t))
+    g = int(round(g1 + (g2 - g1) * t))
+    b = int(round(b1 + (b2 - b1) * t))
+    return "#%02x%02x%02x" % (clamp(r, 0, 255), clamp(g, 0, 255), clamp(b, 0, 255))
+
+
+def map_synth_frame(light_index, levels, mode, palette, band, sensitivity, smoothness, phase):
+    """Map audio band levels + light index into {bri: 1..100, xy: [x, y], hex: '#rrggbb'}."""
+    if isinstance(levels, dict):
+        bass = finite(levels.get("bass"), 0.0, 0.0, 1.0)
+        mids = finite(levels.get("mids"), 0.0, 0.0, 1.0)
+        treble = finite(levels.get("treble"), 0.0, 0.0, 1.0)
+        is_beat = bool(levels.get("beat", False))
+    elif isinstance(levels, (list, tuple)) and len(levels) >= 3:
+        bass = finite(levels[0], 0.0, 0.0, 1.0)
+        mids = finite(levels[1], 0.0, 0.0, 1.0)
+        treble = finite(levels[2], 0.0, 0.0, 1.0)
+        is_beat = bool(levels[3]) if len(levels) >= 4 else False
+    else:
+        bass = mids = treble = 0.0
+        is_beat = False
+
+    idx = max(0, int(light_index)) if isinstance(light_index, (int, float)) else 0
+    mode = mode if mode in SYNTH_MODES else "club"
+    colors = SYNTH_PALETTES.get(palette, SYNTH_PALETTES["neon"])
+    band = band if band in SYNTH_BANDS else "all"
+    sens = finite(sensitivity, 1.0, 0.2, 3.0)
+    smooth = finite(smoothness, 0.45, 0.0, 0.95)
+    ph = finite(phase, 0.0, -1e9, 1e9)
+
+    if band == "bass":
+        energy = bass
+    elif band == "mids":
+        energy = mids
+    elif band == "treble":
+        energy = treble
+    else:
+        energy = 0.50 * bass + 0.30 * mids + 0.20 * treble
+    level = clamp(energy * sens, 0.0, 1.0)
+
+    if mode == "club":
+        raw_bri = 18.0 + level * 68.0 + (22.0 if is_beat else 0.0)
+        mid_bri = 55.0
+        pos = ph * 0.75 + idx * 0.85 + (0.65 if is_beat else 0.0) + treble * 0.4
+    elif mode == "chill":
+        raw_bri = 25.0 + level * 52.0 + (8.0 if is_beat else 0.0)
+        mid_bri = 52.0
+        pos = ph * 0.35 + idx * 0.40 + mids * 0.35
+    elif mode == "ambient":
+        raw_bri = 30.0 + level * 42.0 + (4.0 if is_beat else 0.0)
+        mid_bri = 50.0
+        pos = ph * 0.18 + idx * 0.28
+    else:  # strobe
+        raw_bri = (96.0 + level * 4.0) if (is_beat or level > 0.65) else (8.0 + level * 22.0)
+        mid_bri = 50.0
+        pos = ph * 1.4 + idx * 1.1 + (1.5 if is_beat else 0.0)
+
+    bri_f = raw_bri * (1.0 - smooth * 0.35) + mid_bri * (smooth * 0.35)
+    bri = int(round(clamp(bri_f, 1.0, 100.0)))
+
+    n_col = len(colors)
+    wrapped = pos % n_col
+    i0 = int(wrapped) % n_col
+    i1 = (i0 + 1) % n_col
+    frac = wrapped - int(wrapped)
+    hex_color = _lerp_hex(colors[i0], colors[i1], frac)
+    xy = hex_to_xy(hex_color) or [0.3127, 0.329]
+    return {"bri": bri, "xy": xy, "hex": hex_color}
+
+
 def parse_avahi_hue(lines):
     """Parse `avahi-browse -rtpk _hue._tcp` output into [{ip, bridge_id, name}]."""
     found = {}
@@ -1189,6 +1631,169 @@ def save_rules(data):
         except OSError:
             pass
         raise
+
+
+def _themes_path():
+    return os.path.join(CONFIG_DIR, "themes.json")
+
+
+def load_themes():
+    """Load persisted custom themes from CONFIG_DIR/themes.json (rejecting symlinks, FIFOs, >64 KiB)."""
+    path = _themes_path()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return []
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > MAX_CONFIG:
+            return []
+        raw = os.read(fd, MAX_CONFIG)
+    except OSError:
+        return []
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return []
+    raw_items = data.get("themes") if isinstance(data, dict) else data
+    if not isinstance(raw_items, list):
+        return []
+    themes = []
+    seen = set()
+    for item in raw_items:
+        if len(themes) >= MAX_THEMES:
+            break
+        validated = validate_theme(item)
+        if validated and validated["id"] not in seen:
+            seen.add(validated["id"])
+            themes.append(validated)
+    return themes
+
+
+def save_themes(items):
+    """Atomic 0600 write of themes.json via unique temp file, capped at MAX_CONFIG (64 KiB)."""
+    payload = json.dumps(items, indent=2, allow_nan=False).encode("utf-8")
+    if len(payload) > MAX_CONFIG:
+        raise ValueError("themes file exceeds maximum size")
+    directory = private_config_dir()
+    path = _themes_path()
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".themes.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _local_schedules_path():
+    return os.path.join(CONFIG_DIR, "local_schedules.json")
+
+
+def load_local_schedules():
+    """Load persisted schedule mode & local schedules from CONFIG_DIR/local_schedules.json."""
+    default = {"mode": "bridge", "schedules": []}
+    path = _local_schedules_path()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return default
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > MAX_CONFIG:
+            return default
+        raw = os.read(fd, MAX_CONFIG)
+    except OSError:
+        return default
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return default
+    if not isinstance(data, dict):
+        return default
+    mode = data.get("mode") if data.get("mode") in SCHEDULE_MODES else "bridge"
+    raw_scheds = data.get("schedules")
+    if not isinstance(raw_scheds, list):
+        return {"mode": mode, "schedules": []}
+    schedules = []
+    seen = set()
+    for item in raw_scheds:
+        if len(schedules) >= MAX_LOCAL_SCHEDULES:
+            break
+        validated = validate_local_schedule(item)
+        if validated and validated["id"] not in seen:
+            seen.add(validated["id"])
+            schedules.append(validated)
+    return {"mode": mode, "schedules": schedules}
+
+
+def save_local_schedules(data):
+    """Atomic 0600 write of local_schedules.json via unique temp file, capped at MAX_CONFIG (64 KiB)."""
+    payload = json.dumps(data, indent=2, allow_nan=False).encode("utf-8")
+    if len(payload) > MAX_CONFIG:
+        raise ValueError("local schedules file exceeds maximum size")
+    directory = private_config_dir()
+    path = _local_schedules_path()
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".local_schedules.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def claim_local_schedule_bucket(sid, bucket):
+    """Cross-process deduplication for local schedules using an exclusive flock + persisted last_fired.
+    Returns True if this process claimed `(sid, bucket)` (or when no local_schedules.json exists yet),
+    False if another helper instance or prior run already fired this schedule in `bucket`."""
+    path = _local_schedules_path()
+    if not os.path.exists(path):
+        return True
+    try:
+        directory = private_config_dir()
+        lock_path = os.path.join(directory, ".local_schedules.lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = load_local_schedules()
+        for sched in data["schedules"]:
+            if sched["id"] == sid:
+                if sched.get("last_fired") == bucket:
+                    return False
+                sched["last_fired"] = bucket
+                try:
+                    save_local_schedules(data)
+                except (OSError, ValueError):
+                    pass
+                return True
+        return True
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
 
 
 # Children the helper started and has not reaped yet: ended when the helper exits or gets SIGTERM.
@@ -1431,6 +2036,340 @@ def iter_bounded_lines(read_chunk, max_line=MAX_BODY):
 
 
 # ---------------------------------------------------------------------------
+# Audio-reactive light synthesizer
+
+class SynthController:
+    """Streams audio-reactive (parec or Demo Beat) updates to Hue lights in a background thread."""
+
+    def __init__(self, hue_obj):
+        self.hue = hue_obj
+        self.running = False
+        self.source = "system"
+        self.mode = "club"
+        self.palette = "neon"
+        self.room_id = ""
+        self.sensitivity = 1.0
+        self.smoothness = 0.45
+        self.light_bands = {}
+        self.bass = 0.0
+        self.mids = 0.0
+        self.treble = 0.0
+        self.beat = False
+        self.error = ""
+        self._stop_ev = None
+        self._thread = None
+        self._proc = None
+
+    def snapshot(self):
+        """Return JSON-safe synth state dict (call under hue.lock)."""
+        return {
+            "running": bool(self.running),
+            "source": self.source,
+            "mode": self.mode,
+            "palette": self.palette,
+            "room_id": self.room_id,
+            "sensitivity": round(self.sensitivity, 2),
+            "smoothness": round(self.smoothness, 2),
+            "light_bands": dict(self.light_bands),
+            "bass": round(self.bass, 3),
+            "mids": round(self.mids, 3),
+            "treble": round(self.treble, 3),
+            "beat": bool(self.beat),
+            "error": self.error,
+        }
+
+    def configure(self, cmd):
+        """Validate and update synth settings from a `synth_config` command (call under hue.lock)."""
+        if not isinstance(cmd, dict):
+            return False
+        changed = False
+        if "source" in cmd and cmd["source"] in SYNTH_SOURCES:
+            self.source = cmd["source"]
+            self.error = ""
+            changed = True
+        if "mode" in cmd and cmd["mode"] in SYNTH_MODES:
+            self.mode = cmd["mode"]
+            changed = True
+        if "palette" in cmd and cmd["palette"] in SYNTH_PALETTES:
+            self.palette = cmd["palette"]
+            changed = True
+        if "room_id" in cmd:
+            rid = cmd["room_id"]
+            if rid == "" or rid is None:
+                self.room_id = ""
+                changed = True
+            elif valid_uuid(rid):
+                self.room_id = rid
+                changed = True
+        if "sensitivity" in cmd and not isinstance(cmd["sensitivity"], bool):
+            s = finite(cmd["sensitivity"], None, 0.2, 3.0)
+            if s is not None:
+                self.sensitivity = round(s, 2)
+                changed = True
+        if "smoothness" in cmd and not isinstance(cmd["smoothness"], bool):
+            sm = finite(cmd["smoothness"], None, 0.0, 0.95)
+            if sm is not None:
+                self.smoothness = round(sm, 2)
+                changed = True
+        if isinstance(cmd.get("light_bands"), dict):
+            cleaned = {}
+            for lid, bnd in cmd["light_bands"].items():
+                if len(cleaned) >= MAX_GROUP_LIGHTS:
+                    break
+                if valid_uuid(lid) and bnd in SYNTH_BANDS:
+                    cleaned[lid] = bnd
+            self.light_bands = cleaned
+            changed = True
+        if valid_uuid(cmd.get("light_id")) and cmd.get("band") in SYNTH_BANDS:
+            if cmd["light_id"] in self.light_bands or len(self.light_bands) < MAX_GROUP_LIGHTS:
+                self.light_bands[cmd["light_id"]] = cmd["band"]
+                changed = True
+        return changed
+
+    def start(self):
+        with self.hue.lock:
+            if not self.hue.config:
+                return False
+            if self.running and self._thread is not None and self._thread.is_alive():
+                return False
+            self.running = True
+            self.error = ""
+            self.bass = self.mids = self.treble = 0.0
+            self.beat = False
+            stop_ev = threading.Event()
+            self._stop_ev = stop_ev
+            thread = threading.Thread(target=self._run, args=(stop_ev,), daemon=True)
+            self._thread = thread
+            thread.start()
+        self.hue.emit()
+        return True
+
+    def stop(self, emit=True):
+        with self.hue.lock:
+            was_active = self.running or self._thread is not None or self._proc is not None
+            self.running = False
+            self.bass = self.mids = self.treble = 0.0
+            self.beat = False
+            stop_ev = self._stop_ev
+            self._stop_ev = None
+            thread = self._thread
+            self._thread = None
+            proc = self._proc
+            self._proc = None
+        if stop_ev is not None:
+            stop_ev.set()
+        if proc is not None:
+            self._terminate_proc(proc)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.5)
+        if emit and was_active:
+            self.hue.emit()
+        return was_active
+
+    def _terminate_proc(self, proc):
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except OSError:
+            pass
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=0.3)
+                except subprocess.SubprocessError:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=0.3)
+                    except subprocess.SubprocessError:
+                        pass
+        except OSError:
+            pass
+        with _CHILDREN_LOCK:
+            _CHILDREN.discard(proc)
+
+    def _target_lights(self):
+        """Return target light dicts for current room_id (call under hue.lock)."""
+        rid = self.room_id
+        if rid:
+            for room in self.hue.rooms:
+                if room["id"] == rid:
+                    return list(room["lights"])
+            return []
+        seen = set()
+        lights = []
+        for room in self.hue.rooms:
+            if room["kind"] == "zone":
+                continue
+            for light in room["lights"]:
+                if light["id"] not in seen:
+                    seen.add(light["id"])
+                    lights.append(light)
+        return lights
+
+    def _apply_step(self, bass, mids, treble, is_beat, now_mono, phase, last_light_push, last_emit):
+        with self.hue.lock:
+            self.bass = bass
+            self.mids = mids
+            self.treble = treble
+            self.beat = is_beat
+            panel_open = self.hue.panel_open
+            should_push = (now_mono - last_light_push) >= SYNTH_LIGHT_INTERVAL
+            pushed = False
+            if should_push and self.hue.config:
+                lights = self._target_lights()
+                mode = self.mode
+                palette = self.palette
+                sensitivity = self.sensitivity
+                smoothness = self.smoothness
+                light_bands = dict(self.light_bands)
+                for idx, light in enumerate(lights):
+                    lid = light["id"]
+                    band = light_bands.get(lid, "all")
+                    frame = map_synth_frame(
+                        idx, (bass, mids, treble, is_beat),
+                        mode, palette, band, sensitivity, smoothness, phase,
+                    )
+                    body = {
+                        "on": {"on": True},
+                        "dimming": {"brightness": float(frame["bri"])},
+                        "dynamics": {"duration": 200},
+                    }
+                    if light.get("supports_color"):
+                        body["color"] = {"xy": {"x": frame["xy"][0], "y": frame["xy"][1]}}
+                    if self.hue.queue("light", lid, body, from_rule=True):
+                        self.hue._suppress_target("light", lid, now_mono + RULE_ECHO_WINDOW, expected_on=True)
+                        pushed = True
+                last_light_push = now_mono
+        if pushed:
+            self.hue.wake.set()
+        emit_interval = SYNTH_EMIT_OPEN if panel_open else SYNTH_EMIT_CLOSED
+        if now_mono - last_emit >= emit_interval:
+            self.hue.emit()
+            last_emit = now_mono
+        return last_light_push, last_emit
+
+    def _run(self, stop_ev):
+        tracker = AudioBeatTracker()
+        start_t = time.monotonic()
+        last_light_push = 0.0
+        last_emit = 0.0
+        phase = 0.0
+        try:
+            while not stop_ev.is_set() and not self.hue._stop.is_set():
+                with self.hue.lock:
+                    if not self.running or not self.hue.config:
+                        break
+                    source = self.source
+                    sensitivity = self.sensitivity
+                    smoothness = self.smoothness
+                if source == "demo":
+                    now_mono = time.monotonic()
+                    bass, mids, treble, is_beat = demo_beat_levels(now_mono - start_t)
+                    phase += 0.14 + (0.25 if is_beat else 0.0)
+                    last_light_push, last_emit = self._apply_step(
+                        bass, mids, treble, is_beat, now_mono, phase, last_light_push, last_emit
+                    )
+                    stop_ev.wait(0.05)
+                    continue
+
+                # System or microphone capture via PulseAudio/PipeWire `parec`
+                parec = shutil.which("parec")
+                if not parec:
+                    with self.hue.lock:
+                        self.error = "parec not available"
+                        self.running = False
+                        self.bass = self.mids = self.treble = 0.0
+                        self.beat = False
+                    self.hue.emit()
+                    return
+                device = "@DEFAULT_MONITOR@" if source == "system" else "@DEFAULT_SOURCE@"
+                argv = _parent_death_prefix() + [
+                    parec, "--raw", "--format=s16le", "--channels=1", "--rate=16000",
+                    "--device=" + device,
+                ]
+                proc = None
+                try:
+                    with _CHILDREN_LOCK:
+                        proc = subprocess.Popen(
+                            argv, shell=False, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        )
+                        _CHILDREN.add(proc)
+                    with self.hue.lock:
+                        if stop_ev.is_set() or not self.running:
+                            break
+                        self._proc = proc
+                    tracker.reset()
+                    fd = proc.stdout.fileno()
+                    pcm_buf = bytearray()
+                    chunk_bytes = 1024  # 512 s16le samples = 32ms @ 16kHz
+                    while not stop_ev.is_set() and not self.hue._stop.is_set():
+                        with self.hue.lock:
+                            if not self.running or not self.hue.config or self.source != source:
+                                break
+                            sensitivity = self.sensitivity
+                            smoothness = self.smoothness
+                        try:
+                            ready, _, _ = select.select([fd], [], [], 0.1)
+                        except (OSError, ValueError):
+                            break
+                        if not ready:
+                            continue
+                        try:
+                            chunk = os.read(fd, 4096)
+                        except OSError:
+                            chunk = b""
+                        if not chunk:
+                            if not stop_ev.is_set():
+                                with self.hue.lock:
+                                    if self.running and self.source == source:
+                                        self.error = "audio capture exited"
+                                        self.running = False
+                                        self.bass = self.mids = self.treble = 0.0
+                                        self.beat = False
+                                self.hue.emit()
+                            return
+                        pcm_buf.extend(chunk)
+                        if len(pcm_buf) < chunk_bytes:
+                            continue
+                        frame_bytes = bytes(pcm_buf[-chunk_bytes:])
+                        pcm_buf.clear()
+                        raw_b, raw_m, raw_t = analyze_pcm_bands(frame_bytes, sample_rate=16000)
+                        now_mono = time.monotonic()
+                        bass, mids, treble, is_beat = tracker.update(
+                            raw_b, raw_m, raw_t,
+                            sensitivity=sensitivity, smoothness=smoothness, now_mono=now_mono,
+                        )
+                        phase += 0.10 + (0.25 if is_beat else 0.0)
+                        last_light_push, last_emit = self._apply_step(
+                            bass, mids, treble, is_beat, now_mono, phase, last_light_push, last_emit
+                        )
+                except OSError as exc:
+                    if not stop_ev.is_set():
+                        with self.hue.lock:
+                            self.error = clean(str(exc), 80) or "audio capture failed"
+                            self.running = False
+                            self.bass = self.mids = self.treble = 0.0
+                            self.beat = False
+                        self.hue.emit()
+                    return
+                finally:
+                    if proc is not None:
+                        with self.hue.lock:
+                            if self._proc is proc:
+                                self._proc = None
+                        self._terminate_proc(proc)
+        finally:
+            with self.hue.lock:
+                if self._thread is threading.current_thread():
+                    self._thread = None
+                if self._stop_ev is stop_ev:
+                    self._stop_ev = None
+                    self.running = False
+
+
+# ---------------------------------------------------------------------------
 # Main state machine
 
 class Hue:
@@ -1446,15 +2385,22 @@ class Hue:
         self.light_count = 0
         self.on_count = 0
         self.bridge_home_gl = ""
-        self.schedules = []
+        self.custom_themes = load_themes()
+        local_sched_data = load_local_schedules()
+        self.schedule_mode = local_sched_data["mode"]
+        self.bridge_schedules = []
+        self.local_schedules = local_sched_data["schedules"]
+        self.schedules = list(self.local_schedules)
+        self._local_sched_fired = {}  # schedule_id -> "YYYY-MM-DD HH:MM"
         self.schedule_script_id = DEFAULT_SCHEDULE_SCRIPT_ID
         rules_data = load_rules()
         self.rules = rules_data["rules"]
         self.rules_paused = rules_data["paused"]
         self.rule_log = []
-        self.echo_suppress = {}       # (kind, rid) -> expires_monotonic
+        self.echo_suppress = {}       # (kind, rid) -> (expires_monotonic, expected_on)
         self.rule_last_fired = {}     # rule_id -> last_fired_monotonic
         self.api_queue = []           # [(method, path, body), ...]
+        self.synth = SynthController(self)
         self.phase = "connecting" if self.config else "unpaired"
         self.error = ""
         # error_code/error_args let the panel show the message in its language.
@@ -1538,6 +2484,13 @@ class Hue:
                 "pair_ip": self.pair_ip,
                 "pair_remaining": max(0, int(self.pair_until - time.time())) if self.pair_ip else 0,
                 "schedules": getattr(self, "schedules", []),
+                "schedule_mode": getattr(self, "schedule_mode", "bridge"),
+                "themes": [dict(t) for t in BUILTIN_THEMES] + list(getattr(self, "custom_themes", [])),
+                "synth": self.synth.snapshot() if hasattr(self, "synth") else {
+                    "running": False, "source": "system", "mode": "club", "palette": "neon",
+                    "room_id": "", "sensitivity": 1.0, "smoothness": 0.45, "light_bands": {},
+                    "bass": 0.0, "mids": 0.0, "treble": 0.0, "beat": False, "error": "",
+                },
                 "rules": getattr(self, "rules", []),
                 "rules_paused": getattr(self, "rules_paused", False),
                 "rule_log": getattr(self, "rule_log", []),
@@ -1626,7 +2579,8 @@ class Hue:
                     if time.time() >= self.refresh_hold_until:
                         self.rooms, self.light_count, self.on_count = rooms, total, on
                     self.bridge_home_gl = bridge_home_gl
-                    self.schedules = schedules
+                    self.bridge_schedules = schedules
+                    self._rebuild_schedules()
                     if script_id:
                         self.schedule_script_id = script_id
                     self.phase, self.error = "ok", ""
@@ -1750,7 +2704,8 @@ class Hue:
                     save_config(config)
                     self.conn_generation += 1
                     self.rooms, self.light_count, self.on_count, self.pending = [], 0, 0, {}
-                    self.bridge_home_gl, self.schedules, self.api_queue = "", [], []
+                    self.bridge_home_gl, self.bridge_schedules, self.api_queue = "", [], []
+                    self._rebuild_schedules()
                     self.config, self.pair_ip, self.phase, self.error = config, "", "connecting", ""
                 self._reset_sse()
                 self.wake.set()
@@ -1948,6 +2903,107 @@ class Hue:
                 room["color"] = blend_colors([l["color"] for l in lit])
         self.on_count = sum(1 for r in self.rooms if r["kind"] != "zone" for l in r["lights"] if l["on"])
 
+    # -- schedules & theme helpers
+    def _rebuild_schedules(self):
+        """Keep self.schedules as bridge_schedules + local_schedules (call with lock held)."""
+        self.schedules = list(getattr(self, "bridge_schedules", [])) + list(getattr(self, "local_schedules", []))
+
+    def _find_light(self, light_id):
+        """Return light dict for light_id in current model (call with lock held), or None."""
+        for room in self.rooms:
+            for light in room["lights"]:
+                if light["id"] == light_id:
+                    return light
+        return None
+
+    def _target_name(self, target_kind, target_id):
+        """Resolve display name for a light, room, or zone UUID (call with lock held)."""
+        if target_kind == "light":
+            light = self._find_light(target_id)
+            return light.get("name", "") if light else ""
+        if target_kind in ("room", "zone"):
+            for room in self.rooms:
+                if room["kind"] == target_kind and room["id"] == target_id:
+                    return room.get("name", "")
+        return ""
+
+    def check_local_schedules(self, now=None):
+        """Check enabled local schedules against local (weekday, HH:MM), firing at most once per minute."""
+        if now is None:
+            lt = time.localtime()
+            year, month, day, hour, minute, wday = lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_wday
+        elif hasattr(now, "tm_year"):
+            year, month, day, hour, minute, wday = now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour, now.tm_min, now.tm_wday
+        elif hasattr(now, "weekday"):
+            year, month, day, hour, minute, wday = now.year, now.month, now.day, now.hour, now.minute, now.weekday()
+        else:
+            year, month, day, hour, minute, wday = now
+        day_short = DAY_ORDER[int(wday) % 7]
+        hhmm = "%02d:%02d" % (int(hour), int(minute))
+        bucket = "%04d-%02d-%02d %02d:%02d" % (int(year), int(month), int(day), int(hour), int(minute))
+
+        fired = 0
+        with self.lock:
+            if not self.config or not self.local_schedules:
+                return 0
+            # Prune previous-minute buckets so dict stays tiny
+            self._local_sched_fired = {sid: b for sid, b in self._local_sched_fired.items() if b == bucket}
+            for sched in self.local_schedules:
+                if not sched.get("enabled"):
+                    continue
+                if sched.get("trigger_kind", "time") != "time" or sched.get("time") != hhmm:
+                    continue
+                days = sched.get("days") or []
+                if days and day_short not in days:
+                    continue
+                sid = sched["id"]
+                if self._local_sched_fired.get(sid) == bucket or sched.get("last_fired") == bucket:
+                    self._local_sched_fired[sid] = bucket
+                    continue
+                if not claim_local_schedule_bucket(sid, bucket):
+                    sched["last_fired"] = bucket
+                    self._local_sched_fired[sid] = bucket
+                    continue
+                action = sched.get("action")
+                ok = False
+                if action == "scene":
+                    scene_id = sched.get("scene_id", "")
+                    if valid_uuid(scene_id) and self.may_queue("scene", scene_id):
+                        recall = {"action": "active"}
+                        if sched.get("fade_min", 0) > 0:
+                            recall["duration"] = int(sched["fade_min"]) * 60000
+                        self.pending[("scene", scene_id)] = {"recall": recall}
+                        self.refresh_hold_until = 0
+                        ok = True
+                else:
+                    body = {"on": {"on": action == "on"}}
+                    if action == "on" and sched.get("bri") is not None:
+                        body["dimming"] = {"brightness": round(clamp(float(sched["bri"]), 1.0, 100.0), 1)}
+                    if sched.get("fade_min", 0) > 0:
+                        body["dynamics"] = {"duration": int(sched["fade_min"]) * 60000}
+                    tkind = sched.get("target_kind")
+                    tid = sched.get("target_id")
+                    if tkind == "light":
+                        ok = self.queue("light", tid, body, from_rule=True)
+                    elif tkind in ("room", "zone"):
+                        for room in self.rooms:
+                            if room["kind"] == tkind and room["id"] == tid:
+                                if valid_uuid(room.get("grouped_light")):
+                                    ok = self.queue("grouped_light", room["grouped_light"], body, from_rule=True)
+                                else:
+                                    for light in room["lights"]:
+                                        if self.queue("light", light["id"], body, from_rule=True):
+                                            ok = True
+                                break
+                if ok:
+                    sched["last_fired"] = bucket
+                    self._local_sched_fired[sid] = bucket
+                    fired += 1
+        if fired:
+            self.emit()
+            self.wake.set()
+        return fired
+
     # -- dependency / linked-light rule engine
     def _target_is_on(self, tkind, tid):
         if tkind == "light":
@@ -1961,15 +3017,16 @@ class Hue:
                     return bool(room["on"])
         return False
 
-    def _suppress_target(self, tkind, tid, expires):
-        self.echo_suppress[(tkind, tid)] = expires
+    def _suppress_target(self, tkind, tid, expires, expected_on=None):
+        entry = (expires, expected_on)
+        self.echo_suppress[(tkind, tid)] = entry
         if tkind == "room":
             for room in self.rooms:
                 if room["id"] == tid and room["kind"] == "room":
                     if room.get("grouped_light"):
-                        self.echo_suppress[("grouped_light", room["grouped_light"])] = expires
+                        self.echo_suppress[("grouped_light", room["grouped_light"])] = entry
                     for light in room["lights"]:
-                        self.echo_suppress[("light", light["id"])] = expires
+                        self.echo_suppress[("light", light["id"])] = entry
                     break
 
     def _dispatch_rule_target(self, target, body, recall_scene=False):
@@ -2001,12 +3058,20 @@ class Hue:
         if not rules or not self.config:
             return 0
         now_mono = time.monotonic() if now_mono is None else float(now_mono)
-        # Prune expired echo suppressions
-        self.echo_suppress = {k: exp for k, exp in self.echo_suppress.items() if exp > now_mono}
+        # Prune expired echo suppressions (supports both (expires, expected_on) and legacy bare float)
+        self.echo_suppress = {
+            k: v for k, v in self.echo_suppress.items()
+            if _echo_entry(v)[0] > now_mono
+        }
         fired = 0
         for kind, rid, old_state, new_state in transitions:
-            if kind != "desktop" and self.echo_suppress.get((kind, rid), 0.0) > now_mono:
-                continue
+            if kind != "desktop" and (kind, rid) in self.echo_suppress:
+                exp, expected_on = _echo_entry(self.echo_suppress[(kind, rid)])
+                if exp > now_mono:
+                    new_on = new_state.get("on") if isinstance(new_state, dict) else None
+                    if expected_on is None or new_on is None or new_on == expected_on:
+                        continue
+                    del self.echo_suppress[(kind, rid)]
             for rule in rules:
                 if not rule.get("enabled", True):
                     continue
@@ -2037,8 +3102,10 @@ class Hue:
                     continue
                 applied = 0
                 for target in rule["targets"]:
+                    expected_on = None
                     if mode == "mirror_off":
                         ok = self._dispatch_rule_target(target, {"on": {"on": False}})
+                        expected_on = False
                     elif mode == "match_bri":
                         if target["action"] != "on" or target.get("scene_id"):
                             continue
@@ -2046,12 +3113,15 @@ class Hue:
                             continue
                         b = round(clamp(float(new_bri), 1.0, 100.0), 1)
                         ok = self._dispatch_rule_target(target, {"on": {"on": True}, "dimming": {"brightness": b}})
+                        expected_on = True
                     else:
                         if rule.get("only_if_off") and self._target_is_on(target["kind"], target["id"]):
                             continue
                         if target["action"] == "off":
                             ok = self._dispatch_rule_target(target, {"on": {"on": False}})
+                            expected_on = False
                         else:
+                            expected_on = True
                             if target.get("scene_id") and target["kind"] == "room" and self.known("scene", target["scene_id"]):
                                 ok = self._dispatch_rule_target(target, {}, recall_scene=True)
                             else:
@@ -2062,7 +3132,8 @@ class Hue:
                                     body["dimming"] = {"brightness": round(clamp(float(target["bri"]), 1.0, 100.0), 1)}
                                 ok = self._dispatch_rule_target(target, body)
                     if ok:
-                        self._suppress_target(target["kind"], target["id"], now_mono + RULE_ECHO_WINDOW)
+                        self._suppress_target(target["kind"], target["id"], now_mono + RULE_ECHO_WINDOW,
+                                              expected_on=expected_on)
                         applied += 1
                 if applied:
                     self.rule_last_fired[rule["id"]] = now_mono
@@ -2333,6 +3404,9 @@ class Hue:
             self._reset_sse()
             self.emit()
         elif name == "unpair":
+            # Stop synth before clearing state (outside lock to avoid join deadlock)
+            if hasattr(self, "synth"):
+                self.synth.stop(emit=False)
             # One lock for invalidating, deleting and clearing: try_pair validates and saves
             # under it too, so no pairing reply can save a key between deletion and clearing.
             with self.lock:
@@ -2341,7 +3415,9 @@ class Hue:
                 removed = remove_config()
                 self.pair_ip = ""
                 self.config, self.rooms, self.light_count, self.on_count = {}, [], 0, 0
-                self.bridge_home_gl, self.schedules = "", []
+                self.bridge_home_gl, self.bridge_schedules = "", []
+                self._local_sched_fired = {}
+                self._rebuild_schedules()
                 self.schedule_script_id = DEFAULT_SCHEDULE_SCRIPT_ID
                 self.api_queue = []
                 self.echo_suppress = {}
@@ -2411,41 +3487,182 @@ class Hue:
                     self.pending[("scene", rid)] = {"recall": {"action": "active"}}
                     self.refresh_hold_until = 0
                 self.wake.set()
-        elif name == "schedule_create" and self.config:
+        elif name == "theme_save":
+            theme = validate_theme(cmd.get("theme"))
+            if theme is None:
+                return
             with self.lock:
-                if not self.known_target(cmd.get("target_kind"), cmd.get("target_id")):
+                if theme["id"] in BUILTIN_THEME_IDS:
                     return
-                if cmd.get("action") == "scene" and not self.known("scene", cmd.get("scene_id")):
+                candidate = [t for t in self.custom_themes if t["id"] != theme["id"]]
+                if len(candidate) >= MAX_THEMES:
                     return
-                payload = build_schedule_payload(cmd, getattr(self, "schedule_script_id", DEFAULT_SCHEDULE_SCRIPT_ID))
-                if payload is None or len(self.api_queue) >= MAX_API_QUEUE:
+                candidate.append(theme)
+                save_themes(candidate)
+                self.custom_themes = candidate
+            self.emit()
+        elif name == "theme_delete":
+            tid = cmd.get("id")
+            if not isinstance(tid, str) or tid in BUILTIN_THEME_IDS:
+                return
+            with self.lock:
+                new_themes = [t for t in self.custom_themes if t["id"] != tid]
+                if len(new_themes) == len(self.custom_themes):
                     return
-                self.api_queue.append(("POST", "/clip/v2/resource/behavior_instance", payload))
-            self.wake.set()
-        elif name == "schedule_toggle" and self.config:
+                save_themes(new_themes)
+                self.custom_themes = new_themes
+            self.emit()
+        elif name == "theme_apply" and self.config:
+            theme_id = cmd.get("theme_id")
+            light_id = cmd.get("light_id")
+            if not isinstance(theme_id, str) or not valid_uuid(light_id):
+                return
+            body = None
+            with self.lock:
+                if not self.known("light", light_id):
+                    return
+                light = self._find_light(light_id)
+                theme = next((t for t in (BUILTIN_THEMES + self.custom_themes) if t["id"] == theme_id), None)
+                if light is None or theme is None:
+                    return
+                body = {
+                    "on": {"on": True},
+                    "dimming": {"brightness": round(clamp(float(theme["bri"]), 1.0, 100.0), 1)},
+                }
+                if theme.get("mirek") is not None and light.get("supports_ct"):
+                    m_min = light.get("mirek_min", 153)
+                    m_max = light.get("mirek_max", 500)
+                    m = int(round(clamp(float(theme["mirek"]), float(m_min), float(m_max))))
+                    body["color_temperature"] = {"mirek": m}
+                elif light.get("supports_color"):
+                    xy = hex_to_xy(theme.get("hex"))
+                    if xy is not None:
+                        body["color"] = {"xy": {"x": xy[0], "y": xy[1]}}
+                eff = theme.get("effect") or "no_effect"
+                avail = light.get("available_effects") or []
+                if eff == "no_effect" or eff in avail:
+                    body["effects"] = {"effect": eff}
+            if body:
+                self.queue("light", light_id, body)
+        elif name == "schedule_mode":
+            mode = cmd.get("mode")
+            if mode not in SCHEDULE_MODES:
+                return
+            with self.lock:
+                save_local_schedules({"mode": mode, "schedules": self.local_schedules})
+                self.schedule_mode = mode
+            self.emit()
+        elif name == "schedule_create" and self.config:
+            source = cmd.get("source") if cmd.get("source") in SCHEDULE_MODES else self.schedule_mode
+            if source == "local":
+                with self.lock:
+                    if not self.known_target(cmd.get("target_kind"), cmd.get("target_id")):
+                        return
+                    if cmd.get("action") == "scene" and not self.known("scene", cmd.get("scene_id")):
+                        return
+                    if len(self.local_schedules) >= MAX_LOCAL_SCHEDULES:
+                        return
+                    raw_sched = {
+                        "id": str(uuid.uuid4()),
+                        "name": cmd.get("name"),
+                        "enabled": cmd.get("enabled", True),
+                        "target_kind": cmd.get("target_kind"),
+                        "target_id": cmd.get("target_id"),
+                        "target_name": self._target_name(cmd.get("target_kind"), cmd.get("target_id")) or cmd.get("target_name", ""),
+                        "trigger_kind": "time",
+                        "time": cmd.get("time"),
+                        "offset_min": 0,
+                        "days": cmd.get("days", []),
+                        "action": cmd.get("action"),
+                        "bri": cmd.get("bri"),
+                        "scene_id": cmd.get("scene_id", ""),
+                        "fade_min": cmd.get("fade_min", 0),
+                        "source": "local",
+                    }
+                    sched = validate_local_schedule(raw_sched)
+                    if sched is None:
+                        return
+                    candidate = list(self.local_schedules) + [sched]
+                    save_local_schedules({"mode": self.schedule_mode, "schedules": candidate})
+                    self.local_schedules = candidate
+                    self._rebuild_schedules()
+                self.emit()
+                self.wake.set()
+            else:
+                with self.lock:
+                    if not self.known_target(cmd.get("target_kind"), cmd.get("target_id")):
+                        return
+                    if cmd.get("action") == "scene" and not self.known("scene", cmd.get("scene_id")):
+                        return
+                    payload = build_schedule_payload(cmd, getattr(self, "schedule_script_id", DEFAULT_SCHEDULE_SCRIPT_ID))
+                    if payload is None or len(self.api_queue) >= MAX_API_QUEUE:
+                        return
+                    self.api_queue.append(("POST", "/clip/v2/resource/behavior_instance", payload))
+                self.wake.set()
+        elif name == "schedule_toggle":
             sid = cmd.get("id")
             enabled = cmd.get("enabled")
             if not valid_uuid(sid) or not isinstance(enabled, bool):
                 return
             with self.lock:
-                target = next((s for s in self.schedules if s["id"] == sid), None)
-                if target is None or len(self.api_queue) >= MAX_API_QUEUE:
-                    return
-                target["enabled"] = enabled
-                self.api_queue.append(("PUT", "/clip/v2/resource/behavior_instance/%s" % sid, {"enabled": enabled}))
+                local_target = next((s for s in self.local_schedules if s["id"] == sid), None)
+                if local_target is not None:
+                    candidate = [dict(s, enabled=enabled) if s["id"] == sid else s for s in self.local_schedules]
+                    save_local_schedules({"mode": self.schedule_mode, "schedules": candidate})
+                    self.local_schedules = candidate
+                    self._rebuild_schedules()
+                    handled_local = True
+                else:
+                    handled_local = False
+                    if not self.config:
+                        return
+                    target = next((s for s in self.bridge_schedules if s["id"] == sid), None)
+                    if target is None or len(self.api_queue) >= MAX_API_QUEUE:
+                        return
+                    target["enabled"] = enabled
+                    self._rebuild_schedules()
+                    self.api_queue.append(("PUT", "/clip/v2/resource/behavior_instance/%s" % sid, {"enabled": enabled}))
             self.emit()
-            self.wake.set()
-        elif name == "schedule_delete" and self.config:
+            if not handled_local or enabled:
+                self.wake.set()
+        elif name == "schedule_delete":
             sid = cmd.get("id")
             if not valid_uuid(sid):
                 return
             with self.lock:
-                if not any(s["id"] == sid for s in self.schedules) or len(self.api_queue) >= MAX_API_QUEUE:
-                    return
-                self.schedules = [s for s in self.schedules if s["id"] != sid]
-                self.api_queue.append(("DELETE", "/clip/v2/resource/behavior_instance/%s" % sid, None))
+                if any(s["id"] == sid for s in self.local_schedules):
+                    candidate = [s for s in self.local_schedules if s["id"] != sid]
+                    save_local_schedules({"mode": self.schedule_mode, "schedules": candidate})
+                    self.local_schedules = candidate
+                    self._local_sched_fired.pop(sid, None)
+                    self._rebuild_schedules()
+                    handled_local = True
+                else:
+                    handled_local = False
+                    if not self.config:
+                        return
+                    if not any(s["id"] == sid for s in self.bridge_schedules) or len(self.api_queue) >= MAX_API_QUEUE:
+                        return
+                    self.bridge_schedules = [s for s in self.bridge_schedules if s["id"] != sid]
+                    self._rebuild_schedules()
+                    self.api_queue.append(("DELETE", "/clip/v2/resource/behavior_instance/%s" % sid, None))
             self.emit()
-            self.wake.set()
+            if not handled_local:
+                self.wake.set()
+        elif name == "synth_config":
+            with self.lock:
+                changed = self.synth.configure(cmd)
+            if changed:
+                self.emit()
+        elif name == "synth_start" and self.config:
+            self.synth.start()
+        elif name == "synth_stop":
+            self.synth.stop(emit=True)
+        elif name == "synth_toggle":
+            if self.synth.running:
+                self.synth.stop(emit=True)
+            elif self.config:
+                self.synth.start()
         elif name == "rule_save":
             rule = validate_rule(cmd.get("rule"))
             if rule is None:
@@ -2552,6 +3769,8 @@ class Hue:
                 self.wake.wait(2.0)
                 self.wake.clear()
             return
+        if self.config:
+            self.check_local_schedules()
         if self.send_api_queue():
             self.emit()
             return
@@ -2573,7 +3792,11 @@ class Hue:
             self.emit()
         elif not self.config and not self.candidates and not self.discovering and self.panel_open:
             self.discover()
+        with self.lock:
+            has_local_sched = any(s.get("enabled") for s in self.local_schedules)
         wait = max(0.05, interval - (time.time() - self.last_refresh)) if self.config else 5.0
+        if self.config and has_local_sched:
+            wait = min(wait, LOCAL_SCHEDULE_POLL_CAP)
         self.wake.wait(wait)
         self.wake.clear()
 
@@ -2591,6 +3814,8 @@ class Hue:
                     self.emit()
         finally:
             self._stop.set()
+            if hasattr(self, "synth"):
+                self.synth.stop(emit=False)
             self._reset_sse()
 
 
