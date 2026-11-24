@@ -1,4 +1,4 @@
-// Hue Lights for COSMIC: Philips Hue rooms, zones, lights and scenes from the panel.
+// Hue Lights for COSMIC: Philips Hue rooms, zones, lights, scenes, schedules and rules from the panel.
 // Lit bulb in the accent while any light is on, dim bulb when all are off or no bridge
 // is paired. Left click opens the popup; right click switches every light off.
 //
@@ -8,11 +8,19 @@
 // It talks only to the bridge on the LAN, over pinned HTTPS; its app key stays
 // in ~/.config/hue-lights/config.json and never reaches this process.
 
-use maprisma_hue_lights::i18n::{tr, trf, read_pref, write_pref};
+use maprisma_hue_lights::i18n::{read_pref, tr, trf, write_pref};
 use maprisma_hue_lights::{corners, shot};
+mod model;
 mod window_size;
+use model::{
+    COLOR_PRESETS, CONFIRM_ALL_ON_KEY, DAYS_ORDER, EXCLUDE_ALL_ON_KEY, FAVORITES_KEY, Favorite, RoomFilter, RuleDraft,
+    ScheduleDraft, Tab, TargetOption, WARMTH_PRESETS, all_targets, belongs_to_rule, clamp_mirek, day_short_toggle,
+    effect_label, favorites_to_value, format_unix_ts, has_active_schedule, is_favorite, parse_favorites,
+    parse_string_set, resolve_name, room_matches_filter, schedule_action_summary, schedule_trigger_summary,
+    sorted_exclude_list, string_set_to_value, toggle_favorite,
+};
 use std::collections::{HashMap, HashSet};
-use maprisma_hue_lights::{script_path, TITLE, WINDOW_BUS};
+use maprisma_hue_lights::{TITLE, WINDOW_BUS, script_path};
 use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -27,8 +35,8 @@ use cosmic::iced::widget::{container as iced_container, svg as iced_svg, text as
 use cosmic::iced::{Alignment, Background, Border, Color, Length, Rectangle, Subscription, stream, window};
 use cosmic::widget::rectangle_tracker::{RectangleTracker, RectangleUpdate, rectangle_tracker_subscription};
 use cosmic::widget::{
-    Id, autosize, button, column, container, divider, flex_row, icon, mouse_area, row, scrollable, slider, space,
-    text, text_input, toggler,
+    Id, autosize, button, checkbox, column, container, divider, flex_row, icon, mouse_area, row, scrollable, slider,
+    space, text, text_input, toggler,
 };
 use cosmic::{Element, theme};
 use serde_json::{Value, json};
@@ -57,6 +65,7 @@ const RESTART_DELAY: Duration = Duration::from_secs(5); // before a helper that 
 const SEND_EVERY: Duration = Duration::from_millis(150); // between brightness commands while dragging
 const SCENE_LIMIT: usize = 6; // scenes shown before "+N more"
 const POPUP_WIDTH: f32 = 430.0;
+const TWO_COL_MIN_WIDTH: f32 = 720.0;
 const ROOMS_MAX_HEIGHT: f32 = 540.0;
 // A light's own colour when the bridge reports none: data (what the bulb shows), not the theme's.
 const WARM: Color = Color::from_rgb(1.0, 0xd2 as f32 / 255.0, 0x7a as f32 / 255.0);
@@ -102,10 +111,12 @@ fn window_start_size() -> window_size::Size {
 enum EscStep {
     /// Skip the screenshot's note (or close its error).
     Note,
-    /// Drop the "Unpair?" question.
+    /// Drop the "Unpair?" or "Turn all lights on?" confirmation.
     Confirm,
-    /// Close the open Language / Corners list.
+    /// Close an open Language / Corners list or inline target picker.
     Menus,
+    /// Close an open inline schedule/rule builder or light color drawer.
+    Drawer,
     /// Leave the settings page.
     Back,
     /// Close the window (`--window`) or the popup.
@@ -114,9 +125,10 @@ enum EscStep {
 }
 
 /// `shown`: Esc came from the window or the open popup (not the panel button); `note`: the
-/// screenshot card shows; `confirm`: "Really unpair?" shows; `menus`: a Language / Corners list
-/// is open; `settings`: the settings page shows.
-fn esc_step(shown: bool, note: bool, confirm: bool, menus: bool, settings: bool) -> EscStep {
+/// screenshot card shows; `confirm`: "Really unpair?" or "Turn all lights on?" shows;
+/// `menus`: a Language / Corners / target picker list is open; `drawer`: an inline builder or
+/// light color drawer is open; `settings`: the settings page shows.
+fn esc_step(shown: bool, note: bool, confirm: bool, menus: bool, drawer: bool, settings: bool) -> EscStep {
     if !shown {
         EscStep::Nothing
     } else if note {
@@ -125,6 +137,8 @@ fn esc_step(shown: bool, note: bool, confirm: bool, menus: bool, settings: bool)
         EscStep::Confirm
     } else if menus {
         EscStep::Menus
+    } else if drawer {
+        EscStep::Drawer
     } else if settings {
         EscStep::Back
     } else {
@@ -220,7 +234,7 @@ fn room_icon(room: &Value) -> Option<&'static str> {
     })
 }
 
-fn room_status(room: &Value) -> String {
+fn room_status(room: &Value, excluded: bool) -> String {
     let lights = list(room, "lights");
     let total = lights.len();
     let mut parts: Vec<String> = Vec::new();
@@ -237,6 +251,9 @@ fn room_status(room: &Value) -> String {
     let unreachable = lights.iter().filter(|l| l.get("reachable").and_then(Value::as_bool) == Some(false)).count();
     if unreachable > 0 {
         parts.push(trf("{0} unreachable", &[unreachable.to_string()]));
+    }
+    if excluded {
+        parts.push(tr("Excluded"));
     }
     parts.join(" · ")
 }
@@ -302,6 +319,17 @@ fn card(tint: Option<Color>) -> theme::Container<'static> {
     })
 }
 
+fn sub_card() -> theme::Container<'static> {
+    theme::Container::custom(|theme: &cosmic::Theme| {
+        let base = Color::from(theme.cosmic().on_bg_color());
+        iced_container::Style {
+            background: Some(Background::Color(with_alpha(base, 0.04))),
+            border: Border { radius: corners::now().small.into(), width: 1.0, color: with_alpha(base, 0.12) },
+            ..Default::default()
+        }
+    })
+}
+
 fn badge(tint: Option<Color>) -> theme::Container<'static> {
     theme::Container::custom(move |theme: &cosmic::Theme| {
         let bg = tint.unwrap_or_else(|| with_alpha(Color::from(theme.cosmic().on_bg_color()), 0.1));
@@ -321,10 +349,21 @@ fn pill_style() -> theme::Container<'static> {
     })
 }
 
-fn swatch<'a>(c: Option<Color>, reachable: bool) -> Element<'a, Message> {
+fn segmented_bar_style() -> theme::Container<'static> {
+    theme::Container::custom(|theme: &cosmic::Theme| {
+        let base = Color::from(theme.cosmic().on_bg_color());
+        iced_container::Style {
+            background: Some(Background::Color(with_alpha(base, 0.06))),
+            border: Border { radius: corners::now().small.into(), width: 1.0, color: with_alpha(base, 0.12) },
+            ..Default::default()
+        }
+    })
+}
+
+fn swatch_sized<'a>(c: Option<Color>, reachable: bool, size: f32) -> Element<'a, Message> {
     container(space::horizontal())
-        .width(Length::Fixed(12.0))
-        .height(Length::Fixed(12.0))
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
         .class(theme::Container::custom(move |theme: &cosmic::Theme| {
             let base = Color::from(theme.cosmic().on_bg_color());
             let fill = c.map_or(with_alpha(base, 0.08), |c| with_alpha(c, if reachable { 1.0 } else { 0.4 }));
@@ -335,6 +374,10 @@ fn swatch<'a>(c: Option<Color>, reachable: bool) -> Element<'a, Message> {
             }
         }))
         .into()
+}
+
+fn mini_badge<'a>(label: String) -> Element<'a, Message> {
+    container(dim(label)).padding([1, 6]).class(pill_style()).into()
 }
 
 fn bulb(on: bool) -> icon::Handle {
@@ -349,13 +392,24 @@ fn bulb(on: bool) -> icon::Handle {
 struct HueLights<const WINDOW_MODE: bool = false> {
     core: Core,
     window_mode: bool,
+    window_width: f32,
     popup: Option<window::Id>,
     rectangle: Rectangle,
     tracker: Option<RectangleTracker<u32>>,
     helper: Option<mpsc::UnboundedSender<String>>,
     stats: Value,
+    tab: Tab,
+    filter: RoomFilter,
     expanded: HashSet<String>,
     all_scenes: HashSet<String>,
+    open_light_drawer: Option<String>,
+    favorites: Vec<Favorite>,
+    exclude_all_on: HashSet<String>,
+    confirm_all_on_pref: bool,
+    confirm_all_on: bool,
+    schedule_draft: Option<ScheduleDraft>,
+    rule_draft: Option<RuleDraft>,
+    activity_open: bool,
     // A slider being dragged: its value, and when it was last sent.
     dragging: HashMap<String, (u8, Instant)>,
     ip: String,
@@ -368,7 +422,7 @@ struct HueLights<const WINDOW_MODE: bool = false> {
     corners: String,
     setting_error: bool,
     resize: window_size::Debounce,
-    /// The settings page (Language, F12, Corners) is shown instead of the rooms.
+    /// The settings page (Language, F12, Corners, Confirm All On) is shown instead of the tabs.
     settings_open: bool,
     language_open: bool,
     corners_open: bool,
@@ -384,16 +438,66 @@ enum Message {
     Show,
     CloseRequested(window::Id),
     Rectangle(RectangleUpdate<u32>),
+    SelectTab(Tab),
+    SetFilter(RoomFilter),
     Expand(String),
     AllScenes(String),
+    ToggleLightDrawer(String),
+    ToggleFavorite(String, String),
+    ToggleExcludeAllOn(String, bool),
+    LightMirek(String, u16),
+    LightXy(String, [f64; 2]),
+    LightEffect(String, String),
     RoomOn(String, bool),
     LightOn(String, bool),
     // "room:<key>" or "light:<id>", the value
     Bri(String, u8),
     BriDone(String),
     Scene(String),
+    AllOn,
+    ConfirmAllOn,
+    CancelAllOn,
     AllOff,
     Refresh,
+    // Schedules
+    StartSchedule,
+    StartScheduleFor(String, String, String),
+    CancelSchedule,
+    ScheduleName(String),
+    ScheduleToggleTargetPicker,
+    SchedulePickTarget(String, String, String),
+    ScheduleTriggerKind(String),
+    ScheduleTime(String),
+    ScheduleOffsetDelta(i32),
+    ScheduleToggleDay(String),
+    ScheduleAction(String),
+    ScheduleBri(u8),
+    ScheduleFade(u16),
+    ScheduleSave,
+    ScheduleToggle(String, bool),
+    ScheduleDelete(String),
+    // Rules
+    RulesPause(bool),
+    StartRule,
+    StartRuleFor(String, String, String),
+    CancelRule,
+    RuleName(String),
+    RuleKind(String),
+    RuleToggleTriggerPicker,
+    RulePickTrigger(String, String, String),
+    RuleTriggerState(String),
+    RuleToggleTargetPicker,
+    RulePickTarget(String, String, String),
+    RuleMirrorOff(bool),
+    RuleMatchBri(bool),
+    RuleOnlyIfOff(bool),
+    RuleTimeStart(String),
+    RuleTimeEnd(String),
+    RuleSave,
+    RuleToggle(String, bool),
+    RuleDelete(String),
+    ToggleActivity,
+    // Pairing & settings
     Ip(String),
     Pair(String),
     Discover,
@@ -408,6 +512,7 @@ enum Message {
     NoteDone,
     NoteSaved(Result<(), String>),
     SetShotKey(bool),
+    SetConfirmAllOnPref(bool),
     Corners(String),
     ToggleSettings,
     ToggleLanguage,
@@ -428,13 +533,25 @@ fn off_thread<T: Send + 'static>(
     })
 }
 
-// Settings › F12 saves a screenshot (on unless switched off) and Corners, from config.json.
+// Settings from config.json.
 fn shot_key_setting() -> bool {
     read_pref("screenshot_key").and_then(|v| v.as_bool()).unwrap_or(true)
 }
 
+fn confirm_all_on_setting() -> bool {
+    read_pref(CONFIRM_ALL_ON_KEY).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
 fn corners_setting() -> String {
     corners::normalize(read_pref("corners").as_ref().and_then(Value::as_str).unwrap_or("")).to_string()
+}
+
+fn favorites_setting() -> Vec<Favorite> {
+    parse_favorites(read_pref(FAVORITES_KEY).as_ref())
+}
+
+fn exclude_all_on_setting() -> HashSet<String> {
+    parse_string_set(read_pref(EXCLUDE_ALL_ON_KEY).as_ref())
 }
 
 impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
@@ -442,6 +559,13 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         if let Some(helper) = &self.helper {
             let _ = helper.unbounded_send(command.to_string());
         }
+    }
+
+    fn send_all_on(&self) {
+        self.send(json!({
+            "cmd": "all_on",
+            "exclude_rooms": sorted_exclude_list(&self.exclude_all_on),
+        }));
     }
 
     fn phase(&self) -> &str {
@@ -461,6 +585,13 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
 
     fn room(&self, key: &str) -> Option<&Value> {
         list(&self.stats, "rooms").iter().find(|r| room_key(r) == key)
+    }
+
+    fn find_light(&self, id: &str) -> Option<&Value> {
+        list(&self.stats, "rooms")
+            .iter()
+            .flat_map(|r| list(r, "lights").iter())
+            .find(|l| s(l, "id") == id)
     }
 
     // Rooms with a grouped light are switched with one bridge command; tr("Other lights") per light.
@@ -497,6 +628,25 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         maprisma_hue_lights::summary(&self.stats)
     }
 
+    fn any_picker_open(&self) -> bool {
+        self.schedule_draft.as_ref().is_some_and(|d| d.target_picker_open)
+            || self.rule_draft.as_ref().is_some_and(|d| d.trigger_picker_open || d.target_picker_open)
+    }
+
+    fn close_pickers(&mut self) {
+        if let Some(d) = &mut self.schedule_draft {
+            d.target_picker_open = false;
+        }
+        if let Some(d) = &mut self.rule_draft {
+            d.trigger_picker_open = false;
+            d.target_picker_open = false;
+        }
+    }
+
+    fn any_drawer_open(&self) -> bool {
+        self.open_light_drawer.is_some() || self.schedule_draft.is_some() || self.rule_draft.is_some()
+    }
+
     fn panel_content(&self) -> Element<'_, Message> {
         let lit = self.on_count() > 0.0;
         let size = self.core.applet.suggested_size(true).0;
@@ -528,6 +678,47 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             cosmic::widget::tooltip::Position::Bottom,
         ));
         header.into()
+    }
+
+    fn tab_bar(&self) -> Element<'_, Message> {
+        let sch_count = list(&self.stats, "schedules").len();
+        let rule_count = list(&self.stats, "rules").len();
+        let paused = flag(&self.stats, "rules_paused");
+
+        let tab_btn = |tab: Tab, label: String, count: usize, dimmed: bool| -> Element<'_, Message> {
+            let active = self.tab == tab;
+            let text_el: Element<Message> = if dimmed && !active {
+                dim(label)
+            } else {
+                text::caption(label).into()
+            };
+            let mut inner = row![text_el].spacing(6).align_y(Alignment::Center);
+            if count > 0 {
+                inner = inner.push(container(text::caption(count.to_string())).padding([1, 6]).class(pill_style()));
+            }
+            if dimmed {
+                inner = inner.push(dim("⏸"));
+            }
+            button::custom(container(inner).width(Length::Fill).align_x(Alignment::Center))
+                .width(Length::FillPortion(1))
+                .padding([6, 8])
+                .class(if active { theme::Button::Suggested } else { theme::Button::MenuItem })
+                .on_press(Message::SelectTab(tab))
+                .into()
+        };
+
+        container(
+            row![
+                tab_btn(Tab::Lights, tr("Lights"), 0, false),
+                tab_btn(Tab::Schedules, tr("Schedules"), sch_count, false),
+                tab_btn(Tab::Rules, tr("Rules"), rule_count, paused),
+            ]
+            .spacing(4),
+        )
+        .padding(4)
+        .width(Length::Fill)
+        .class(segmented_bar_style())
+        .into()
     }
 
     fn pairing(&self) -> Element<'_, Message> {
@@ -580,11 +771,145 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         content.into()
     }
 
+    // --------------------------------------------------------------------- Lights tab
+
+    fn favorites_strip(&self) -> Option<Element<'_, Message>> {
+        if self.favorites.is_empty() {
+            return None;
+        }
+        let mut pills: Vec<Element<Message>> = Vec::new();
+        for fav in &self.favorites {
+            if fav.kind == "room" {
+                if let Some(room) = self.room(&fav.id) {
+                    let lit = flag(room, "on");
+                    let c = color(room.get("color").unwrap_or(&Value::Null));
+                    let name = room_name(room);
+                    let id = fav.id.clone();
+                    let inner = row![swatch_sized(lit.then_some(c), true, 10.0), text::caption(name)]
+                        .spacing(6)
+                        .align_y(Alignment::Center);
+                    let b = button::custom(inner)
+                        .padding([5, 10])
+                        .class(if lit { theme::Button::Suggested } else { theme::Button::Standard })
+                        .on_press(Message::RoomOn(id, !lit));
+                    pills.push(b.into());
+                }
+            } else if fav.kind == "light" {
+                if let Some(light) = self.find_light(&fav.id) {
+                    let lit = flag(light, "on");
+                    let reachable = light.get("reachable").and_then(Value::as_bool) != Some(false);
+                    let c = color(light.get("color").unwrap_or(&Value::Null));
+                    let name = s(light, "name").to_string();
+                    let id = fav.id.clone();
+                    let inner = row![swatch_sized(lit.then_some(c), reachable, 10.0), text::caption(name)]
+                        .spacing(6)
+                        .align_y(Alignment::Center);
+                    let b = button::custom(inner)
+                        .padding([5, 10])
+                        .class(if lit { theme::Button::Suggested } else { theme::Button::Standard })
+                        .on_press(Message::LightOn(id, !lit));
+                    pills.push(b.into());
+                }
+            }
+        }
+        if pills.is_empty() {
+            return None;
+        }
+        Some(
+            column![
+                dim(tr("Pinned")),
+                flex_row(pills).row_spacing(6).column_spacing(6),
+            ]
+            .spacing(6)
+            .into(),
+        )
+    }
+
+    fn filter_bar(&self) -> Element<'_, Message> {
+        let mut filters: Vec<(RoomFilter, String)> = vec![
+            (RoomFilter::All, tr("All")),
+            (RoomFilter::On, tr("On")),
+            (RoomFilter::Rooms, tr("Rooms")),
+            (RoomFilter::Zones, tr("Zones")),
+        ];
+        if !self.favorites.is_empty() {
+            filters.push((RoomFilter::Favorites, tr("Favorites")));
+        }
+        let pills: Vec<Element<Message>> = filters
+            .into_iter()
+            .map(|(f, label)| {
+                let b = if self.filter == f { button::suggested(label) } else { button::standard(label) };
+                b.on_press(Message::SetFilter(f)).into()
+            })
+            .collect();
+        flex_row(pills).row_spacing(6).column_spacing(6).into()
+    }
+
+    fn lights_tab(&self) -> Element<'_, Message> {
+        let rooms = list(&self.stats, "rooms");
+        if rooms.is_empty() {
+            return dim(if self.phase() == "ok" {
+                tr("No lights on this bridge yet.")
+            } else {
+                tr("Connecting to the bridge …")
+            });
+        }
+        let mut content = column![].spacing(10);
+        if let Some(strip) = self.favorites_strip() {
+            content = content.push(strip);
+        }
+        content = content.push(self.filter_bar());
+
+        let filtered: Vec<&Value> = rooms
+            .iter()
+            .filter(|r| room_matches_filter(r, self.filter, &self.favorites))
+            .collect();
+
+        if filtered.is_empty() {
+            content = content.push(container(dim(tr("No lights match this filter."))).padding([12, 4]));
+            return content.into();
+        }
+
+        let two_cols = self.window_mode && self.window_width >= TWO_COL_MIN_WIDTH;
+        let cards_area: Element<Message> = if two_cols {
+            let mut left = column![].spacing(12).width(Length::FillPortion(1));
+            let mut right = column![].spacing(12).width(Length::FillPortion(1));
+            for (i, room) in filtered.iter().enumerate() {
+                if i % 2 == 0 {
+                    left = left.push(self.room_card(room));
+                } else {
+                    right = right.push(self.room_card(room));
+                }
+            }
+            row![left, right].spacing(12).align_y(Alignment::Start).into()
+        } else {
+            let mut cards = column![].spacing(12);
+            for room in filtered {
+                cards = cards.push(self.room_card(room));
+            }
+            cards.into()
+        };
+
+        if self.window_mode {
+            content = content.push(cards_area);
+        } else {
+            content = content.push(
+                container(scrollable(container(cards_area).padding([0, 12, 0, 0])).height(Length::Shrink))
+                    .max_height(ROOMS_MAX_HEIGHT),
+            );
+        }
+        content.into()
+    }
+
     fn room_card<'a>(&'a self, room: &'a Value) -> Element<'a, Message> {
         let key = room_key(room);
+        let kind = s(room, "kind").to_string();
         let lit = flag(room, "on");
         let tint = lit.then(|| color(room.get("color").unwrap_or(&Value::Null)));
         let open = self.expanded.contains(&key);
+        let excluded = self.exclude_all_on.contains(&key);
+        let pinned = is_favorite(&self.favorites, "room", &key);
+        let rname = room_name(room);
 
         let glyph: Element<Message> = match room_icon(room) {
             Some(name) => {
@@ -611,7 +936,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             .align_y(Alignment::Center)
             .class(badge(tint));
         let chevron = icon::from_name(if open { "pan-down-symbolic" } else { "pan-end-symbolic" }).size(16).symbolic(true);
-        let names = column![text::heading(room_name(room)), dim(room_status(room))].spacing(4);
+        let names = column![text::heading(rname.clone()), dim(room_status(room, excluded))].spacing(4);
         let expander = button::custom(
             row![badge, names, space::horizontal(), chevron].spacing(12).align_y(Alignment::Center),
         )
@@ -646,6 +971,9 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         if open {
             for light in list(room, "lights") {
                 card_content = card_content.push(self.light_row(light));
+                if self.open_light_drawer.as_deref() == Some(s(light, "id")) {
+                    card_content = card_content.push(self.light_drawer(light));
+                }
             }
             let scenes = list(room, "scenes");
             if !scenes.is_empty() {
@@ -662,11 +990,44 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                     .collect();
                 if scenes.len() > SCENE_LIMIT {
                     let shown = pills.len();
-                    let label = if all { tr("less").to_string() } else { trf("+{0} more", &[(scenes.len() - shown).to_string()]) };
+                    let label = if all { tr("less") } else { trf("+{0} more", &[(scenes.len() - shown).to_string()]) };
                     pills.push(button::text(label).on_press(Message::AllScenes(key.clone())).into());
                 }
                 card_content =
                     card_content.push(container(flex_row(pills).row_spacing(8).column_spacing(8)).padding([4, 4, 0, 4]));
+            }
+            // Room quick actions: Pin, Schedule, Link rule, Exclude from All On.
+            let mut room_actions: Vec<Element<Message>> = vec![
+                button::standard(if pinned { tr("Unpin") } else { tr("Pin") })
+                    .on_press(Message::ToggleFavorite("room".into(), key.clone()))
+                    .into(),
+            ];
+            if matches!(kind.as_str(), "room" | "zone") {
+                room_actions.push(
+                    button::standard(tr("Schedule"))
+                        .on_press(Message::StartScheduleFor(kind.clone(), key.clone(), rname.clone()))
+                        .into(),
+                );
+                room_actions.push(
+                    button::standard(tr("Link rule"))
+                        .on_press(Message::StartRuleFor(kind.clone(), key.clone(), rname.clone()))
+                        .into(),
+                );
+            }
+            card_content = card_content.push(divider::horizontal::light());
+            card_content = card_content.push(
+                container(flex_row(room_actions).row_spacing(6).column_spacing(6)).padding([2, 4, 0, 4]),
+            );
+            if matches!(kind.as_str(), "room" | "zone") {
+                let ex_key = key.clone();
+                card_content = card_content.push(
+                    container(
+                        checkbox(excluded)
+                            .label(tr("Exclude from All On"))
+                            .on_toggle(move |v| Message::ToggleExcludeAllOn(ex_key.clone(), v)),
+                    )
+                    .padding([0, 4]),
+                );
             }
         }
         container(card_content).padding(12).width(Length::Fill).class(card(tint)).into()
@@ -677,13 +1038,39 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         let on = flag(light, "on");
         let reachable = light.get("reachable").and_then(Value::as_bool) != Some(false);
         let c = color(light.get("color").unwrap_or(&Value::Null));
+        let drawer_open = self.open_light_drawer.as_deref() == Some(id.as_str());
         let mut name = s(light, "name").to_string();
         if !reachable {
             name += &format!(" · {}", tr("unreachable"));
         }
-        let name: Element<Message> = if on && reachable { text::body(name).into() } else { dim(name) };
-        let mut line = row![swatch(on.then_some(c), reachable), container(name).width(Length::Fill)]
-            .spacing(8)
+        let name_el: Element<Message> = if on && reachable { text::body(name).into() } else { dim(name) };
+
+        let has_sched = has_active_schedule(&self.stats, "light", &id);
+        let has_rule = belongs_to_rule(&self.stats, "light", &id);
+        let label_col: Element<Message> = if has_sched || has_rule {
+            let mut badges = row![].spacing(4).align_y(Alignment::Center);
+            if has_sched {
+                badges = badges.push(mini_badge(tr("Schedule")));
+            }
+            if has_rule {
+                badges = badges.push(mini_badge(tr("Rule")));
+            }
+            column![name_el, badges].spacing(2).into()
+        } else {
+            name_el
+        };
+
+        let dot_btn = cosmic::widget::tooltip(
+            button::custom(swatch_sized(on.then_some(c), reachable, 14.0))
+                .padding(4)
+                .class(if drawer_open { theme::Button::Suggested } else { theme::Button::MenuItem })
+                .on_press(Message::ToggleLightDrawer(id.clone())),
+            text::body(tr("Color, warmth & effects")),
+            cosmic::widget::tooltip::Position::Top,
+        );
+
+        let mut line = row![dot_btn, container(label_col).width(Length::Fill)]
+            .spacing(6)
             .align_y(Alignment::Center);
         if flag(light, "dimmable") {
             let target = format!("light:{id}");
@@ -693,13 +1080,642 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                 slider(0..=100, bri, move |v| Message::Bri(t1.clone(), v))
                     .step(5u8)
                     .on_release(Message::BriDone(target))
-                    .width(Length::Fixed(110.0)),
+                    .width(Length::Fixed(104.0)),
             );
         }
         let switch_id = id.clone();
         line = line.push(toggler(on).on_toggle(move |v| Message::LightOn(switch_id.clone(), v)));
-        container(line).padding([4, 4, 4, 12]).into()
+        container(line).padding([4, 4, 4, 8]).into()
     }
+
+    fn light_drawer<'a>(&'a self, light: &'a Value) -> Element<'a, Message> {
+        let id = s(light, "id").to_string();
+        let name = s(light, "name").to_string();
+        let supports_ct = flag(light, "supports_ct");
+        let supports_color = flag(light, "supports_color");
+        let current_mirek = light.get("mirek").and_then(Value::as_i64);
+        let current_effect = s(light, "effect");
+        let effects = list(light, "available_effects");
+        let pinned = is_favorite(&self.favorites, "light", &id);
+
+        let mut drawer = column![].spacing(8);
+
+        if supports_ct {
+            let pills: Vec<Element<Message>> = WARMTH_PRESETS
+                .iter()
+                .map(|preset| {
+                    let target = clamp_mirek(light, preset.mirek);
+                    let active = current_mirek.is_some_and(|m| (m - target as i64).abs() <= 25);
+                    let inner = row![
+                        swatch_sized(Some(preset.swatch), true, 10.0),
+                        text::caption(tr(preset.label_key)),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
+                    button::custom(inner)
+                        .padding([4, 8])
+                        .class(if active { theme::Button::Suggested } else { theme::Button::Standard })
+                        .on_press(Message::LightMirek(id.clone(), target))
+                        .into()
+                })
+                .collect();
+            drawer = drawer.push(column![dim(tr("Warmth")), flex_row(pills).row_spacing(6).column_spacing(6)].spacing(4));
+        }
+
+        if supports_color {
+            let swatches: Vec<Element<Message>> = COLOR_PRESETS
+                .iter()
+                .map(|preset| {
+                    let lid = id.clone();
+                    let xy = preset.xy;
+                    button::custom(swatch_sized(Some(preset.swatch), true, 18.0))
+                        .padding(4)
+                        .class(theme::Button::Standard)
+                        .on_press(Message::LightXy(lid, xy))
+                        .into()
+                })
+                .collect();
+            drawer = drawer.push(column![dim(tr("Color")), flex_row(swatches).row_spacing(6).column_spacing(6)].spacing(4));
+        }
+
+        if !effects.is_empty() {
+            let chips: Vec<Element<Message>> = effects
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|eff| {
+                    let active = eff == current_effect || (current_effect.is_empty() && eff == "no_effect");
+                    let b = if active { button::suggested(effect_label(eff)) } else { button::standard(effect_label(eff)) };
+                    b.on_press(Message::LightEffect(id.clone(), eff.to_string())).into()
+                })
+                .collect();
+            if !chips.is_empty() {
+                drawer = drawer.push(column![dim(tr("Effects")), flex_row(chips).row_spacing(6).column_spacing(6)].spacing(4));
+            }
+        }
+
+        let quick: Vec<Element<Message>> = vec![
+            button::standard(if pinned { tr("Unpin") } else { tr("Pin") })
+                .on_press(Message::ToggleFavorite("light".into(), id.clone()))
+                .into(),
+            button::standard(tr("Schedule"))
+                .on_press(Message::StartScheduleFor("light".into(), id.clone(), name.clone()))
+                .into(),
+            button::standard(tr("Link rule"))
+                .on_press(Message::StartRuleFor("light".into(), id, name))
+                .into(),
+        ];
+        drawer = drawer.push(flex_row(quick).row_spacing(6).column_spacing(6));
+
+        container(container(drawer).padding(10).width(Length::Fill).class(sub_card()))
+            .padding([0, 4, 4, 16])
+            .into()
+    }
+
+    // --------------------------------------------------------------------- Schedules tab
+
+    fn schedules_tab(&self) -> Element<'_, Message> {
+        let mut content = column![].spacing(10);
+        if self.schedule_draft.is_none() {
+            content = content.push(
+                row![
+                    space::horizontal(),
+                    button::suggested(tr("+ New schedule")).on_press(Message::StartSchedule),
+                ]
+                .align_y(Alignment::Center),
+            );
+        }
+
+        if let Some(draft) = &self.schedule_draft {
+            content = content.push(self.schedule_builder(draft));
+        }
+
+        let schedules = list(&self.stats, "schedules");
+        let list_view: Element<Message> = if schedules.is_empty() {
+            container(dim(tr("No schedules yet."))).padding([8, 4]).into()
+        } else {
+            let mut items = column![].spacing(10);
+            for sch in schedules {
+                items = items.push(self.schedule_card(sch));
+            }
+            items.into()
+        };
+
+        if self.window_mode {
+            content = content.push(list_view);
+        } else {
+            content = content.push(
+                container(scrollable(container(list_view).padding([0, 12, 0, 0])).height(Length::Shrink))
+                    .max_height(ROOMS_MAX_HEIGHT),
+            );
+        }
+        content.into()
+    }
+
+    fn schedule_card<'a>(&'a self, sch: &'a Value) -> Element<'a, Message> {
+        let id = s(sch, "id").to_string();
+        let enabled = flag(sch, "enabled");
+        let name = match s(sch, "name") {
+            "" => tr("Schedule"),
+            n => n.to_string(),
+        };
+        let target_name = match s(sch, "target_name") {
+            "" => resolve_name(&self.stats, s(sch, "target_kind"), s(sch, "target_id")),
+            n => n.to_string(),
+        };
+        let trigger = schedule_trigger_summary(sch);
+        let action = schedule_action_summary(sch);
+        let source = s(sch, "source");
+
+        let mut head_left = row![text::heading(name)].spacing(8).align_y(Alignment::Center);
+        if source == "bridge" {
+            head_left = head_left.push(mini_badge(tr("Bridge")));
+        }
+
+        let toggle_id = id.clone();
+        let head = row![
+            head_left,
+            space::horizontal(),
+            toggler(enabled).on_toggle(move |v| Message::ScheduleToggle(toggle_id.clone(), v)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let meta = format!("{target_name} · {trigger}");
+        let foot = row![
+            dim(action),
+            space::horizontal(),
+            button::destructive(tr("Delete")).on_press(Message::ScheduleDelete(id)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        container(column![head, dim(meta), foot].spacing(6))
+            .padding(12)
+            .width(Length::Fill)
+            .class(card(None))
+            .into()
+    }
+
+    fn schedule_builder<'a>(&'a self, draft: &'a ScheduleDraft) -> Element<'a, Message> {
+        let mut form = column![
+            text::heading(tr("+ New schedule")),
+            text_input(tr("Name (optional)"), &draft.name).on_input(Message::ScheduleName),
+        ]
+        .spacing(8);
+
+        // Target picker
+        let target_label = if draft.target_name.is_empty() { tr("Select target") } else { draft.target_name.clone() };
+        form = form.push(
+            row![
+                dim(tr("Target")),
+                space::horizontal(),
+                button::text(target_label)
+                    .trailing_icon(icon::from_name(if draft.target_picker_open { "pan-up-symbolic" } else { "pan-down-symbolic" }).size(16))
+                    .on_press(Message::ScheduleToggleTargetPicker),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        if draft.target_picker_open {
+            let mut opts = column![].spacing(2);
+            for opt in all_targets(&self.stats) {
+                let selected = opt.kind == draft.target_kind && opt.id == draft.target_id;
+                let label = if selected { format!("✓ {}", opt.label) } else { opt.label.clone() };
+                opts = opts.push(
+                    menu_button(text::caption(label)).on_press(Message::SchedulePickTarget(opt.kind, opt.id, opt.label)),
+                );
+            }
+            form = form.push(
+                container(scrollable(opts).height(Length::Shrink))
+                    .max_height(160.0)
+                    .padding(4)
+                    .width(Length::Fill)
+                    .class(sub_card()),
+            );
+        }
+
+        // Trigger kind pills
+        let trigger_pills: Vec<Element<Message>> = [
+            ("time", tr("Time")),
+            ("sunrise", tr("Sunrise")),
+            ("sunset", tr("Sunset")),
+        ]
+        .into_iter()
+        .map(|(k, label)| {
+            let b = if draft.trigger_kind == k { button::suggested(label) } else { button::standard(label) };
+            b.on_press(Message::ScheduleTriggerKind(k.into())).into()
+        })
+        .collect();
+        form = form.push(column![dim(tr("Trigger")), flex_row(trigger_pills).row_spacing(6).column_spacing(6)].spacing(4));
+
+        // Time or solar offset
+        if draft.trigger_kind == "time" {
+            form = form.push(
+                row![
+                    dim(tr("Time")),
+                    space::horizontal(),
+                    text_input("07:00", &draft.time)
+                        .on_input(Message::ScheduleTime)
+                        .width(Length::Fixed(100.0)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        } else {
+            let offset_text = if draft.offset_min > 0 {
+                format!("+{}", trf("{0} min", &[draft.offset_min.to_string()]))
+            } else {
+                trf("{0} min", &[draft.offset_min.to_string()])
+            };
+            form = form.push(
+                row![
+                    dim(tr("Offset")),
+                    space::horizontal(),
+                    button::standard("-15").on_press(Message::ScheduleOffsetDelta(-15)),
+                    button::standard("-5").on_press(Message::ScheduleOffsetDelta(-5)),
+                    text::body(offset_text),
+                    button::standard("+5").on_press(Message::ScheduleOffsetDelta(5)),
+                    button::standard("+15").on_press(Message::ScheduleOffsetDelta(15)),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center),
+            );
+        }
+
+        // Weekday toggles
+        let day_btns: Vec<Element<Message>> = DAYS_ORDER
+            .iter()
+            .map(|code| {
+                let active = draft.days.contains(*code);
+                let label = day_short_toggle(code);
+                let b = if active { button::suggested(label) } else { button::standard(label) };
+                b.on_press(Message::ScheduleToggleDay((*code).to_string())).into()
+            })
+            .collect();
+        form = form.push(column![dim(tr("Days")), flex_row(day_btns).row_spacing(4).column_spacing(4)].spacing(4));
+
+        // Action & brightness
+        let action_pills: Vec<Element<Message>> = [("on", tr("On")), ("off", tr("Off"))]
+            .into_iter()
+            .map(|(k, label)| {
+                let b = if draft.action == k { button::suggested(label) } else { button::standard(label) };
+                b.on_press(Message::ScheduleAction(k.into())).into()
+            })
+            .collect();
+        form = form.push(
+            row![
+                dim(tr("Action")),
+                space::horizontal(),
+                flex_row(action_pills).row_spacing(6).column_spacing(6),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+
+        if draft.action == "on" {
+            form = form.push(
+                row![
+                    dim(tr("Brightness")),
+                    slider(1..=100, draft.bri, Message::ScheduleBri).step(5u8).width(Length::Fill),
+                    container(text::caption(format!("{}%", draft.bri))).width(Length::Fixed(40.0)).align_x(Alignment::End),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
+
+        // Fade minutes
+        let fade_pills: Vec<Element<Message>> = [0u16, 5, 10, 15, 30]
+            .into_iter()
+            .map(|m| {
+                let label = if m == 0 { tr("None") } else { trf("{0} min", &[m.to_string()]) };
+                let b = if draft.fade_min == m { button::suggested(label) } else { button::standard(label) };
+                b.on_press(Message::ScheduleFade(m)).into()
+            })
+            .collect();
+        form = form.push(column![dim(tr("Fade")), flex_row(fade_pills).row_spacing(6).column_spacing(6)].spacing(4));
+
+        if let Some(err) = &draft.error {
+            form = form.push(error_text(err.clone()));
+        }
+
+        form = form.push(
+            row![
+                space::horizontal(),
+                button::standard(tr("Cancel")).on_press(Message::CancelSchedule),
+                button::suggested(tr("Save")).on_press(Message::ScheduleSave),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+
+        container(form).padding(12).width(Length::Fill).class(card(None)).into()
+    }
+
+    // --------------------------------------------------------------------- Rules tab
+
+    fn rules_tab(&self) -> Element<'_, Message> {
+        let paused = flag(&self.stats, "rules_paused");
+        let rules = list(&self.stats, "rules");
+        let log = list(&self.stats, "rule_log");
+
+        let mut head = row![
+            text::body(tr("Pause all rules")),
+            toggler(paused).on_toggle(Message::RulesPause),
+            space::horizontal(),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        if self.rule_draft.is_none() {
+            head = head.push(button::suggested(tr("+ New rule")).on_press(Message::StartRule));
+        }
+
+        let mut content = column![head].spacing(10);
+        if paused {
+            content = content.push(dim(tr("Rules are paused")));
+        }
+
+        if let Some(draft) = &self.rule_draft {
+            content = content.push(self.rule_builder(draft));
+        }
+
+        let mut body = column![].spacing(10);
+        if rules.is_empty() {
+            body = body.push(container(dim(tr("No rules yet."))).padding([8, 4]));
+        } else {
+            for rule in rules {
+                body = body.push(self.rule_card(rule, paused));
+            }
+        }
+
+        // Expandable Recent activity section
+        let chevron = icon::from_name(if self.activity_open { "pan-down-symbolic" } else { "pan-end-symbolic" })
+            .size(16)
+            .symbolic(true);
+        let mut act_head = row![text::body(tr("Recent activity"))].spacing(8).align_y(Alignment::Center);
+        if !log.is_empty() {
+            act_head = act_head.push(mini_badge(log.len().to_string()));
+        }
+        act_head = act_head.push(space::horizontal()).push(chevron);
+        body = body.push(divider::horizontal::default());
+        body = body.push(
+            button::custom(act_head)
+                .padding([6, 4])
+                .width(Length::Fill)
+                .class(theme::Button::MenuItem)
+                .on_press(Message::ToggleActivity),
+        );
+
+        if self.activity_open {
+            if log.is_empty() {
+                body = body.push(container(dim(tr("No recent activity."))).padding([4, 8]));
+            } else {
+                let mut entries = column![].spacing(6);
+                for entry in log.iter().rev() {
+                    let ts = entry.get("ts").and_then(Value::as_i64).unwrap_or(0);
+                    let rname = s(entry, "rule_name");
+                    let detail = s(entry, "detail");
+                    entries = entries.push(
+                        container(
+                            row![
+                                dim(format_unix_ts(ts)),
+                                column![text::caption(rname.to_string()), dim(detail.to_string())].spacing(2),
+                            ]
+                            .spacing(10)
+                            .align_y(Alignment::Start),
+                        )
+                        .padding([6, 8])
+                        .width(Length::Fill)
+                        .class(sub_card()),
+                    );
+                }
+                body = body.push(entries);
+            }
+        }
+
+        if self.window_mode {
+            content = content.push(body);
+        } else {
+            content = content.push(
+                container(scrollable(container(body).padding([0, 12, 0, 0])).height(Length::Shrink))
+                    .max_height(ROOMS_MAX_HEIGHT),
+            );
+        }
+        content.into()
+    }
+
+    fn rule_card<'a>(&'a self, rule: &'a Value, all_paused: bool) -> Element<'a, Message> {
+        let id = s(rule, "id").to_string();
+        let enabled = flag(rule, "enabled");
+        let kind = s(rule, "kind");
+        let name = match s(rule, "name") {
+            "" => tr("Rule"),
+            n => n.to_string(),
+        };
+        let kind_label = match kind {
+            "exclusive" => tr("Exclusive"),
+            "companion" => tr("Companion"),
+            _ => tr("Follow"),
+        };
+
+        let trig_name = resolve_name(&self.stats, s(rule, "trigger_kind"), s(rule, "trigger_id"));
+        let trig_state = if s(rule, "trigger_state") == "off" { tr("Turns off") } else { tr("Turns on") };
+        let when_part = format!("{trig_name} ({trig_state})");
+
+        let targets_str: String = list(rule, "targets")
+            .iter()
+            .map(|t| {
+                let tname = resolve_name(&self.stats, s(t, "kind"), s(t, "id"));
+                let act = if s(t, "action") == "off" { tr("Turn off") } else { tr("Turn on") };
+                format!("{tname} ({act})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let summary_line = trf("WHEN {0} → {1}", &[when_part, targets_str]);
+
+        let mut conds: Vec<String> = Vec::new();
+        if flag(rule, "mirror_off") {
+            conds.push(tr("Also turn off together"));
+        }
+        if flag(rule, "match_bri") {
+            conds.push(tr("Match brightness"));
+        }
+        if flag(rule, "only_if_off") {
+            conds.push(tr("Only if target is off"));
+        }
+        let ts = s(rule, "time_start");
+        let te = s(rule, "time_end");
+        if !ts.is_empty() || !te.is_empty() {
+            conds.push(format!("{ts}–{te}"));
+        }
+
+        let toggle_id = id.clone();
+        let title_el: Element<Message> = if all_paused || !enabled {
+            dim(name)
+        } else {
+            text::heading(name).into()
+        };
+        let head = row![
+            title_el,
+            mini_badge(kind_label),
+            space::horizontal(),
+            toggler(enabled).on_toggle(move |v| Message::RuleToggle(toggle_id.clone(), v)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let mut col = column![head, text::caption(summary_line)].spacing(6);
+        if !conds.is_empty() {
+            col = col.push(dim(conds.join(" · ")));
+        }
+        col = col.push(
+            row![
+                space::horizontal(),
+                button::destructive(tr("Delete")).on_press(Message::RuleDelete(id)),
+            ]
+            .align_y(Alignment::Center),
+        );
+
+        container(col).padding(12).width(Length::Fill).class(card(None)).into()
+    }
+
+    fn rule_builder<'a>(&'a self, draft: &'a RuleDraft) -> Element<'a, Message> {
+        let mut form = column![
+            text::heading(tr("+ New rule")),
+            text_input(tr("Name (optional)"), &draft.name).on_input(Message::RuleName),
+        ]
+        .spacing(8);
+
+        // Rule type pills
+        let types: Vec<Element<Message>> = [
+            ("follow", tr("Follow / Mirror")),
+            ("exclusive", tr("Exclusive (turn other off)")),
+            ("companion", tr("Companion")),
+        ]
+        .into_iter()
+        .map(|(k, label)| {
+            let b = if draft.kind == k { button::suggested(label) } else { button::standard(label) };
+            b.on_press(Message::RuleKind(k.into())).into()
+        })
+        .collect();
+        form = form.push(column![dim(tr("Rule type")), flex_row(types).row_spacing(6).column_spacing(6)].spacing(4));
+
+        // Trigger picker + state
+        let trig_label = if draft.trigger_name.is_empty() { tr("Select target") } else { draft.trigger_name.clone() };
+        form = form.push(
+            row![
+                dim(tr("When")),
+                space::horizontal(),
+                button::text(trig_label)
+                    .trailing_icon(icon::from_name(if draft.trigger_picker_open { "pan-up-symbolic" } else { "pan-down-symbolic" }).size(16))
+                    .on_press(Message::RuleToggleTriggerPicker),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        if draft.trigger_picker_open {
+            let mut opts = column![].spacing(2);
+            for opt in all_targets(&self.stats) {
+                let norm = if opt.kind == "zone" { "room" } else { opt.kind.as_str() };
+                let selected = norm == draft.trigger_kind && opt.id == draft.trigger_id;
+                let label = if selected { format!("✓ {}", opt.label) } else { opt.label.clone() };
+                opts = opts.push(
+                    menu_button(text::caption(label)).on_press(Message::RulePickTrigger(norm.into(), opt.id, opt.label)),
+                );
+            }
+            form = form.push(
+                container(scrollable(opts).height(Length::Shrink))
+                    .max_height(150.0)
+                    .padding(4)
+                    .width(Length::Fill)
+                    .class(sub_card()),
+            );
+        }
+
+        let state_pills: Vec<Element<Message>> = [("on", tr("Turns on")), ("off", tr("Turns off"))]
+            .into_iter()
+            .map(|(k, label)| {
+                let b = if draft.trigger_state == k { button::suggested(label) } else { button::standard(label) };
+                b.on_press(Message::RuleTriggerState(k.into())).into()
+            })
+            .collect();
+        form = form.push(flex_row(state_pills).row_spacing(6).column_spacing(6));
+
+        // Target picker
+        let target_label = if draft.target_name.is_empty() { tr("Select target") } else { draft.target_name.clone() };
+        let action_hint = if draft.target_action() == "off" { tr("Turn off") } else { tr("Turn on") };
+        form = form.push(
+            row![
+                dim(format!("{} ({action_hint})", tr("Then"))),
+                space::horizontal(),
+                button::text(target_label)
+                    .trailing_icon(icon::from_name(if draft.target_picker_open { "pan-up-symbolic" } else { "pan-down-symbolic" }).size(16))
+                    .on_press(Message::RuleToggleTargetPicker),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        if draft.target_picker_open {
+            let mut opts = column![].spacing(2);
+            for opt in all_targets(&self.stats) {
+                let norm = if opt.kind == "zone" { "room" } else { opt.kind.as_str() };
+                let selected = norm == draft.target_kind && opt.id == draft.target_id;
+                let label = if selected { format!("✓ {}", opt.label) } else { opt.label.clone() };
+                opts = opts.push(
+                    menu_button(text::caption(label)).on_press(Message::RulePickTarget(norm.into(), opt.id, opt.label)),
+                );
+            }
+            form = form.push(
+                container(scrollable(opts).height(Length::Shrink))
+                    .max_height(150.0)
+                    .padding(4)
+                    .width(Length::Fill)
+                    .class(sub_card()),
+            );
+        }
+
+        // Option checkboxes
+        if draft.kind != "exclusive" {
+            form = form.push(checkbox(draft.mirror_off).label(tr("Also turn off together")).on_toggle(Message::RuleMirrorOff));
+            form = form.push(checkbox(draft.match_bri).label(tr("Match brightness")).on_toggle(Message::RuleMatchBri));
+        }
+        form = form.push(checkbox(draft.only_if_off).label(tr("Only if target is off")).on_toggle(Message::RuleOnlyIfOff));
+
+        // Optional time window
+        form = form.push(
+            row![
+                dim(tr("Active between")),
+                space::horizontal(),
+                text_input(tr("Optional HH:MM"), &draft.time_start)
+                    .on_input(Message::RuleTimeStart)
+                    .width(Length::Fixed(96.0)),
+                dim("–"),
+                text_input(tr("Optional HH:MM"), &draft.time_end)
+                    .on_input(Message::RuleTimeEnd)
+                    .width(Length::Fixed(96.0)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+
+        if let Some(err) = &draft.error {
+            form = form.push(error_text(err.clone()));
+        }
+
+        form = form.push(
+            row![
+                space::horizontal(),
+                button::standard(tr("Cancel")).on_press(Message::CancelRule),
+                button::suggested(tr("Save")).on_press(Message::RuleSave),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+
+        container(form).padding(12).width(Length::Fill).class(card(None)).into()
+    }
+
+    // --------------------------------------------------------------------- Main details
 
     fn details(&self) -> Element<'_, Message> {
         let mut content = column![self.header()].spacing(12);
@@ -712,24 +1728,12 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             content = content.push(self.pairing());
             return content.into();
         }
-        content = content.push(divider::horizontal::default());
-        let rooms = list(&self.stats, "rooms");
-        if rooms.is_empty() {
-            content = content.push(dim(if self.phase() == "ok" {
-                tr("No lights on this bridge yet.")
-            } else {
-                tr("Connecting to the bridge …")
-            }));
-            return content.into();
-        }
-        let mut cards = column![].spacing(12);
-        for room in rooms {
-            cards = cards.push(self.room_card(room));
-        }
-        content = content.push(
-            container(scrollable(container(cards).padding([0, 12, 0, 0])).height(Length::Shrink))
-                .max_height(ROOMS_MAX_HEIGHT),
-        );
+        content = content.push(self.tab_bar());
+        content = content.push(match self.tab {
+            Tab::Lights => self.lights_tab(),
+            Tab::Schedules => self.schedules_tab(),
+            Tab::Rules => self.rules_tab(),
+        });
         content.into()
     }
 
@@ -831,6 +1835,10 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                 page = page.push(menu_button(text::body(label)).on_press(Message::Language(code)));
             }
         }
+        page = page.push(setting(
+            tr("Confirm before All On"),
+            toggler(self.confirm_all_on_pref).on_toggle(Message::SetConfirmAllOnPref).into(),
+        ));
         page = page.push(setting(tr("F12 saves a screenshot"), toggler(self.shot_key).on_toggle(Message::SetShotKey).into()));
         let corner_choices = [
             ("desktop", trf("Like the desktop ({0} px)", &[corners::desktop_radius().round().to_string()])),
@@ -879,10 +1887,34 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         } else {
             button::text(tr("Unpair")).on_press(Message::Unpair)
         };
+        let master_row: Element<Message> = if self.confirm_all_on {
+            padded_control(
+                row![
+                    text::body(tr("Turn all lights on?")),
+                    space::horizontal(),
+                    button::suggested(tr("Yes, all on")).on_press(Message::ConfirmAllOn),
+                    button::text(tr("Cancel")).on_press(Message::CancelAllOn),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .into()
+        } else {
+            padded_control(
+                row![
+                    button::standard(tr("All on")).on_press(Message::AllOn),
+                    button::standard(tr("All off")).on_press_maybe((self.on_count() > 0.0).then_some(Message::AllOff)),
+                    space::horizontal(),
+                    button::standard(tr("Refresh")).on_press(Message::Refresh),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .into()
+        };
         column![
             divider::horizontal::default(),
-            menu_button(text::body(tr("All off"))).on_press_maybe((self.on_count() > 0.0).then_some(Message::AllOff)),
-            menu_button(text::body(tr("Refresh"))).on_press(Message::Refresh),
+            master_row,
             padded_control(
                 row![dim(tr("Bridge")), text::caption(bridge_text(&self.stats)), space::horizontal(), unpair]
                     .spacing(8)
@@ -924,14 +1956,25 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
     fn init(mut core: Core, window_mode: bool) -> (Self, Task<Message>) {
         maprisma_hue_lights::look::solid(&mut core);
         if window_mode { core.set_header_title(TITLE.into()); }
-        let mut app = Self { core, window_mode, shot_key: shot_key_setting(), corners: corners_setting(), ..Default::default() };
+        let start_size = window_start_size();
+        let mut app = Self {
+            core,
+            window_mode,
+            window_width: if window_mode { start_size.0 } else { POPUP_WIDTH },
+            shot_key: shot_key_setting(),
+            confirm_all_on_pref: confirm_all_on_setting(),
+            corners: corners_setting(),
+            favorites: favorites_setting(),
+            exclude_all_on: exclude_all_on_setting(),
+            ..Default::default()
+        };
         // Debug builds only: start on the settings page (for off-screen screenshots).
         app.settings_open = cfg!(debug_assertions) && std::env::var("MAPRISMA_SHOT_PAGE").as_deref() == Ok("settings");
         let title = if window_mode { app.name_window() } else { Task::none() };
         if window_mode {
-            app.resize = window_size::Debounce::new(window_start_size());
+            app.resize = window_size::Debounce::new(start_size);
             // Hyprland: back where the user left it (the tray rule first puts it under the bar).
-            window_size::restore_position(window_size::parse_position(read_pref(window_size::POSITION_KEY).as_ref()), window_start_size());
+            window_size::restore_position(window_size::parse_position(read_pref(window_size::POSITION_KEY).as_ref()), start_size);
         }
         corners::set_current(&app.corners);
         // The desktop's theme for the whole window (title bar too), see look.rs.
@@ -951,6 +1994,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
 
     fn on_window_resize(&mut self, id: window::Id, width: f32, height: f32) {
         if self.window_mode && self.core.main_window_id() == Some(id) {
+            self.window_width = width;
             self.resize.resized(width, height, Instant::now());
         }
     }
@@ -1017,10 +2061,17 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             Message::Stats(stats) => {
                 if !matches!(s(&stats, "phase"), "ok" | "error" | "connecting") {
                     self.confirm_unpair = false;
+                    self.confirm_all_on = false;
                 }
                 self.stats = stats;
                 // Settings changed in another interface (window, applet) take effect here too.
                 self.shot_key = shot_key_setting();
+                self.confirm_all_on_pref = confirm_all_on_setting();
+                self.favorites = favorites_setting();
+                self.exclude_all_on = exclude_all_on_setting();
+                if self.filter == RoomFilter::Favorites && self.favorites.is_empty() {
+                    self.filter = RoomFilter::All;
+                }
                 let corners = corners_setting();
                 let mut restyle = corners != self.corners;
                 if restyle { corners::set_current(&corners); self.corners = corners; }
@@ -1037,6 +2088,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                 if self.popup == Some(id) {
                     self.popup = None;
                     self.confirm_unpair = false;
+                    self.confirm_all_on = false;
                     self.send(json!({"cmd": "closed"}));
                     return self.popup_closed();
                 }
@@ -1045,6 +2097,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                 if self.window_mode { return Task::none(); }
                 if let Some(popup) = self.popup.take() {
                     self.confirm_unpair = false;
+                    self.confirm_all_on = false;
                     self.send(json!({"cmd": "closed"}));
                     return Task::batch([self.popup_closed(), destroy_popup(popup)]);
                 }
@@ -1074,6 +2127,13 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                     None,
                 )), focus]);
             }
+            Message::SelectTab(tab) => {
+                self.tab = tab;
+                self.close_pickers();
+            }
+            Message::SetFilter(filter) => {
+                self.filter = filter;
+            }
             Message::Expand(key) => {
                 if !self.expanded.remove(&key) {
                     self.expanded.insert(key);
@@ -1083,6 +2143,39 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                 if !self.all_scenes.remove(&key) {
                     self.all_scenes.insert(key);
                 }
+            }
+            Message::ToggleLightDrawer(id) => {
+                if self.open_light_drawer.as_deref() == Some(id.as_str()) {
+                    self.open_light_drawer = None;
+                } else {
+                    self.open_light_drawer = Some(id);
+                }
+            }
+            Message::ToggleFavorite(kind, id) => {
+                toggle_favorite(&mut self.favorites, &kind, &id);
+                let val = (!self.favorites.is_empty()).then(|| favorites_to_value(&self.favorites));
+                self.setting_error = write_pref(FAVORITES_KEY, val).is_err();
+                if self.filter == RoomFilter::Favorites && self.favorites.is_empty() {
+                    self.filter = RoomFilter::All;
+                }
+            }
+            Message::ToggleExcludeAllOn(key, excluded) => {
+                if excluded {
+                    self.exclude_all_on.insert(key);
+                } else {
+                    self.exclude_all_on.remove(&key);
+                }
+                let val = (!self.exclude_all_on.is_empty()).then(|| string_set_to_value(&self.exclude_all_on));
+                self.setting_error = write_pref(EXCLUDE_ALL_ON_KEY, val).is_err();
+            }
+            Message::LightMirek(id, mirek) => {
+                self.send(json!({"cmd": "light", "id": id, "mirek": mirek}));
+            }
+            Message::LightXy(id, xy) => {
+                self.send(json!({"cmd": "light", "id": id, "xy": xy}));
+            }
+            Message::LightEffect(id, effect) => {
+                self.send(json!({"cmd": "light", "id": id, "effect": effect}));
             }
             Message::RoomOn(key, on) => self.set_room(&key, "on", json!(on)),
             Message::LightOn(id, on) => self.send(json!({"cmd": "light", "id": id, "on": on})),
@@ -1104,12 +2197,229 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                 }
             }
             Message::Scene(id) => self.send(json!({"cmd": "scene", "id": id})),
+            Message::AllOn => {
+                if self.confirm_all_on_pref {
+                    self.confirm_all_on = true;
+                } else {
+                    self.send_all_on();
+                }
+            }
+            Message::ConfirmAllOn => {
+                self.confirm_all_on = false;
+                self.send_all_on();
+            }
+            Message::CancelAllOn => {
+                self.confirm_all_on = false;
+            }
             Message::AllOff => {
                 if self.on_count() > 0.0 {
                     self.send(json!({"cmd": "all_off"}));
                 }
             }
             Message::Refresh => self.send(json!({"cmd": "refresh"})),
+
+            // Schedules
+            Message::StartSchedule => {
+                let first = all_targets(&self.stats).into_iter().next();
+                self.schedule_draft = Some(ScheduleDraft::new(first));
+            }
+            Message::StartScheduleFor(kind, id, name) => {
+                self.tab = Tab::Schedules;
+                self.open_light_drawer = None;
+                self.schedule_draft = Some(ScheduleDraft::new(Some(TargetOption { kind, id, label: name })));
+            }
+            Message::CancelSchedule => {
+                self.schedule_draft = None;
+            }
+            Message::ScheduleName(v) => {
+                if let Some(d) = &mut self.schedule_draft {
+                    d.name = v.chars().take(60).collect();
+                }
+            }
+            Message::ScheduleToggleTargetPicker => {
+                if let Some(d) = &mut self.schedule_draft {
+                    d.target_picker_open = !d.target_picker_open;
+                }
+            }
+            Message::SchedulePickTarget(kind, id, label) => {
+                if let Some(d) = &mut self.schedule_draft {
+                    d.target_kind = kind;
+                    d.target_id = id;
+                    d.target_name = label;
+                    d.target_picker_open = false;
+                    d.error = None;
+                }
+            }
+            Message::ScheduleTriggerKind(kind) => {
+                if let Some(d) = &mut self.schedule_draft {
+                    d.trigger_kind = kind;
+                    d.error = None;
+                }
+            }
+            Message::ScheduleTime(t) => {
+                if let Some(d) = &mut self.schedule_draft {
+                    d.time = t.chars().take(5).collect();
+                    d.error = None;
+                }
+            }
+            Message::ScheduleOffsetDelta(delta) => {
+                if let Some(d) = &mut self.schedule_draft {
+                    d.offset_min = (d.offset_min + delta).clamp(-120, 120);
+                }
+            }
+            Message::ScheduleToggleDay(day) => {
+                if let Some(d) = &mut self.schedule_draft {
+                    if !d.days.remove(&day) {
+                        d.days.insert(day);
+                    }
+                }
+            }
+            Message::ScheduleAction(act) => {
+                if let Some(d) = &mut self.schedule_draft {
+                    d.action = act;
+                }
+            }
+            Message::ScheduleBri(bri) => {
+                if let Some(d) = &mut self.schedule_draft {
+                    d.bri = bri.clamp(1, 100);
+                }
+            }
+            Message::ScheduleFade(fade) => {
+                if let Some(d) = &mut self.schedule_draft {
+                    d.fade_min = fade;
+                }
+            }
+            Message::ScheduleSave => {
+                if let Some(d) = &mut self.schedule_draft {
+                    match d.to_command() {
+                        Ok(cmd) => {
+                            self.send(cmd);
+                            self.schedule_draft = None;
+                        }
+                        Err(err) => d.error = Some(err),
+                    }
+                }
+            }
+            Message::ScheduleToggle(id, enabled) => {
+                self.send(json!({"cmd": "schedule_toggle", "id": id, "enabled": enabled}));
+            }
+            Message::ScheduleDelete(id) => {
+                self.send(json!({"cmd": "schedule_delete", "id": id}));
+            }
+
+            // Rules
+            Message::RulesPause(paused) => {
+                self.send(json!({"cmd": "rules_pause", "paused": paused}));
+            }
+            Message::StartRule => {
+                let targets = all_targets(&self.stats);
+                let first = targets.first().cloned();
+                let second = targets.get(1).cloned().or_else(|| first.clone());
+                self.rule_draft = Some(RuleDraft::new(first, second));
+            }
+            Message::StartRuleFor(kind, id, name) => {
+                self.tab = Tab::Rules;
+                self.open_light_drawer = None;
+                let second = all_targets(&self.stats).into_iter().find(|t| t.id != id);
+                self.rule_draft = Some(RuleDraft::new(Some(TargetOption { kind, id, label: name }), second));
+            }
+            Message::CancelRule => {
+                self.rule_draft = None;
+            }
+            Message::RuleName(v) => {
+                if let Some(d) = &mut self.rule_draft {
+                    d.name = v.chars().take(60).collect();
+                }
+            }
+            Message::RuleKind(kind) => {
+                if let Some(d) = &mut self.rule_draft {
+                    d.kind = kind;
+                }
+            }
+            Message::RuleToggleTriggerPicker => {
+                if let Some(d) = &mut self.rule_draft {
+                    d.trigger_picker_open = !d.trigger_picker_open;
+                    d.target_picker_open = false;
+                }
+            }
+            Message::RulePickTrigger(kind, id, label) => {
+                if let Some(d) = &mut self.rule_draft {
+                    d.trigger_kind = kind;
+                    d.trigger_id = id;
+                    d.trigger_name = label;
+                    d.trigger_picker_open = false;
+                    d.error = None;
+                }
+            }
+            Message::RuleTriggerState(state) => {
+                if let Some(d) = &mut self.rule_draft {
+                    d.trigger_state = state;
+                }
+            }
+            Message::RuleToggleTargetPicker => {
+                if let Some(d) = &mut self.rule_draft {
+                    d.target_picker_open = !d.target_picker_open;
+                    d.trigger_picker_open = false;
+                }
+            }
+            Message::RulePickTarget(kind, id, label) => {
+                if let Some(d) = &mut self.rule_draft {
+                    d.target_kind = kind;
+                    d.target_id = id;
+                    d.target_name = label;
+                    d.target_picker_open = false;
+                    d.error = None;
+                }
+            }
+            Message::RuleMirrorOff(v) => {
+                if let Some(d) = &mut self.rule_draft {
+                    d.mirror_off = v;
+                }
+            }
+            Message::RuleMatchBri(v) => {
+                if let Some(d) = &mut self.rule_draft {
+                    d.match_bri = v;
+                }
+            }
+            Message::RuleOnlyIfOff(v) => {
+                if let Some(d) = &mut self.rule_draft {
+                    d.only_if_off = v;
+                }
+            }
+            Message::RuleTimeStart(v) => {
+                if let Some(d) = &mut self.rule_draft {
+                    d.time_start = v.chars().take(5).collect();
+                    d.error = None;
+                }
+            }
+            Message::RuleTimeEnd(v) => {
+                if let Some(d) = &mut self.rule_draft {
+                    d.time_end = v.chars().take(5).collect();
+                    d.error = None;
+                }
+            }
+            Message::RuleSave => {
+                if let Some(d) = &mut self.rule_draft {
+                    match d.to_command() {
+                        Ok(cmd) => {
+                            self.send(cmd);
+                            self.rule_draft = None;
+                        }
+                        Err(err) => d.error = Some(err),
+                    }
+                }
+            }
+            Message::RuleToggle(id, enabled) => {
+                self.send(json!({"cmd": "rule_toggle", "id": id, "enabled": enabled}));
+            }
+            Message::RuleDelete(id) => {
+                self.send(json!({"cmd": "rule_delete", "id": id}));
+            }
+            Message::ToggleActivity => {
+                self.activity_open = !self.activity_open;
+            }
+
+            // Pairing & settings
             Message::Ip(ip) => self.ip = ip.chars().take(64).collect(),
             Message::Pair(ip) => {
                 if !ip.is_empty() {
@@ -1152,10 +2462,25 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             Message::NoteDone => return self.finish_note(true),
             Message::Escape(id) => {
                 let shown = if self.window_mode { self.core.main_window_id() == Some(id) } else { self.popup == Some(id) };
-                match esc_step(shown, self.shot.open(), self.confirm_unpair, self.language_open || self.corners_open, self.settings_open) {
+                let confirm = self.confirm_unpair || self.confirm_all_on;
+                let menus = self.language_open || self.corners_open || self.any_picker_open();
+                let drawer = self.any_drawer_open();
+                match esc_step(shown, self.shot.open(), confirm, menus, drawer, self.settings_open) {
                     EscStep::Note => return self.finish_note(false),
-                    EscStep::Confirm => self.confirm_unpair = false,
-                    EscStep::Menus => { self.language_open = false; self.corners_open = false; }
+                    EscStep::Confirm => {
+                        self.confirm_unpair = false;
+                        self.confirm_all_on = false;
+                    }
+                    EscStep::Menus => {
+                        self.language_open = false;
+                        self.corners_open = false;
+                        self.close_pickers();
+                    }
+                    EscStep::Drawer => {
+                        self.open_light_drawer = None;
+                        self.schedule_draft = None;
+                        self.rule_draft = None;
+                    }
                     EscStep::Back => self.settings_open = false,
                     // Like the window's own close (the tray keeps running); the popup like a click on the icon.
                     EscStep::Close if self.window_mode => return self.update(Message::CloseRequested(id)),
@@ -1170,6 +2495,14 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             Message::SetShotKey(on) => {
                 self.setting_error = write_pref("screenshot_key", Some(on.into())).is_err();
                 self.shot_key = on;
+            }
+            Message::SetConfirmAllOnPref(on) => {
+                let val = on.then(|| Value::from(true));
+                self.setting_error = write_pref(CONFIRM_ALL_ON_KEY, val).is_err();
+                self.confirm_all_on_pref = on;
+                if !on {
+                    self.confirm_all_on = false;
+                }
             }
             Message::Corners(choice) => {
                 let choice = corners::normalize(&choice);
@@ -1186,6 +2519,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                 self.language_open = false;
                 self.corners_open = false;
                 self.confirm_unpair = false;
+                self.confirm_all_on = false;
             }
             Message::ToggleLanguage => { self.language_open = !self.language_open; self.corners_open = false; }
             Message::ToggleCorners => { self.corners_open = !self.corners_open; self.language_open = false; }
@@ -1305,13 +2639,14 @@ mod tests {
 
     #[test]
     fn esc_closes_the_innermost_thing_first() {
-        assert_eq!(esc_step(true, true, true, true, true), EscStep::Note);
-        assert_eq!(esc_step(true, false, true, true, true), EscStep::Confirm);
-        assert_eq!(esc_step(true, false, false, true, true), EscStep::Menus);
-        assert_eq!(esc_step(true, false, false, false, true), EscStep::Back);
-        assert_eq!(esc_step(true, false, false, false, false), EscStep::Close);
+        assert_eq!(esc_step(true, true, true, true, true, true), EscStep::Note);
+        assert_eq!(esc_step(true, false, true, true, true, true), EscStep::Confirm);
+        assert_eq!(esc_step(true, false, false, true, true, true), EscStep::Menus);
+        assert_eq!(esc_step(true, false, false, false, true, true), EscStep::Drawer);
+        assert_eq!(esc_step(true, false, false, false, false, true), EscStep::Back);
+        assert_eq!(esc_step(true, false, false, false, false, false), EscStep::Close);
         // Not from the window or the open popup (e.g. the panel button): nothing.
-        assert_eq!(esc_step(false, true, true, true, true), EscStep::Nothing);
-        assert_eq!(esc_step(false, false, false, false, false), EscStep::Nothing);
+        assert_eq!(esc_step(false, true, true, true, true, true), EscStep::Nothing);
+        assert_eq!(esc_step(false, false, false, false, false, false), EscStep::Nothing);
     }
 }
