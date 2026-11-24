@@ -1060,6 +1060,48 @@ class LocalScheduleTests(Base):
         self.assertEqual(h.check_local_schedules(now=tue_2200), 1)
         self.assertEqual(h.pending[("scene", SCENE1)], {"recall": {"action": "active"}})
 
+    def test_local_schedule_lock_fails_closed_and_preserves_claims(self):
+        h1 = self.make_hue()
+        h1.handle({"cmd": "schedule_mode", "mode": "local"})
+        h1.handle({
+            "cmd": "schedule_create", "name": "Desk 09:00", "target_kind": "light", "target_id": L1,
+            "time": "09:00", "days": ["mon"], "action": "on", "bri": 80,
+        })
+        # Second independent helper loads the same persisted schedules
+        h2 = self.make_hue()
+        mon_0900 = datetime.datetime(2026, 11, 23, 9, 0)
+        self.assertEqual(h1.check_local_schedules(now=mon_0900), 1)
+        # Second helper in the same minute must NOT double-fire
+        self.assertEqual(h2.check_local_schedules(now=mon_0900), 0)
+        # Writing schedule_mode from stale h2 preserves h1's last_fired claim on disk
+        h2.handle({"cmd": "schedule_mode", "mode": "local"})
+        persisted = hue.load_local_schedules()["schedules"][0]
+        self.assertEqual(persisted.get("last_fired"), "2026-11-23 09:00")
+
+        # Symlinked lock file fails closed and never touches the symlink target
+        victim = os.path.join(os.path.dirname(hue.CONFIG_DIR), "victim.txt")
+        with open(victim, "w") as f:
+            f.write("KEEP")
+        lock_path = os.path.join(hue.CONFIG_DIR, ".local_schedules.lock")
+        if os.path.exists(lock_path):
+            os.unlink(lock_path)
+        os.symlink(victim, lock_path)
+        self.assertFalse(hue.claim_local_schedule_bucket(persisted["id"], "2026-11-30 09:00"))
+        with open(victim) as f:
+            self.assertEqual(f.read(), "KEEP")
+
+    def test_sse_iter_bounded_lines_times_out_on_dripping_partial_line(self):
+        chunks = [b"data: partial", None, None]
+        def reader():
+            if not chunks:
+                return b""
+            c = chunks.pop(0)
+            if c is None:
+                time.sleep(0.04)
+            return c
+        with self.assertRaises(OSError):
+            list(hue.iter_bounded_lines(reader, max_line=1024, line_timeout=0.03))
+
 
 class AudioSynthTests(Base):
     def _sine_samples(self, freq, n=512, sr=16000, amp=0.9):

@@ -1761,39 +1761,55 @@ def save_local_schedules(data):
         raise
 
 
-def claim_local_schedule_bucket(sid, bucket):
-    """Cross-process deduplication for local schedules using an exclusive flock + persisted last_fired.
-    Returns True if this process claimed `(sid, bucket)` (or when no local_schedules.json exists yet),
-    False if another helper instance or prior run already fired this schedule in `bucket`."""
-    path = _local_schedules_path()
-    if not os.path.exists(path):
-        return True
+def _with_local_schedules_lock(fn):
+    """Run `fn()` under an exclusive flock on a verified private `.local_schedules.lock` file."""
+    directory = private_config_dir()
+    lock_path = os.path.join(directory, ".local_schedules.lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
-        directory = private_config_dir()
-        lock_path = os.path.join(directory, ".local_schedules.lock")
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    except OSError:
-        return True
-    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise OSError("unsafe local schedules lock file")
         fcntl.flock(fd, fcntl.LOCK_EX)
-        data = load_local_schedules()
-        for sched in data["schedules"]:
-            if sched["id"] == sid:
-                if sched.get("last_fired") == bucket:
-                    return False
-                sched["last_fired"] = bucket
-                try:
-                    save_local_schedules(data)
-                except (OSError, ValueError):
-                    pass
-                return True
-        return True
+        return fn()
     finally:
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
             pass
         os.close(fd)
+
+
+def update_local_schedules(mutator):
+    """Reload local_schedules.json under the exclusive lock, apply `mutator(data)`, and save atomically.
+    Preserves concurrent `last_fired` claims written by other helper instances."""
+    def _run():
+        data = load_local_schedules()
+        changed = mutator(data)
+        if changed is not False:
+            save_local_schedules(data)
+        return data
+    return _with_local_schedules_lock(_run)
+
+
+def claim_local_schedule_bucket(sid, bucket):
+    """Cross-process deduplication for local schedules using an exclusive flock + persisted last_fired.
+    Fails closed (returns False) on lock, symlink, missing-file, or persistence errors so two
+    helper instances can never double-fire the same minute."""
+    def _claim():
+        data = load_local_schedules()
+        for sched in data["schedules"]:
+            if sched["id"] == sid:
+                if sched.get("last_fired") == bucket:
+                    return False
+                sched["last_fired"] = bucket
+                save_local_schedules(data)
+                return True
+        return False
+    try:
+        return bool(_with_local_schedules_lock(_claim))
+    except (OSError, ValueError):
+        return False
 
 
 # Children the helper started and has not reaped yet: ended when the helper exits or gets SIGTERM.
@@ -1953,7 +1969,8 @@ def https_request(ip, method, path, body=None, headers=None, pin=None, timeout=H
 def open_sse_stream(ip, app_key, pin, timeout=HTTP_TIMEOUT, read_timeout=SSE_READ_TIMEOUT, port=None):
     """Open a pinned-TLS GET /eventstream/clip/v2 connection. Returns (conn, resp, sock).
 
-    Verifies SHA-256 fingerprint + CN == bridge_id before sending hue-application-key.
+    Enforces a single overall `timeout` deadline across connect, TLS handshake, cert pin check,
+    request write, and response header parsing so a dripping server cannot stall the SSE thread.
     Raises PinError on certificate mismatch, PermissionError on 401/403, or OSError on failure.
     """
     port = port or BRIDGE_PORT
@@ -1963,9 +1980,27 @@ def open_sse_stream(ip, app_key, pin, timeout=HTTP_TIMEOUT, read_timeout=SSE_REA
     conn = http.client.HTTPSConnection(ip, port, timeout=timeout, context=ctx)
     resp = None
     sock = None
+    expired = threading.Event()
+    connected = []
+
+    def cut():
+        expired.set()
+        s = connected[0] if connected else conn.sock
+        if s is not None:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    watchdog = threading.Timer(timeout, cut)
+    watchdog.daemon = True
+    watchdog.start()
     try:
         conn.connect()
         sock = conn.sock
+        connected.append(sock)
+        if expired.is_set():
+            raise OSError("eventstream handshake timed out")
         der = sock.getpeercert(binary_form=True) or b""
         peer = (fingerprint(der), cert_common_name(der).upper())
         if pin is None or peer[0] != pin.get("fingerprint") or (pin.get("bridge_id") and peer[1] != pin["bridge_id"]):
@@ -1975,14 +2010,18 @@ def open_sse_stream(ip, app_key, pin, timeout=HTTP_TIMEOUT, read_timeout=SSE_REA
             "hue-application-key": app_key,
         })
         resp = conn.getresponse()
+        if expired.is_set():
+            raise OSError("eventstream handshake timed out")
         if resp.status in (401, 403):
             raise PermissionError("bridge rejected the app key")
         if resp.status != 200:
             raise OSError("eventstream returned HTTP %d" % resp.status)
+        watchdog.cancel()
         if sock is not None:
             sock.settimeout(read_timeout)
         return conn, resp, sock
     except BaseException:
+        watchdog.cancel()
         if resp is not None:
             try:
                 resp.close()
@@ -2000,21 +2039,37 @@ def open_sse_stream(ip, app_key, pin, timeout=HTTP_TIMEOUT, read_timeout=SSE_REA
         raise
 
 
-def iter_bounded_lines(read_chunk, max_line=MAX_BODY):
-    """Yield complete lines (bytes) from `read_chunk()`, dropping any line longer than `max_line`."""
+SSE_LINE_TIMEOUT = 15.0
+
+
+def iter_bounded_lines(read_chunk, max_line=MAX_BODY, line_timeout=None):
+    """Yield complete lines (bytes) from `read_chunk()`, dropping any line longer than `max_line`.
+    If `read_chunk()` returns None (e.g. idle poll timeout), no EOF is assumed; if `line_timeout`
+    is set and a partial line remains unfinished beyond `line_timeout` seconds, raises OSError."""
     buf = bytearray()
     dropping = False
+    line_started = None
     while True:
         chunk = read_chunk()
+        if chunk is None:
+            if line_timeout is not None and line_started is not None:
+                if time.monotonic() - line_started > line_timeout:
+                    raise OSError("eventstream line timed out")
+            continue
         if not chunk:
             if not dropping and buf:
                 yield bytes(buf)
             return
+        now_m = time.monotonic()
+        if line_timeout is not None and line_started is not None and (now_m - line_started > line_timeout):
+            raise OSError("eventstream line timed out")
         start = 0
         while start < len(chunk):
             nl = chunk.find(b"\n", start)
             if nl == -1:
                 seg = chunk[start:]
+                if line_started is None and seg:
+                    line_started = now_m
                 if not dropping:
                     if len(buf) + len(seg) > max_line:
                         buf.clear()
@@ -2024,6 +2079,7 @@ def iter_bounded_lines(read_chunk, max_line=MAX_BODY):
                 break
             seg = chunk[start:nl + 1]
             start = nl + 1
+            line_started = None
             if dropping:
                 dropping = False
                 continue
@@ -3269,9 +3325,9 @@ class Hue:
                         try:
                             return resp.read1(8192)
                         except socket.timeout:
-                            continue
+                            return None
 
-                for raw_line in iter_bounded_lines(read_chunk, max_line=MAX_BODY):
+                for raw_line in iter_bounded_lines(read_chunk, max_line=MAX_BODY, line_timeout=SSE_LINE_TIMEOUT):
                     if self._stop.is_set():
                         break
                     with self.lock:
@@ -3549,8 +3605,12 @@ class Hue:
             if mode not in SCHEDULE_MODES:
                 return
             with self.lock:
-                save_local_schedules({"mode": mode, "schedules": self.local_schedules})
-                self.schedule_mode = mode
+                def _set_mode(data):
+                    data["mode"] = mode
+                merged = update_local_schedules(_set_mode)
+                self.schedule_mode = merged["mode"]
+                self.local_schedules = merged["schedules"]
+                self._rebuild_schedules()
             self.emit()
         elif name == "schedule_create" and self.config:
             source = cmd.get("source") if cmd.get("source") in SCHEDULE_MODES else self.schedule_mode
@@ -3582,9 +3642,13 @@ class Hue:
                     sched = validate_local_schedule(raw_sched)
                     if sched is None:
                         return
-                    candidate = list(self.local_schedules) + [sched]
-                    save_local_schedules({"mode": self.schedule_mode, "schedules": candidate})
-                    self.local_schedules = candidate
+                    def _add_sched(data):
+                        if len(data["schedules"]) >= MAX_LOCAL_SCHEDULES:
+                            return False
+                        data["schedules"].append(sched)
+                    merged = update_local_schedules(_add_sched)
+                    self.schedule_mode = merged["mode"]
+                    self.local_schedules = merged["schedules"]
                     self._rebuild_schedules()
                 self.emit()
                 self.wake.set()
@@ -3607,9 +3671,15 @@ class Hue:
             with self.lock:
                 local_target = next((s for s in self.local_schedules if s["id"] == sid), None)
                 if local_target is not None:
-                    candidate = [dict(s, enabled=enabled) if s["id"] == sid else s for s in self.local_schedules]
-                    save_local_schedules({"mode": self.schedule_mode, "schedules": candidate})
-                    self.local_schedules = candidate
+                    def _toggle_sched(data):
+                        for s in data["schedules"]:
+                            if s["id"] == sid:
+                                s["enabled"] = enabled
+                                return True
+                        return False
+                    merged = update_local_schedules(_toggle_sched)
+                    self.schedule_mode = merged["mode"]
+                    self.local_schedules = merged["schedules"]
                     self._rebuild_schedules()
                     handled_local = True
                 else:
@@ -3631,9 +3701,13 @@ class Hue:
                 return
             with self.lock:
                 if any(s["id"] == sid for s in self.local_schedules):
-                    candidate = [s for s in self.local_schedules if s["id"] != sid]
-                    save_local_schedules({"mode": self.schedule_mode, "schedules": candidate})
-                    self.local_schedules = candidate
+                    def _del_sched(data):
+                        before = len(data["schedules"])
+                        data["schedules"] = [s for s in data["schedules"] if s["id"] != sid]
+                        return len(data["schedules"]) != before
+                    merged = update_local_schedules(_del_sched)
+                    self.schedule_mode = merged["mode"]
+                    self.local_schedules = merged["schedules"]
                     self._local_sched_fired.pop(sid, None)
                     self._rebuild_schedules()
                     handled_local = True
