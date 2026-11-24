@@ -3103,8 +3103,17 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             exclude_all_on: exclude_all_on_setting(),
             ..Default::default()
         };
-        // Debug builds only: start on the settings page (for off-screen screenshots).
-        app.settings_open = cfg!(debug_assertions) && std::env::var("MAPRISMA_SHOT_PAGE").as_deref() == Ok("settings");
+        // Debug builds only: start on a specific page/tab (for off-screen screenshots).
+        if cfg!(debug_assertions) {
+            match std::env::var("MAPRISMA_SHOT_PAGE").as_deref() {
+                Ok("settings") => app.settings_open = true,
+                Ok("map") => app.tab = Tab::Map,
+                Ok("schedules") => app.tab = Tab::Schedules,
+                Ok("rules") => app.tab = Tab::Rules,
+                Ok("synth") => app.tab = Tab::Synth,
+                _ => {}
+            }
+        }
         let title = if window_mode { app.name_window() } else { Task::none() };
         if window_mode {
             app.resize = window_size::Debounce::new(start_size);

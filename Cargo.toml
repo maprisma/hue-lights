@@ -3,7 +3,7 @@ name = "maprisma-hue-lights"
 version = "0.3.0"
 edition = "2024"
 license = "MIT"
-description = "Philips Hue desktop & panel app for COSMIC, KDE and Hyprland: rooms, color, Light Themes, schedules, linked-light rules and Audio Light Synthesizer"
+description = "Philips Hue desktop & panel app for COSMIC, KDE and Hyprland: Visual Floorplan Studio, lamp icons, rooms, Light Themes, schedules, wired rules & Audio Light Synth"
 
 [[bin]]
 name = "maprisma-hue-lights-tray"
