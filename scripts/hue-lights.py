@@ -2119,6 +2119,7 @@ class SynthController:
         self._stop_ev = None
         self._thread = None
         self._proc = None
+        self._proc_lock = threading.Lock()
 
     def snapshot(self):
         """Return JSON-safe synth state dict (call under hue.lock)."""
@@ -2146,9 +2147,6 @@ class SynthController:
         if "source" in cmd and cmd["source"] in SYNTH_SOURCES:
             new_source = cmd["source"]
             if new_source != self.source:
-                if self.running:
-                    # Changing audio source always stops capture so parec never starts without an explicit Start click.
-                    self.stop()
                 self.source = new_source
                 self.error = ""
                 changed = True
@@ -2219,10 +2217,11 @@ class SynthController:
             self._stop_ev = None
             thread = self._thread
             self._thread = None
+        with self._proc_lock:
+            if stop_ev is not None:
+                stop_ev.set()
             proc = self._proc
             self._proc = None
-        if stop_ev is not None:
-            stop_ev.set()
         if proc is not None:
             self._terminate_proc(proc)
         if thread is not None and thread is not threading.current_thread():
@@ -2355,16 +2354,19 @@ class SynthController:
                 ]
                 proc = None
                 try:
-                    with _CHILDREN_LOCK:
-                        proc = subprocess.Popen(
-                            argv, shell=False, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                        )
-                        _CHILDREN.add(proc)
+                    with self._proc_lock:
+                        if stop_ev.is_set() or self.hue._stop.is_set():
+                            return
+                        with _CHILDREN_LOCK:
+                            proc = subprocess.Popen(
+                                argv, shell=False, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            )
+                            _CHILDREN.add(proc)
+                        self._proc = proc
                     with self.hue.lock:
                         if stop_ev.is_set() or not self.running:
                             break
-                        self._proc = proc
                     tracker.reset()
                     fd = proc.stdout.fileno()
                     pcm_buf = bytearray()
@@ -3753,9 +3755,18 @@ class Hue:
             if not handled_local:
                 self.wake.set()
         elif name == "synth_config":
+            new_source = cmd.get("source") if isinstance(cmd, dict) else None
+            with self.lock:
+                need_stop = (
+                    new_source in SYNTH_SOURCES
+                    and new_source != self.synth.source
+                    and (self.synth.running or self.synth._thread is not None)
+                )
+            if need_stop:
+                self.synth.stop(emit=False)
             with self.lock:
                 changed = self.synth.configure(cmd)
-            if changed:
+            if changed or need_stop:
                 self.emit()
         elif name == "synth_start" and self.config:
             self.synth.start()

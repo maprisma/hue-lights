@@ -1190,10 +1190,7 @@ class AudioSynthTests(Base):
             self.assertFalse(h.snapshot()["synth"]["running"])
             self.assertEqual(h.snapshot()["synth"]["source"], "mic")
 
-            # Restart in demo and stop cleanly
-            h.handle({"cmd": "synth_config", "source": "demo"})
-            h.handle({"cmd": "synth_start"})
-            self.assertTrue(h.snapshot()["synth"]["running"])
+            # Stop cleanly
             h.handle({"cmd": "synth_stop"})
             snap_stopped = h.snapshot()["synth"]
             self.assertFalse(snap_stopped["running"])
@@ -1214,6 +1211,46 @@ class AudioSynthTests(Base):
             finally:
                 hue.shutil.which = real_which
         finally:
+            h.synth.stop(emit=False)
+
+    def test_synth_source_switch_before_popen_never_launches_parec(self):
+        h = self.make_hue()
+        h.handle({"cmd": "synth_config", "source": "system"})
+        at_which = threading.Event()
+        release_which = threading.Event()
+        popen_called = []
+
+        def fake_which(name):
+            if name == "parec":
+                at_which.set()
+                release_which.wait(timeout=2.0)
+                return "/usr/bin/parec"
+            return None
+
+        def fake_popen(*args, **kwargs):
+            popen_called.append(args)
+            raise AssertionError("Popen must not run after source switch stopped synth")
+
+        orig_which = hue.shutil.which
+        orig_popen = hue.subprocess.Popen
+        try:
+            hue.shutil.which = fake_which
+            hue.subprocess.Popen = fake_popen
+            h.handle({"cmd": "synth_start"})
+            self.assertTrue(at_which.wait(timeout=1.5))
+            # Switch source while thread is paused right before Popen
+            def release_soon():
+                time.sleep(0.05)
+                release_which.set()
+            threading.Thread(target=release_soon, daemon=True).start()
+            h.handle({"cmd": "synth_config", "source": "demo"})
+            self.assertFalse(h.snapshot()["synth"]["running"])
+            self.assertEqual(h.snapshot()["synth"]["source"], "demo")
+            self.assertEqual(popen_called, [])
+        finally:
+            release_which.set()
+            hue.shutil.which = orig_which
+            hue.subprocess.Popen = orig_popen
             h.synth.stop(emit=False)
 
 
