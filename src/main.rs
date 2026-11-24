@@ -10,19 +10,26 @@
 
 use maprisma_hue_lights::i18n::{read_pref, tr, trf, write_pref};
 use maprisma_hue_lights::{corners, shot};
+mod floorplan;
 mod model;
 mod window_size;
+use floorplan::{
+    CanvasMode, FloorplanState, MapMsg, Selection, compute_pending_sync_count, view_map_tab,
+};
 use model::{
     COLOR_PRESETS, CONFIRM_ALL_ON_KEY, DAYS_ORDER, EXCLUDE_ALL_ON_KEY, FAVORITES_KEY, FONT_SCALES, FONT_SCALE_KEY,
-    Favorite, PANEL_ICONS, PANEL_ICON_KEY, RoomFilter, RuleDraft, SCHEDULE_MODES, SCHEDULE_MODE_KEY, SHOW_COUNT_KEY,
-    SKINS, SKIN_KEY, SYNTH_BANDS, SYNTH_MODES, SYNTH_PALETTES, SYNTH_SOURCES, ScheduleDraft, Tab, TargetOption,
-    ThemeDraft, WARMTH_PRESETS, all_targets, belongs_to_rule, clamp_mirek, day_short_toggle, effect_label,
+    Favorite, FloorplanBox, FloorplanLamp, FloorplanStamp, PANEL_ICONS, PANEL_ICON_KEY, RoomFilter, RuleDraft,
+    SCHEDULE_MODES, SCHEDULE_MODE_KEY, SHOW_COUNT_KEY, SKINS, SKIN_KEY, SYNTH_BANDS, SYNTH_MODES, SYNTH_PALETTES,
+    SYNTH_SOURCES, ScheduleDraft, Tab, TargetOption, ThemeDraft, WARMTH_PRESETS, all_targets, belongs_to_rule,
+    clamp_mirek, cmd_entertainment_sync, cmd_floorplan_bg_clear, cmd_floorplan_bg_set, cmd_floorplan_bg_update,
+    cmd_floorplan_save, cmd_floorplan_sync_all, cmd_floorplan_sync_rooms, cmd_floorplan_template, cmd_light_rename,
+    cmd_room_delete, cmd_room_update, cmd_scene_create, day_short_toggle, effect_label, extract_bridge_lights,
     favorites_to_value, font_scale_factor, font_scale_label, format_unix_ts, has_active_schedule, is_favorite,
-    normalize_font_scale, normalize_panel_icon, normalize_schedule_mode, normalize_skin, panel_icon_glyph,
-    panel_icon_label, panel_icon_svg, parse_favorites, parse_string_set, resolve_name, room_matches_filter,
-    schedule_action_summary, schedule_mode_label, schedule_trigger_summary, skin_label, skin_style,
-    sorted_exclude_list, string_set_to_value, synth_band_label, synth_mode_label, synth_palette_label,
-    synth_palette_swatch, synth_source_label, synth_target_lights, toggle_favorite,
+    normalize_font_scale, normalize_lamp_icon, normalize_panel_icon, normalize_schedule_mode, normalize_skin,
+    panel_icon_glyph, panel_icon_label, panel_icon_svg, parse_favorites, parse_floorplan, parse_string_set,
+    resolve_name, room_matches_filter, schedule_action_summary, schedule_mode_label, schedule_trigger_summary,
+    skin_label, skin_style, sorted_exclude_list, string_set_to_value, synth_band_label, synth_mode_label,
+    synth_palette_label, synth_palette_swatch, synth_source_label, synth_target_lights, toggle_favorite,
 };
 use std::collections::{HashMap, HashSet};
 use maprisma_hue_lights::{TITLE, WINDOW_BUS, script_path};
@@ -494,6 +501,7 @@ struct HueLights<const WINDOW_MODE: bool = false> {
     helper: Option<mpsc::UnboundedSender<String>>,
     stats: Value,
     tab: Tab,
+    floorplan: FloorplanState,
     filter: RoomFilter,
     expanded: HashSet<String>,
     all_scenes: HashSet<String>,
@@ -547,6 +555,7 @@ enum Message {
     CloseRequested(window::Id),
     Rectangle(RectangleUpdate<u32>),
     SelectTab(Tab),
+    Map(MapMsg),
     SetFilter(RoomFilter),
     Expand(String),
     AllScenes(String),
@@ -785,14 +794,490 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         maprisma_hue_lights::summary(&self.stats)
     }
 
+    fn save_floorplan(&mut self, trigger_auto_sync: bool) {
+        self.floorplan.local_dirty = false;
+        self.send(cmd_floorplan_save(&self.floorplan.doc));
+        if trigger_auto_sync && self.floorplan.doc.auto_sync {
+            self.send(cmd_floorplan_sync_all());
+        }
+    }
+
+    fn handle_map_msg(&mut self, msg: MapMsg) -> Task<Message> {
+        match msg {
+            MapMsg::ToggleSidebar => {
+                self.floorplan.sidebar_open = !self.floorplan.sidebar_open;
+            }
+            MapMsg::SearchChanged(q) => {
+                self.floorplan.search = q.chars().take(60).collect();
+            }
+            MapMsg::ToggleTemplatesMenu => {
+                let next = !self.floorplan.templates_open;
+                self.floorplan.close_menus();
+                self.floorplan.templates_open = next;
+            }
+            MapMsg::ApplyTemplate(tid) => {
+                self.floorplan.close_menus();
+                self.floorplan.local_dirty = false;
+                self.floorplan.selection = None;
+                self.send(cmd_floorplan_template(&tid));
+            }
+            MapMsg::AddBox(kind) => {
+                self.floorplan.close_menus();
+                let is_zone = kind == "zone";
+                let id = self.floorplan.next_unique_id(if is_zone { "zone" } else { "box" });
+                let offset = ((self.floorplan.doc.boxes.len() % 5) as f64) * 30.0;
+                let bx = (120.0 + offset).min((self.floorplan.doc.canvas.width - 300.0).max(40.0));
+                let by = (120.0 + offset).min((self.floorplan.doc.canvas.height - 240.0).max(40.0));
+                let name = if is_zone { tr("New Zone") } else { tr("New Room") };
+                self.floorplan.doc.boxes.push(FloorplanBox {
+                    id: id.clone(),
+                    kind: if is_zone { "zone".into() } else { "room".into() },
+                    hue_id: None,
+                    name,
+                    archetype: if is_zone { "other".into() } else { "living_room".into() },
+                    x: bx,
+                    y: by,
+                    w: 320.0,
+                    h: 220.0,
+                    entertainment_area_id: None,
+                });
+                self.floorplan.select(Some(Selection::Box(id)), &self.stats);
+                self.save_floorplan(true);
+            }
+            MapMsg::ToggleStampsMenu => {
+                let next = !self.floorplan.stamps_open;
+                self.floorplan.close_menus();
+                self.floorplan.stamps_open = next;
+            }
+            MapMsg::AddStamp(kind) => {
+                self.floorplan.close_menus();
+                let id = self.floorplan.next_unique_id("st");
+                let (w, h) = match kind.as_str() {
+                    "door" => (52.0, 52.0),
+                    "window" => (180.0, 12.0),
+                    "sofa" => (170.0, 72.0),
+                    "tv" => (150.0, 18.0),
+                    "desk" => (160.0, 72.0),
+                    "bed" => (190.0, 155.0),
+                    "dining" => (150.0, 90.0),
+                    "kitchen" => (240.0, 54.0),
+                    _ => (100.0, 60.0),
+                };
+                let cx = (self.floorplan.doc.canvas.width * 0.5 - w * 0.5).clamp(20.0, 3600.0);
+                let cy = (self.floorplan.doc.canvas.height * 0.5 - h * 0.5).clamp(20.0, 2600.0);
+                self.floorplan.doc.stamps.push(FloorplanStamp {
+                    id: id.clone(),
+                    kind,
+                    x: cx,
+                    y: cy,
+                    w,
+                    h,
+                    rot: 0,
+                });
+                self.floorplan.select(Some(Selection::Stamp(id)), &self.stats);
+                self.save_floorplan(false);
+            }
+            MapMsg::SetMode(mode) => {
+                self.floorplan.mode = mode;
+                self.floorplan.armed_place_lamp = None;
+                if mode != CanvasMode::Wire {
+                    self.floorplan.pending_wire_from = None;
+                }
+            }
+            MapMsg::SetWireKind(wk) => {
+                self.floorplan.wire_kind = wk;
+            }
+            MapMsg::ToggleGlows => {
+                self.floorplan.doc.show_glows = !self.floorplan.doc.show_glows;
+                self.save_floorplan(false);
+            }
+            MapMsg::ToggleFurniture => {
+                self.floorplan.doc.show_furniture = !self.floorplan.doc.show_furniture;
+                self.save_floorplan(false);
+            }
+            MapMsg::ToggleWires => {
+                self.floorplan.doc.show_wires = !self.floorplan.doc.show_wires;
+                self.save_floorplan(false);
+            }
+            MapMsg::ToggleAutoSync(on) => {
+                self.floorplan.doc.auto_sync = on;
+                self.floorplan.doc.auto_sync_rooms = on;
+                self.save_floorplan(on);
+            }
+            MapMsg::SyncAll => {
+                self.save_floorplan(false);
+                self.send(cmd_floorplan_sync_all());
+            }
+            MapMsg::ToggleEntMenu => {
+                let next = !self.floorplan.ent_menu_open;
+                self.floorplan.close_menus();
+                self.floorplan.ent_menu_open = next;
+            }
+            MapMsg::SetTopEntertainment(ent_id) => {
+                self.floorplan.ent_menu_open = false;
+                self.floorplan.doc.entertainment_id = ent_id;
+                self.save_floorplan(true);
+            }
+            // Background image controls
+            MapMsg::ToggleBgMenu => {
+                let next = !self.floorplan.bg_open;
+                self.floorplan.close_menus();
+                self.floorplan.bg_open = next;
+                if next && self.floorplan.bg_path_draft.is_empty() {
+                    self.floorplan.bg_path_draft = self.floorplan.doc.background.path.clone();
+                }
+            }
+            MapMsg::ChooseBgFile => {
+                let title = tr("Choose floorplan image");
+                let filter_lbl = tr("Images");
+                return cosmic::task::future(async move {
+                    use cosmic::dialog::file_chooser;
+                    let filter = file_chooser::FileFilter::new(&filter_lbl)
+                        .glob("*.png")
+                        .glob("*.jpg")
+                        .glob("*.jpeg")
+                        .glob("*.webp");
+                    let dialog = file_chooser::open::Dialog::new().title(title).filter(filter);
+                    let picked = match dialog.open_file().await {
+                        Ok(resp) => resp.url().to_file_path().ok().map(|p| p.to_string_lossy().into_owned()),
+                        Err(_) => None,
+                    };
+                    cosmic::Action::App(Message::Map(MapMsg::BgFilePicked(picked)))
+                });
+            }
+            MapMsg::BgFilePicked(Some(path)) => {
+                self.floorplan.bg_path_draft = path.clone();
+                let op = self.floorplan.doc.background.opacity;
+                let fit = self.floorplan.doc.background.fit.clone();
+                self.floorplan.local_dirty = false;
+                self.send(cmd_floorplan_bg_set(&path, op, &fit));
+            }
+            MapMsg::BgFilePicked(None) => {}
+            MapMsg::BgPathInput(p) => {
+                self.floorplan.bg_path_draft = p.chars().take(512).collect();
+            }
+            MapMsg::BgApplyPath => {
+                let p = self.floorplan.bg_path_draft.trim().to_string();
+                if !p.is_empty() {
+                    let op = self.floorplan.doc.background.opacity;
+                    let fit = self.floorplan.doc.background.fit.clone();
+                    self.floorplan.local_dirty = false;
+                    self.send(cmd_floorplan_bg_set(&p, op, &fit));
+                }
+            }
+            MapMsg::BgOpacity(pct) => {
+                let clamped = pct.clamp(5, 100);
+                self.floorplan.bg_opacity_drag = Some(clamped);
+                self.floorplan.doc.background.opacity = (clamped as f64) / 100.0;
+            }
+            MapMsg::BgOpacityDone => {
+                if let Some(pct) = self.floorplan.bg_opacity_drag.take() {
+                    let op = (pct.clamp(5, 100) as f64) / 100.0;
+                    self.floorplan.doc.background.opacity = op;
+                    let fit = self.floorplan.doc.background.fit.clone();
+                    self.send(cmd_floorplan_bg_update(op, &fit));
+                }
+            }
+            MapMsg::BgFit(fit) => {
+                let f = if fit == "cover" { "cover".to_string() } else { "contain".to_string() };
+                self.floorplan.doc.background.fit = f.clone();
+                let op = self.floorplan.doc.background.opacity;
+                self.send(cmd_floorplan_bg_update(op, &f));
+            }
+            MapMsg::BgClear => {
+                self.floorplan.doc.background.path.clear();
+                self.floorplan.bg_path_draft.clear();
+                self.floorplan.local_dirty = false;
+                self.send(cmd_floorplan_bg_clear());
+            }
+            // Sidebar lamp actions
+            MapMsg::PlaceLamp(lid) => {
+                self.floorplan.armed_place_lamp = None;
+                let lights = extract_bridge_lights(&self.stats);
+                let room_id = lights
+                    .iter()
+                    .find(|l| l.id == lid)
+                    .map(|l| l.room_id.as_str())
+                    .unwrap_or("");
+                let (x, y) = self
+                    .floorplan
+                    .doc
+                    .boxes
+                    .iter()
+                    .find(|b| !room_id.is_empty() && b.hue_id.as_deref() == Some(room_id))
+                    .map(|b| (b.x + b.w * 0.5, b.y + b.h * 0.5))
+                    .unwrap_or((
+                        self.floorplan.doc.canvas.width * 0.5,
+                        self.floorplan.doc.canvas.height * 0.5,
+                    ));
+                self.floorplan.doc.lamps.insert(
+                    lid.clone(),
+                    FloorplanLamp { x, y, z: 0.0, icon: "bulb".into() },
+                );
+                self.floorplan.select(Some(Selection::Lamp(lid)), &self.stats);
+                self.save_floorplan(true);
+            }
+            MapMsg::ArmPlaceLamp(lid) => {
+                self.floorplan.armed_place_lamp = Some(lid);
+                self.floorplan.mode = CanvasMode::Select;
+            }
+            MapMsg::FocusLamp(lid) => {
+                self.floorplan.armed_place_lamp = None;
+                self.floorplan.select(Some(Selection::Lamp(lid)), &self.stats);
+            }
+            MapMsg::UnplaceLamp(lid) => {
+                self.floorplan.doc.lamps.remove(&lid);
+                if matches!(&self.floorplan.selection, Some(Selection::Lamp(id)) if id == &lid) {
+                    self.floorplan.selection = None;
+                }
+                self.save_floorplan(false);
+            }
+            // Canvas drag & click interactions
+            MapMsg::Select(sel) => {
+                self.floorplan.armed_place_lamp = None;
+                if sel.is_none() {
+                    self.floorplan.pending_wire_from = None;
+                }
+                self.floorplan.select(sel, &self.stats);
+            }
+            MapMsg::PlaceArmedAt { x, y } => {
+                if let Some(lid) = self.floorplan.armed_place_lamp.take() {
+                    self.floorplan.doc.lamps.insert(
+                        lid.clone(),
+                        FloorplanLamp { x, y, z: 0.0, icon: "bulb".into() },
+                    );
+                    self.floorplan.select(Some(Selection::Lamp(lid)), &self.stats);
+                    self.save_floorplan(true);
+                }
+            }
+            MapMsg::MoveLamp { id, x, y, commit } => {
+                if let Some(pos) = self.floorplan.doc.lamps.get_mut(&id) {
+                    pos.x = x;
+                    pos.y = y;
+                }
+                self.floorplan.local_dirty = !commit;
+                if commit {
+                    self.save_floorplan(true);
+                }
+            }
+            MapMsg::MoveBox { id, x, y, commit } => {
+                if let Some(b) = self.floorplan.doc.boxes.iter_mut().find(|b| b.id == id) {
+                    b.x = x;
+                    b.y = y;
+                }
+                self.floorplan.local_dirty = !commit;
+                if commit {
+                    self.save_floorplan(true);
+                }
+            }
+            MapMsg::ResizeBox { id, x, y, w, h, commit } => {
+                if let Some(b) = self.floorplan.doc.boxes.iter_mut().find(|b| b.id == id) {
+                    b.x = x;
+                    b.y = y;
+                    b.w = w;
+                    b.h = h;
+                }
+                self.floorplan.local_dirty = !commit;
+                if commit {
+                    self.save_floorplan(true);
+                }
+            }
+            MapMsg::MoveStamp { id, x, y, commit } => {
+                if let Some(st) = self.floorplan.doc.stamps.iter_mut().find(|s| s.id == id) {
+                    st.x = x;
+                    st.y = y;
+                }
+                self.floorplan.local_dirty = !commit;
+                if commit {
+                    self.save_floorplan(false);
+                }
+            }
+            MapMsg::CreateWire { from_id, to_id } => {
+                self.floorplan.pending_wire_from = None;
+                if from_id != to_id {
+                    let from_name = resolve_name(&self.stats, "light", &from_id);
+                    let to_name = resolve_name(&self.stats, "light", &to_id);
+                    let cmd = self
+                        .floorplan
+                        .wire_kind
+                        .to_rule_payload(&from_id, &from_name, &to_id, &to_name);
+                    self.send(cmd);
+                }
+            }
+            // Lamp Inspector
+            MapMsg::LampToggle(id, on) => {
+                self.send(json!({"cmd": "light", "id": id, "on": on}));
+            }
+            MapMsg::LampBri(id, val) => {
+                let target = format!("light:{id}");
+                let value = val.max(1);
+                let now = Instant::now();
+                let due = self.dragging.get(&target).is_none_or(|(_, sent)| now.duration_since(*sent) >= SEND_EVERY);
+                let sent = if due {
+                    self.send_bri(&target, value);
+                    now
+                } else {
+                    self.dragging[&target].1
+                };
+                self.dragging.insert(target, (value, sent));
+            }
+            MapMsg::LampBriDone(id) => {
+                let target = format!("light:{id}");
+                if let Some((value, _)) = self.dragging.remove(&target) {
+                    self.send_bri(&target, value);
+                }
+            }
+            MapMsg::LampRenameInput(v) => {
+                self.floorplan.lamp_rename_draft = v.chars().take(32).collect();
+            }
+            MapMsg::LampRenameSave(id) => {
+                let name = self.floorplan.lamp_rename_draft.trim().to_string();
+                if !name.is_empty() {
+                    self.send(cmd_light_rename(&id, &name));
+                }
+            }
+            MapMsg::LampSetIcon(id, icon_key) => {
+                let norm = normalize_lamp_icon(&icon_key).to_string();
+                if let Some(pos) = self.floorplan.doc.lamps.get_mut(&id) {
+                    pos.icon = norm;
+                    self.save_floorplan(false);
+                }
+            }
+            MapMsg::LampStartWire(id) => {
+                self.floorplan.mode = CanvasMode::Wire;
+                self.floorplan.pending_wire_from = Some(id);
+            }
+            // Room / Zone Inspector
+            MapMsg::BoxRenameInput(v) => {
+                self.floorplan.box_rename_draft = v.chars().take(40).collect();
+            }
+            MapMsg::BoxRenameSave(bid) => {
+                let name = self.floorplan.box_rename_draft.trim().to_string();
+                if !name.is_empty()
+                    && let Some(b) = self.floorplan.doc.boxes.iter_mut().find(|b| b.id == bid)
+                {
+                    b.name = name.clone();
+                    let linked = b.hue_id.clone();
+                    let bkind = b.kind.clone();
+                    self.save_floorplan(false);
+                    if let Some(hid) = linked {
+                        self.send(cmd_room_update(&hid, &bkind, Some(&name), None, None));
+                    }
+                }
+            }
+            MapMsg::BoxSetKind(bid, kind) => {
+                if let Some(b) = self.floorplan.doc.boxes.iter_mut().find(|b| b.id == bid) {
+                    let norm = if kind == "zone" { "zone" } else { "room" };
+                    if b.kind != norm {
+                        b.kind = norm.to_string();
+                        // Unlink if switching Room <-> Zone so Bridge resource types stay consistent
+                        b.hue_id = None;
+                        self.save_floorplan(true);
+                    }
+                }
+            }
+            MapMsg::ToggleArchetypeMenu => {
+                self.floorplan.archetype_menu_open = !self.floorplan.archetype_menu_open;
+            }
+            MapMsg::BoxSetArchetype(bid, arch) => {
+                self.floorplan.archetype_menu_open = false;
+                if let Some(b) = self.floorplan.doc.boxes.iter_mut().find(|b| b.id == bid) {
+                    b.archetype = arch.clone();
+                    let linked = b.hue_id.clone();
+                    let bkind = b.kind.clone();
+                    self.save_floorplan(false);
+                    if let Some(hid) = linked {
+                        self.send(cmd_room_update(&hid, &bkind, None, Some(&arch), None));
+                    }
+                }
+            }
+            MapMsg::ToggleBoxEntMenu => {
+                self.floorplan.box_ent_menu_open = !self.floorplan.box_ent_menu_open;
+            }
+            MapMsg::BoxSetEntertainment(bid, area_id) => {
+                self.floorplan.box_ent_menu_open = false;
+                if let Some(b) = self.floorplan.doc.boxes.iter_mut().find(|b| b.id == bid) {
+                    b.entertainment_area_id = area_id;
+                    self.save_floorplan(true);
+                }
+            }
+            MapMsg::BoxSyncEntertainment(area_id, box_id) => {
+                self.save_floorplan(false);
+                self.send(cmd_entertainment_sync(&area_id, &box_id));
+            }
+            MapMsg::BoxSyncRoom => {
+                self.save_floorplan(false);
+                self.send(cmd_floorplan_sync_rooms());
+            }
+            MapMsg::BoxRemoveFromCanvas(bid) => {
+                self.floorplan.doc.boxes.retain(|b| b.id != bid);
+                self.floorplan.selection = None;
+                self.save_floorplan(false);
+            }
+            MapMsg::BoxDeleteOnBridge(bid) => {
+                if let Some(pos) = self.floorplan.doc.boxes.iter().position(|b| b.id == bid) {
+                    let b = self.floorplan.doc.boxes.remove(pos);
+                    self.floorplan.selection = None;
+                    self.save_floorplan(false);
+                    if let Some(hid) = b.hue_id {
+                        self.send(cmd_room_delete(&hid, &b.kind));
+                    }
+                }
+            }
+            MapMsg::RecallScene(sid) => {
+                self.send(json!({"cmd": "scene", "id": sid}));
+            }
+            MapMsg::NewSceneNameInput(v) => {
+                self.floorplan.new_scene_name = v.chars().take(32).collect();
+            }
+            MapMsg::SaveCurrentScene(room_id) => {
+                let name = self.floorplan.new_scene_name.trim().to_string();
+                if !name.is_empty() {
+                    self.floorplan.new_scene_name.clear();
+                    self.send(cmd_scene_create(&room_id, &name));
+                }
+            }
+            MapMsg::ScheduleScene { kind, room_id, room_name, scene_id, scene_name } => {
+                self.tab = Tab::Schedules;
+                self.open_light_drawer = None;
+                self.schedule_draft = Some(ScheduleDraft::for_scene(
+                    kind, room_id, room_name, scene_id, scene_name,
+                ));
+            }
+            // Stamp Inspector
+            MapMsg::StampRotate(sid) => {
+                if let Some(st) = self.floorplan.doc.stamps.iter_mut().find(|s| s.id == sid) {
+                    st.rot = (st.rot + 90) % 360;
+                    self.save_floorplan(false);
+                }
+            }
+            MapMsg::StampDelete(sid) => {
+                self.floorplan.doc.stamps.retain(|s| s.id != sid);
+                self.floorplan.selection = None;
+                self.save_floorplan(false);
+            }
+            // Wire Inspector
+            MapMsg::WireToggle(rid, enabled) => {
+                self.send(json!({"cmd": "rule_toggle", "id": rid, "enabled": enabled}));
+            }
+            MapMsg::WireDelete(rid) => {
+                self.floorplan.selection = None;
+                self.send(json!({"cmd": "rule_delete", "id": rid}));
+            }
+        }
+        Task::none()
+    }
+
     fn any_picker_open(&self) -> bool {
         self.synth_room_picker_open
+            || self.floorplan.any_menu_open()
             || self.schedule_draft.as_ref().is_some_and(|d| d.target_picker_open)
             || self.rule_draft.as_ref().is_some_and(|d| d.trigger_picker_open || d.target_picker_open)
     }
 
     fn close_pickers(&mut self) {
         self.synth_room_picker_open = false;
+        self.floorplan.close_menus();
         if let Some(d) = &mut self.schedule_draft {
             d.target_picker_open = false;
         }
@@ -885,6 +1370,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
     fn tab_bar(&self) -> Element<'_, Message> {
         let sch_count = list(&self.stats, "schedules").len();
         let rule_count = list(&self.stats, "rules").len();
+        let map_pending = compute_pending_sync_count(&self.floorplan.doc, &self.stats);
         let paused = flag(&self.stats, "rules_paused");
         let synth_running = self.stats.get("synth").is_some_and(|sy| flag(sy, "running"));
 
@@ -916,6 +1402,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         container(
             row![
                 tab_btn(Tab::Lights, tr("Lights"), 0, false, false),
+                tab_btn(Tab::Map, tr("Map"), map_pending, false, false),
                 tab_btn(Tab::Schedules, tr("Schedules"), sch_count, false, false),
                 tab_btn(Tab::Rules, tr("Rules"), rule_count, paused, false),
                 tab_btn(Tab::Synth, tr("Synth"), 0, false, synth_running),
@@ -1624,8 +2111,12 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             .collect();
         form = form.push(column![dim(tr("Days")), flex_row(day_btns).row_spacing(4).column_spacing(4)].spacing(4));
 
-        // Action & brightness
-        let action_pills: Vec<Element<Message>> = [("on", tr("On")), ("off", tr("Off"))]
+        // Action & brightness / scene
+        let mut action_opts: Vec<(&str, String)> = vec![("on", tr("On")), ("off", tr("Off"))];
+        if !draft.scene_id.is_empty() {
+            action_opts.push(("scene", tr("Scene")));
+        }
+        let action_pills: Vec<Element<Message>> = action_opts
             .into_iter()
             .map(|(k, label)| {
                 let b = if draft.action == k { button::suggested(label) } else { button::standard(label) };
@@ -1642,7 +2133,18 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             .align_y(Alignment::Center),
         );
 
-        if draft.action == "on" {
+        if draft.action == "scene" && !draft.scene_id.is_empty() {
+            let scene_lbl = if draft.scene_name.is_empty() {
+                draft.scene_id.clone()
+            } else {
+                draft.scene_name.clone()
+            };
+            form = form.push(
+                row![dim(tr("Scene")), space::horizontal(), text::body(scene_lbl)]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+            );
+        } else if draft.action == "on" {
             form = form.push(
                 row![
                     dim(tr("Brightness")),
@@ -2249,6 +2751,8 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         content = content.push(self.tab_bar());
         content = content.push(match self.tab {
             Tab::Lights => self.lights_tab(),
+            Tab::Map => view_map_tab(&self.floorplan, &self.stats, &self.skin, self.window_mode, self.window_width)
+                .map(Message::Map),
             Tab::Schedules => self.schedules_tab(),
             Tab::Rules => self.rules_tab(),
             Tab::Synth => self.synth_tab(),
@@ -2696,6 +3200,9 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                     self.confirm_all_on = false;
                 }
                 self.stats = stats;
+                if let Some(fp) = parse_floorplan(&self.stats) {
+                    self.floorplan.sync_from_snapshot(fp);
+                }
                 // Settings changed in another interface (window, applet) take effect here too.
                 self.shot_key = shot_key_setting();
                 self.confirm_all_on_pref = confirm_all_on_setting();
@@ -2774,6 +3281,9 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             Message::SelectTab(tab) => {
                 self.tab = tab;
                 self.close_pickers();
+            }
+            Message::Map(m) => {
+                return self.handle_map_msg(m);
             }
             Message::SetFilter(filter) => {
                 self.filter = filter;

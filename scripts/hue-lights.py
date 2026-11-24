@@ -59,7 +59,7 @@ if not 1 <= BRIDGE_PORT <= 65535:
 MAX_BODY = 4 * 1024 * 1024
 MAX_CONFIG = 64 * 1024
 MAX_PENDING = 256     # queued light/group/scene commands at most (one per resource)
-MAX_COMMAND = 4096    # bytes per panel command line; longer lines are dropped unread
+MAX_COMMAND = 64 * 1024  # bytes per panel command line; longer lines are dropped unread
 # Rooms and zones name their lights directly or through devices, and nothing stops
 # a bridge from repeating them: each group keeps a light once and at most
 # MAX_GROUP_LIGHTS of them, all groups together at most MAX_MEMBERSHIPS. The lights
@@ -77,8 +77,45 @@ MAX_THEMES = 40
 MAX_RULES = 100
 MAX_RULE_TARGETS = 16
 MAX_RULE_LOG = 20
-MAX_API_QUEUE = 32
+MAX_API_QUEUE = 64
 MAX_EFFECTS = 64
+MAX_ENTERTAINMENT_AREAS = 32
+MAX_FLOORPLAN_BOXES = 40
+MAX_FLOORPLAN_STAMPS = 80
+MAX_FLOORPLAN_LAMPS = 120
+MAX_FLOORPLAN_BG_BYTES = 15 * 1024 * 1024
+FLOORPLAN_VERSION = 1
+FLOORPLAN_TEMPLATES = (
+    "auto_bridge", "studio_loft", "one_bed_apt", "three_room_apt", "family_house", "desk_studio",
+)
+FLOORPLAN_STAMP_KINDS = ("door", "window", "sofa", "tv", "desk", "bed", "dining", "kitchen")
+FLOORPLAN_STAMP_ROTS = (0, 90, 180, 270)
+LAMP_ICONS = (
+    "bulb", "spot", "strip", "floor", "table", "pendant",
+    "ceiling", "wall", "bar", "desk", "outdoor", "candle",
+)
+_LAMP_ICON_ALIASES = {
+    "floor_lamp": "floor",
+    "table_lamp": "table",
+    "desk_lamp": "desk",
+    "wall_lamp": "wall",
+    "ceiling_lamp": "ceiling",
+    "pendant_lamp": "pendant",
+    "lightstrip": "strip",
+    "spotlight": "spot",
+}
+FLOORPLAN_BG_FITS = ("contain", "cover")
+FLOORPLAN_BG_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+FLOORPLAN_BG_PREFIX = "floorplan_bg."
+HUE_ARCHETYPES = frozenset({
+    "living_room", "kitchen", "dining", "bedroom", "kids_bedroom",
+    "bathroom", "nursery", "recreation", "office", "gym", "hallway",
+    "toilet", "front_door", "garage", "terrace", "garden", "driveway",
+    "carport", "home", "downstairs", "upstairs", "top_floor", "attic",
+    "guest_room", "staircase", "lounge", "man_cave", "computer", "studio",
+    "music", "tv", "reading", "closet", "storage", "laundry_room",
+    "balcony", "porch", "barbecue", "pool", "other",
+})
 RULE_ECHO_WINDOW = 1.5
 RULE_COOLDOWN = 2.0
 MAX_CASCADE_DEPTH = 3
@@ -94,6 +131,8 @@ CLIENT_KEY_RE = re.compile(r"[0-9A-Fa-f]{1,64}")    # the entertainment client k
 EFFECT_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 TIME_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 THEME_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+FLOORPLAN_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+FLOORPLAN_ICON_RE = re.compile(r"^[a-z0-9_]{1,24}$")
 HEX_COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
 DAY_SHORT_TO_FULL = {
     "mon": "monday", "tue": "tuesday", "wed": "wednesday",
@@ -323,10 +362,17 @@ def build_model(resources):
         owner = (zc.get("owner") or {}).get("rid")
         if owner:
             connectivity[owner] = zc.get("status") == "connected"
+    light_owner = {}
+    for did, device in devices.items():
+        for svc in device.get("services") or []:
+            if isinstance(svc, dict) and svc.get("rtype") == "light" and valid_uuid(svc.get("rid")):
+                light_owner.setdefault(svc["rid"], did)
 
     def light_entry(light):
         dimming = light.get("dimming") if isinstance(light.get("dimming"), dict) else {}
-        owner = (light.get("owner") or {}).get("rid")
+        owner_obj = light.get("owner") if isinstance(light.get("owner"), dict) else {}
+        raw_owner = owner_obj.get("rid")
+        owner_id = raw_owner if valid_uuid(raw_owner) else light_owner.get(light["id"], "")
         ct = light.get("color_temperature") if isinstance(light.get("color_temperature"), dict) else {}
         schema = ct.get("mirek_schema") if isinstance(ct.get("mirek_schema"), dict) else {}
         mirek_min = int(round(finite(schema.get("mirek_minimum"), 153.0, 153.0, 500.0)))
@@ -354,12 +400,13 @@ def build_model(resources):
                     avail_effects.append(ev)
         return {
             "id": light["id"],
+            "device_id": owner_id,
             "name": clean((light.get("metadata") or {}).get("name") or "Light"),
             "on": bool((light.get("on") or {}).get("on")),
             "bri": round(brightness(dimming.get("brightness", 100.0)), 1),
             "dimmable": "dimming" in light,
             "color": light_color(light),
-            "reachable": connectivity.get(owner, True),
+            "reachable": connectivity.get(raw_owner or owner_id, True),
             "supports_color": "color" in light,
             "supports_ct": "color_temperature" in light,
             "mirek": mirek,
@@ -491,6 +538,174 @@ def extract_bridge_home_gl(resources):
             if isinstance(svc, dict) and svc.get("rtype") == "grouped_light" and valid_uuid(svc.get("rid")):
                 return svc["rid"]
     return ""
+
+
+def _extract_light_entertainment_services(resources):
+    """Map light_id -> entertainment service UUID via shared owner device."""
+    if not isinstance(resources, list):
+        return {}
+    device_lights = {}
+    device_ents = {}
+    for res in resources:
+        if not isinstance(res, dict) or not valid_uuid(res.get("id")):
+            continue
+        rtype = res.get("type")
+        if rtype == "light":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                device_lights.setdefault(owner, []).append(res["id"])
+        elif rtype == "entertainment":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                device_ents.setdefault(owner, []).append(res["id"])
+        elif rtype == "device":
+            did = res["id"]
+            for svc in res.get("services") or []:
+                if not isinstance(svc, dict) or not valid_uuid(svc.get("rid")):
+                    continue
+                if svc.get("rtype") == "light":
+                    if svc["rid"] not in device_lights.setdefault(did, []):
+                        device_lights[did].append(svc["rid"])
+                elif svc.get("rtype") == "entertainment":
+                    if svc["rid"] not in device_ents.setdefault(did, []):
+                        device_ents[did].append(svc["rid"])
+    mapping = {}
+    for did, lids in device_lights.items():
+        ents = device_ents.get(did) or []
+        if ents:
+            for lid in lids:
+                mapping.setdefault(lid, ents[0])
+    return mapping
+
+
+def parse_entertainment_areas(resources):
+    """Parse CLIP v2 `entertainment_configuration` resources into
+    [{id, name, channels: [...], locations: [{light_id, service_id, service_type, x, y, z}]}]."""
+    if not isinstance(resources, list):
+        return []
+    lights = set()
+    device_lights = {}
+    ent_to_device = {}
+    for res in resources:
+        if not isinstance(res, dict) or not valid_uuid(res.get("id")):
+            continue
+        rtype = res.get("type")
+        if rtype == "light":
+            lights.add(res["id"])
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                device_lights.setdefault(owner, []).append(res["id"])
+        elif rtype == "entertainment":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                ent_to_device[res["id"]] = owner
+        elif rtype == "device":
+            did = res["id"]
+            for svc in res.get("services") or []:
+                if not isinstance(svc, dict) or not valid_uuid(svc.get("rid")):
+                    continue
+                if svc.get("rtype") == "light":
+                    if svc["rid"] not in device_lights.setdefault(did, []):
+                        device_lights[did].append(svc["rid"])
+                elif svc.get("rtype") == "entertainment":
+                    ent_to_device.setdefault(svc["rid"], did)
+
+    def resolve_light(svc_id, svc_type):
+        if svc_type == "light" and valid_uuid(svc_id):
+            return svc_id
+        did = ent_to_device.get(svc_id)
+        if did and device_lights.get(did):
+            return device_lights[did][0]
+        if svc_id in lights:
+            return svc_id
+        return ""
+
+    areas = []
+    seen = set()
+    for res in resources:
+        if len(areas) >= MAX_ENTERTAINMENT_AREAS:
+            break
+        if not isinstance(res, dict) or res.get("type") != "entertainment_configuration":
+            continue
+        aid = res.get("id")
+        if not valid_uuid(aid) or aid in seen:
+            continue
+        seen.add(aid)
+        meta = res.get("metadata") if isinstance(res.get("metadata"), dict) else {}
+        name = clean(meta.get("name") or res.get("name") or "Entertainment", 60) or "Entertainment"
+
+        channels = []
+        raw_channels = res.get("channels")
+        if isinstance(raw_channels, list):
+            for ch in raw_channels[:64]:
+                if not isinstance(ch, dict):
+                    continue
+                cid = ch.get("channel_id", 0)
+                if isinstance(cid, bool) or not isinstance(cid, (int, float)):
+                    cid = 0
+                pos = ch.get("position") if isinstance(ch.get("position"), dict) else {}
+                members = []
+                for mem in (ch.get("members") if isinstance(ch.get("members"), list) else [])[:16]:
+                    if not isinstance(mem, dict):
+                        continue
+                    svc = mem.get("service") if isinstance(mem.get("service"), dict) else {}
+                    srid = svc.get("rid")
+                    srtype = svc.get("rtype") if svc.get("rtype") in ("entertainment", "light") else "entertainment"
+                    if valid_uuid(srid):
+                        members.append({
+                            "service_id": srid,
+                            "service_type": srtype,
+                            "light_id": resolve_light(srid, srtype),
+                        })
+                channels.append({
+                    "channel_id": int(round(finite(cid, 0.0, 0.0, 255.0))),
+                    "position": {
+                        "x": round(finite(pos.get("x"), 0.0, -1.0, 1.0), 4),
+                        "y": round(finite(pos.get("y"), 0.0, -1.0, 1.0), 4),
+                        "z": round(finite(pos.get("z"), 0.0, -1.0, 1.0), 4),
+                    },
+                    "members": members,
+                })
+
+        locations = []
+        loc_obj = res.get("locations") if isinstance(res.get("locations"), dict) else {}
+        raw_locs = loc_obj.get("service_locations")
+        if isinstance(raw_locs, list):
+            for sl in raw_locs[:MAX_GROUP_LIGHTS]:
+                if not isinstance(sl, dict):
+                    continue
+                svc = sl.get("service") if isinstance(sl.get("service"), dict) else {}
+                srid = svc.get("rid") if valid_uuid(svc.get("rid")) else ""
+                srtype = svc.get("rtype") if svc.get("rtype") in ("entertainment", "light") else "entertainment"
+                lid = resolve_light(srid, srtype)
+                if not lid and valid_uuid(sl.get("light_id")):
+                    lid = sl["light_id"]
+                if not lid and not srid:
+                    continue
+                positions = sl.get("positions")
+                if isinstance(positions, list) and positions and isinstance(positions[0], dict):
+                    pos = positions[0]
+                elif isinstance(sl.get("position"), dict):
+                    pos = sl["position"]
+                else:
+                    pos = {}
+                locations.append({
+                    "light_id": lid,
+                    "service_id": srid,
+                    "service_type": srtype,
+                    "x": round(finite(pos.get("x"), 0.0, -1.0, 1.0), 4),
+                    "y": round(finite(pos.get("y"), 0.0, -1.0, 1.0), 4),
+                    "z": round(finite(pos.get("z"), 0.0, -1.0, 1.0), 4),
+                })
+
+        areas.append({
+            "id": aid,
+            "name": name,
+            "channels": channels,
+            "locations": locations,
+        })
+    areas.sort(key=lambda a: (a["name"].lower(), a["id"]))
+    return areas
 
 
 def _parse_hhmm(value):
@@ -867,6 +1082,11 @@ def parse_sse_events(payload):
                 st = eff_obj.get("status")
                 if isinstance(st, str) and EFFECT_RE.match(st):
                     changes["effect"] = st
+            meta_obj = item.get("metadata")
+            if isinstance(meta_obj, dict) and isinstance(meta_obj.get("name"), str):
+                nm = clean(meta_obj["name"], 60)
+                if nm:
+                    changes["name"] = nm
             if changes:
                 updates.append((kind, rid, changes))
     return updates
@@ -1216,6 +1436,1041 @@ def validate_local_schedule(raw):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Floorplan model, validation, starter prototypes & spatial sync helpers
+
+def _strict_finite(value, low, high):
+    """Strict numeric check: rejects bool, non-numeric, NaN, and Inf; clamps finite floats to [low, high]."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    num = float(value)
+    if not math.isfinite(num):
+        return None
+    return clamp(num, low, high)
+
+
+def _detect_image_ext(data):
+    """Detect PNG, JPEG, or WEBP format from magic bytes, or return None."""
+    if not isinstance(data, (bytes, bytearray, memoryview)) or len(data) < 12:
+        return None
+    b = bytes(data[:12])
+    if b.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if b.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def _validate_managed_bg_path(path):
+    """Return normalized absolute path iff `path` is a real, regular, non-symlink
+    `floorplan_bg.<ext>` file strictly inside CONFIG_DIR, else None."""
+    if not isinstance(path, str) or not path or "\x00" in path:
+        return None
+    if not os.path.isabs(path):
+        return None
+    norm = os.path.normpath(path)
+    parent, base = os.path.split(norm)
+    try:
+        cfg_real = os.path.realpath(CONFIG_DIR)
+        parent_real = os.path.realpath(parent)
+    except OSError:
+        return None
+    if parent_real != cfg_real:
+        return None
+    if not base.startswith(FLOORPLAN_BG_PREFIX):
+        return None
+    _, ext = os.path.splitext(base.lower())
+    if ext not in FLOORPLAN_BG_EXTS:
+        return None
+    try:
+        fd = os.open(norm, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            return None
+        if info.st_size <= 0 or info.st_size > MAX_FLOORPLAN_BG_BYTES:
+            return None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return norm
+
+
+def validate_floorplan(raw):
+    """Strictly validate and normalize a floorplan.json payload, or return None."""
+    if not isinstance(raw, dict):
+        return None
+    version = raw.get("version", FLOORPLAN_VERSION)
+    if isinstance(version, bool) or not isinstance(version, int) or version != FLOORPLAN_VERSION:
+        return None
+
+    raw_bid = raw.get("bridge_id", "")
+    if raw_bid is None or raw_bid == "":
+        bridge_id = ""
+    elif isinstance(raw_bid, str) and BRIDGE_ID_RE.match(raw_bid.upper()):
+        bridge_id = raw_bid.upper()
+    else:
+        return None
+
+    raw_tid = raw.get("template_id", "auto_bridge")
+    if raw_tid is None or raw_tid == "":
+        template_id = "auto_bridge"
+    elif isinstance(raw_tid, str) and raw_tid in (FLOORPLAN_TEMPLATES + ("custom",)):
+        template_id = raw_tid
+    else:
+        return None
+
+    raw_ent = raw.get("entertainment_id")
+    if raw_ent is None or raw_ent == "":
+        entertainment_id = None
+    elif valid_uuid(raw_ent):
+        entertainment_id = raw_ent
+    else:
+        return None
+
+    raw_canvas = raw.get("canvas", {})
+    if not isinstance(raw_canvas, dict):
+        return None
+    c_width = _strict_finite(raw_canvas.get("width", 1600.0), 400.0, 4000.0)
+    c_height = _strict_finite(raw_canvas.get("height", 1000.0), 300.0, 3000.0)
+    c_grid = _strict_finite(raw_canvas.get("grid", 20.0), 5.0, 100.0)
+    c_snap = raw_canvas.get("snap", True)
+    c_zoom = _strict_finite(raw_canvas.get("zoom", 1.0), 0.25, 4.0)
+    c_pan_x = _strict_finite(raw_canvas.get("pan_x", 0.0), -4000.0, 4000.0)
+    c_pan_y = _strict_finite(raw_canvas.get("pan_y", 0.0), -4000.0, 4000.0)
+    if (c_width is None or c_height is None or c_grid is None or not isinstance(c_snap, bool)
+            or c_zoom is None or c_pan_x is None or c_pan_y is None):
+        return None
+    canvas = {
+        "width": round(c_width, 1),
+        "height": round(c_height, 1),
+        "grid": int(round(c_grid)),
+        "snap": c_snap,
+        "zoom": round(c_zoom, 3),
+        "pan_x": round(c_pan_x, 1),
+        "pan_y": round(c_pan_y, 1),
+    }
+
+    show_wires = raw.get("show_wires", True)
+    show_glows = raw.get("show_glows", True)
+    show_furniture = raw.get("show_furniture", True)
+    has_auto_sync = "auto_sync" in raw
+    has_auto_sync_rooms = "auto_sync_rooms" in raw
+    if has_auto_sync and not isinstance(raw["auto_sync"], bool):
+        return None
+    if has_auto_sync_rooms and not isinstance(raw["auto_sync_rooms"], bool):
+        return None
+    if has_auto_sync and has_auto_sync_rooms:
+        auto_sync = raw["auto_sync"]
+        auto_sync_rooms = raw["auto_sync_rooms"]
+    elif has_auto_sync:
+        auto_sync = raw["auto_sync"]
+        auto_sync_rooms = auto_sync
+    elif has_auto_sync_rooms:
+        auto_sync_rooms = raw["auto_sync_rooms"]
+        auto_sync = auto_sync_rooms
+    else:
+        auto_sync = False
+        auto_sync_rooms = False
+    if not (isinstance(show_wires, bool) and isinstance(show_glows, bool) and isinstance(show_furniture, bool)):
+        return None
+
+    raw_bg = raw.get("background")
+    if raw_bg is None:
+        background = {"path": "", "opacity": 0.35, "fit": "contain"}
+    else:
+        if not isinstance(raw_bg, dict):
+            return None
+        bg_opacity = _strict_finite(raw_bg.get("opacity", 0.35), 0.05, 1.0)
+        bg_fit = raw_bg.get("fit", "contain")
+        bg_path = raw_bg.get("path", "")
+        if bg_opacity is None or bg_fit not in FLOORPLAN_BG_FITS or not isinstance(bg_path, str):
+            return None
+        if bg_path:
+            validated_bg_path = _validate_managed_bg_path(bg_path)
+            if validated_bg_path is None:
+                return None
+            bg_path = validated_bg_path
+        background = {
+            "path": bg_path,
+            "opacity": round(bg_opacity, 3),
+            "fit": bg_fit,
+        }
+
+    raw_boxes = raw.get("boxes", [])
+    if not isinstance(raw_boxes, list) or len(raw_boxes) > MAX_FLOORPLAN_BOXES:
+        return None
+    boxes = []
+    seen_box_ids = set()
+    for b in raw_boxes:
+        if not isinstance(b, dict):
+            return None
+        bid = b.get("id")
+        if bid is None or bid == "":
+            bid = str(uuid.uuid4())
+        elif not isinstance(bid, str) or FLOORPLAN_ID_RE.match(bid) is None:
+            return None
+        if bid in seen_box_ids:
+            return None
+        seen_box_ids.add(bid)
+
+        bkind = b.get("kind")
+        if bkind not in ("room", "zone"):
+            return None
+        hue_id = b.get("hue_id")
+        if hue_id is None or hue_id == "":
+            hue_id = None
+        elif not valid_uuid(hue_id):
+            return None
+
+        raw_name = b.get("name")
+        if not isinstance(raw_name, str):
+            return None
+        if any(ch in raw_name for ch in "<>&"):
+            return None
+        bname = clean(raw_name, 40)
+        if not bname:
+            return None
+
+        arch = b.get("archetype", "other")
+        if arch is None or arch == "":
+            arch = "other"
+        elif not isinstance(arch, str) or arch not in HUE_ARCHETYPES:
+            return None
+
+        bx = _strict_finite(b.get("x"), 0.0, 4000.0)
+        by = _strict_finite(b.get("y"), 0.0, 3000.0)
+        bw = _strict_finite(b.get("w"), 60.0, 4000.0)
+        bh = _strict_finite(b.get("h"), 60.0, 3000.0)
+        if bx is None or by is None or bw is None or bh is None:
+            return None
+
+        ent_area_id = b.get("entertainment_area_id")
+        if ent_area_id is None or ent_area_id == "":
+            ent_area_id = None
+        elif not valid_uuid(ent_area_id):
+            return None
+
+        boxes.append({
+            "id": bid,
+            "kind": bkind,
+            "hue_id": hue_id,
+            "name": bname,
+            "archetype": arch,
+            "x": round(bx, 1),
+            "y": round(by, 1),
+            "w": round(bw, 1),
+            "h": round(bh, 1),
+            "entertainment_area_id": ent_area_id,
+        })
+
+    raw_stamps = raw.get("stamps", [])
+    if not isinstance(raw_stamps, list) or len(raw_stamps) > MAX_FLOORPLAN_STAMPS:
+        return None
+    stamps = []
+    seen_stamp_ids = set()
+    for s in raw_stamps:
+        if not isinstance(s, dict):
+            return None
+        sid = s.get("id")
+        if sid is None or sid == "":
+            sid = str(uuid.uuid4())
+        elif not isinstance(sid, str) or FLOORPLAN_ID_RE.match(sid) is None:
+            return None
+        if sid in seen_stamp_ids:
+            return None
+        seen_stamp_ids.add(sid)
+
+        skind = s.get("kind")
+        if skind not in FLOORPLAN_STAMP_KINDS:
+            return None
+        sx = _strict_finite(s.get("x"), 0.0, 4000.0)
+        sy = _strict_finite(s.get("y"), 0.0, 3000.0)
+        sw = _strict_finite(s.get("w"), 10.0, 1000.0)
+        sh = _strict_finite(s.get("h"), 10.0, 1000.0)
+        rot = s.get("rot", 0)
+        if (sx is None or sy is None or sw is None or sh is None
+                or isinstance(rot, bool) or not isinstance(rot, int) or rot not in FLOORPLAN_STAMP_ROTS):
+            return None
+        stamps.append({
+            "id": sid,
+            "kind": skind,
+            "x": round(sx, 1),
+            "y": round(sy, 1),
+            "w": round(sw, 1),
+            "h": round(sh, 1),
+            "rot": rot,
+        })
+
+    raw_lamps = raw.get("lamps", {})
+    if not isinstance(raw_lamps, dict) or len(raw_lamps) > MAX_FLOORPLAN_LAMPS:
+        return None
+    lamps = {}
+    for lid, lpos in raw_lamps.items():
+        if not valid_uuid(lid) or not isinstance(lpos, dict):
+            return None
+        lx = _strict_finite(lpos.get("x"), 0.0, 4000.0)
+        ly = _strict_finite(lpos.get("y"), 0.0, 3000.0)
+        lz = _strict_finite(lpos.get("z", 0.0), -1.0, 1.0)
+        if lx is None or ly is None or lz is None:
+            return None
+        icon = lpos.get("icon", "bulb")
+        if icon is None or icon == "":
+            icon = "bulb"
+        elif not isinstance(icon, str) or FLOORPLAN_ICON_RE.match(icon) is None:
+            return None
+        else:
+            icon = _LAMP_ICON_ALIASES.get(icon, icon)
+            if icon not in LAMP_ICONS:
+                icon = "bulb"
+        lamps[lid] = {
+            "x": round(lx, 1),
+            "y": round(ly, 1),
+            "z": round(lz, 3),
+            "icon": icon,
+        }
+
+    return {
+        "version": FLOORPLAN_VERSION,
+        "bridge_id": bridge_id,
+        "template_id": template_id,
+        "entertainment_id": entertainment_id,
+        "canvas": canvas,
+        "show_wires": show_wires,
+        "show_glows": show_glows,
+        "show_furniture": show_furniture,
+        "auto_sync": auto_sync,
+        "auto_sync_rooms": auto_sync_rooms,
+        "background": background,
+        "boxes": boxes,
+        "stamps": stamps,
+        "lamps": lamps,
+    }
+
+
+_ARCHETYPE_ALIASES = {
+    "living_room": ("living_room", "lounge", "tv", "recreation", "music", "reading"),
+    "kitchen": ("kitchen", "dining"),
+    "dining": ("dining", "kitchen", "living_room"),
+    "bedroom": ("bedroom", "guest_room", "nursery"),
+    "kids_bedroom": ("kids_bedroom", "guest_room", "nursery", "bedroom"),
+    "office": ("office", "computer", "studio", "man_cave", "reading"),
+    "bathroom": ("bathroom", "toilet", "laundry_room"),
+    "toilet": ("toilet", "bathroom"),
+    "hallway": ("hallway", "front_door", "staircase", "closet", "storage"),
+    "balcony": ("balcony", "terrace", "porch", "garden"),
+    "terrace": ("terrace", "garden", "balcony", "porch", "barbecue", "pool"),
+}
+
+_ARCHETYPE_KEYWORDS = {
+    "living_room": ("living", "wohn", "salon", "salón", "soggiorno", "woonkamer", "lounge", "tv"),
+    "kitchen": ("kitchen", "küch", "kuech", "cuisine", "cocina", "cucina", "keuken", "kuchnia"),
+    "dining": ("dining", "ess", "manger", "comedor", "pranzo", "eetkamer", "jadalnia"),
+    "bedroom": ("bedroom", "schlaf", "master", "chambre", "dormitorio", "camera", "slaapkamer", "sypialnia"),
+    "kids_bedroom": ("kids", "kinder", "guest", "gäste", "gaste", "second", "zweit", "enfant", "niños"),
+    "office": ("office", "büro", "buero", "desk", "studio", "arbeit", "study", "bureau", "despacho", "ufficio", "kantoor", "biuro", "gaming", "computer"),
+    "bathroom": ("bath", "bad", "bain", "baño", "bagno", "badkamer", "łazienka", "lazienka", "shower", "dusche"),
+    "toilet": ("wc", "toilet", "restroom", "gäste-wc"),
+    "hallway": ("hall", "flur", "diele", "corridor", "entry", "eingang", "couloir", "pasillo", "gang", "przedpokój"),
+    "balcony": ("balcony", "balkon", "balcon", "balcón", "balcone"),
+    "terrace": ("terrace", "terrass", "garden", "garten", "patio", "outdoor", "jardin", "tuin", "ogród", "ogrod", "yard"),
+}
+
+
+def _place_lamps_in_box(box, lights, lamps_out):
+    """Distribute `lights` neatly inside `box` (strictly inside walls) into `lamps_out`."""
+    valid_lights = [l for l in (lights or []) if isinstance(l, dict) and valid_uuid(l.get("id"))]
+    if not valid_lights:
+        return
+    n = len(valid_lights)
+    cols = max(1, int(math.ceil(math.sqrt(n * (box["w"] / max(1.0, box["h"]))))))
+    rows = max(1, int(math.ceil(n / float(cols))))
+    pad_x = min(56.0, box["w"] * 0.2)
+    pad_y = min(56.0, box["h"] * 0.22)
+    inner_w = max(20.0, box["w"] - 2.0 * pad_x)
+    inner_h = max(20.0, box["h"] - 2.0 * pad_y)
+    for idx, light in enumerate(valid_lights):
+        lid = light["id"]
+        if lid in lamps_out or len(lamps_out) >= MAX_FLOORPLAN_LAMPS:
+            continue
+        col = idx % cols
+        row = idx // cols
+        fx = 0.5 if cols == 1 else (col / float(cols - 1))
+        fy = 0.5 if rows == 1 else (row / float(rows - 1))
+        lx = box["x"] + pad_x + fx * inner_w
+        ly = box["y"] + pad_y + fy * inner_h
+        lamps_out[lid] = {
+            "x": round(clamp(lx, 0.0, 4000.0), 1),
+            "y": round(clamp(ly, 0.0, 3000.0), 1),
+            "z": 0.0,
+            "icon": "bulb",
+        }
+
+
+def _template_blueprints():
+    """Return static pure-vector architectural starter blueprints (boxes + stamps)."""
+    return {
+        "studio_loft": {
+            "canvas": {"width": 1200.0, "height": 820.0},
+            "boxes": [
+                {"id": "box-living", "kind": "room", "hue_id": None, "name": "Living / Sleeping", "archetype": "living_room", "x": 80.0, "y": 80.0, "w": 660.0, "h": 440.0, "entertainment_area_id": None},
+                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchenette", "archetype": "kitchen", "x": 740.0, "y": 80.0, "w": 340.0, "h": 240.0, "entertainment_area_id": None},
+                {"id": "box-bath", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 740.0, "y": 320.0, "w": 340.0, "h": 200.0, "entertainment_area_id": None},
+                {"id": "box-balcony", "kind": "room", "hue_id": None, "name": "Balcony", "archetype": "balcony", "x": 80.0, "y": 520.0, "w": 660.0, "h": 180.0, "entertainment_area_id": None},
+            ],
+            "stamps": [
+                {"id": "st-1", "kind": "tv", "x": 160.0, "y": 95.0, "w": 160.0, "h": 18.0, "rot": 0},
+                {"id": "st-2", "kind": "sofa", "x": 150.0, "y": 240.0, "w": 180.0, "h": 72.0, "rot": 0},
+                {"id": "st-3", "kind": "bed", "x": 490.0, "y": 110.0, "w": 190.0, "h": 150.0, "rot": 0},
+                {"id": "st-4", "kind": "desk", "x": 490.0, "y": 350.0, "w": 150.0, "h": 68.0, "rot": 0},
+                {"id": "st-5", "kind": "kitchen", "x": 760.0, "y": 96.0, "w": 280.0, "h": 54.0, "rot": 0},
+                {"id": "st-6", "kind": "dining", "x": 800.0, "y": 190.0, "w": 130.0, "h": 80.0, "rot": 0},
+                {"id": "st-7", "kind": "door", "x": 740.0, "y": 390.0, "w": 52.0, "h": 52.0, "rot": 90},
+                {"id": "st-8", "kind": "window", "x": 220.0, "y": 514.0, "w": 220.0, "h": 12.0, "rot": 0},
+            ],
+        },
+        "one_bed_apt": {
+            "canvas": {"width": 1400.0, "height": 820.0},
+            "boxes": [
+                {"id": "box-living", "kind": "room", "hue_id": None, "name": "Living Room", "archetype": "living_room", "x": 80.0, "y": 80.0, "w": 460.0, "h": 360.0, "entertainment_area_id": None},
+                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchen", "archetype": "kitchen", "x": 540.0, "y": 80.0, "w": 320.0, "h": 240.0, "entertainment_area_id": None},
+                {"id": "box-hall", "kind": "room", "hue_id": None, "name": "Hallway", "archetype": "hallway", "x": 540.0, "y": 320.0, "w": 320.0, "h": 120.0, "entertainment_area_id": None},
+                {"id": "box-bedroom", "kind": "room", "hue_id": None, "name": "Bedroom", "archetype": "bedroom", "x": 860.0, "y": 80.0, "w": 420.0, "h": 360.0, "entertainment_area_id": None},
+                {"id": "box-bath", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 540.0, "y": 440.0, "w": 320.0, "h": 220.0, "entertainment_area_id": None},
+                {"id": "box-balcony", "kind": "room", "hue_id": None, "name": "Balcony", "archetype": "balcony", "x": 80.0, "y": 440.0, "w": 460.0, "h": 160.0, "entertainment_area_id": None},
+            ],
+            "stamps": [
+                {"id": "st-1", "kind": "tv", "x": 180.0, "y": 94.0, "w": 160.0, "h": 18.0, "rot": 0},
+                {"id": "st-2", "kind": "sofa", "x": 170.0, "y": 240.0, "w": 180.0, "h": 74.0, "rot": 0},
+                {"id": "st-3", "kind": "kitchen", "x": 560.0, "y": 94.0, "w": 270.0, "h": 54.0, "rot": 0},
+                {"id": "st-4", "kind": "dining", "x": 600.0, "y": 190.0, "w": 140.0, "h": 84.0, "rot": 0},
+                {"id": "st-5", "kind": "bed", "x": 960.0, "y": 120.0, "w": 200.0, "h": 170.0, "rot": 0},
+                {"id": "st-6", "kind": "door", "x": 540.0, "y": 350.0, "w": 52.0, "h": 52.0, "rot": 90},
+                {"id": "st-7", "kind": "door", "x": 860.0, "y": 350.0, "w": 52.0, "h": 52.0, "rot": 270},
+                {"id": "st-8", "kind": "window", "x": 180.0, "y": 434.0, "w": 200.0, "h": 12.0, "rot": 0},
+            ],
+        },
+        "three_room_apt": {
+            "canvas": {"width": 1500.0, "height": 880.0},
+            "boxes": [
+                {"id": "box-living", "kind": "room", "hue_id": None, "name": "Living / Dining", "archetype": "living_room", "x": 80.0, "y": 80.0, "w": 520.0, "h": 360.0, "entertainment_area_id": None},
+                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchen", "archetype": "kitchen", "x": 600.0, "y": 80.0, "w": 300.0, "h": 240.0, "entertainment_area_id": None},
+                {"id": "box-hall", "kind": "room", "hue_id": None, "name": "Hallway", "archetype": "hallway", "x": 600.0, "y": 320.0, "w": 300.0, "h": 120.0, "entertainment_area_id": None},
+                {"id": "box-master", "kind": "room", "hue_id": None, "name": "Master Bedroom", "archetype": "bedroom", "x": 900.0, "y": 80.0, "w": 460.0, "h": 360.0, "entertainment_area_id": None},
+                {"id": "box-office", "kind": "room", "hue_id": None, "name": "Office / Studio", "archetype": "office", "x": 80.0, "y": 440.0, "w": 380.0, "h": 300.0, "entertainment_area_id": None},
+                {"id": "box-bath", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 460.0, "y": 440.0, "w": 280.0, "h": 300.0, "entertainment_area_id": None},
+                {"id": "box-second", "kind": "room", "hue_id": None, "name": "Second Bedroom", "archetype": "kids_bedroom", "x": 740.0, "y": 440.0, "w": 620.0, "h": 300.0, "entertainment_area_id": None},
+            ],
+            "stamps": [
+                {"id": "st-1", "kind": "tv", "x": 140.0, "y": 94.0, "w": 160.0, "h": 18.0, "rot": 0},
+                {"id": "st-2", "kind": "sofa", "x": 130.0, "y": 230.0, "w": 180.0, "h": 72.0, "rot": 0},
+                {"id": "st-3", "kind": "dining", "x": 380.0, "y": 180.0, "w": 160.0, "h": 95.0, "rot": 0},
+                {"id": "st-4", "kind": "kitchen", "x": 620.0, "y": 94.0, "w": 250.0, "h": 52.0, "rot": 0},
+                {"id": "st-5", "kind": "bed", "x": 1020.0, "y": 120.0, "w": 200.0, "h": 170.0, "rot": 0},
+                {"id": "st-6", "kind": "desk", "x": 150.0, "y": 510.0, "w": 170.0, "h": 74.0, "rot": 0},
+                {"id": "st-7", "kind": "bed", "x": 960.0, "y": 510.0, "w": 170.0, "h": 140.0, "rot": 0},
+                {"id": "st-8", "kind": "door", "x": 600.0, "y": 350.0, "w": 52.0, "h": 52.0, "rot": 90},
+                {"id": "st-9", "kind": "window", "x": 200.0, "y": 74.0, "w": 200.0, "h": 12.0, "rot": 0},
+            ],
+        },
+        "family_house": {
+            "canvas": {"width": 1600.0, "height": 900.0},
+            "boxes": [
+                {"id": "box-living", "kind": "room", "hue_id": None, "name": "Living / Dining", "archetype": "living_room", "x": 80.0, "y": 80.0, "w": 540.0, "h": 380.0, "entertainment_area_id": None},
+                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchen", "archetype": "kitchen", "x": 620.0, "y": 80.0, "w": 360.0, "h": 260.0, "entertainment_area_id": None},
+                {"id": "box-hall", "kind": "room", "hue_id": None, "name": "Hallway", "archetype": "hallway", "x": 620.0, "y": 340.0, "w": 360.0, "h": 120.0, "entertainment_area_id": None},
+                {"id": "box-office", "kind": "room", "hue_id": None, "name": "Home Office", "archetype": "office", "x": 980.0, "y": 80.0, "w": 420.0, "h": 260.0, "entertainment_area_id": None},
+                {"id": "box-wc", "kind": "room", "hue_id": None, "name": "Guest WC", "archetype": "toilet", "x": 980.0, "y": 340.0, "w": 240.0, "h": 120.0, "entertainment_area_id": None},
+                {"id": "box-terrace", "kind": "room", "hue_id": None, "name": "Terrace / Garden", "archetype": "terrace", "x": 80.0, "y": 460.0, "w": 900.0, "h": 280.0, "entertainment_area_id": None},
+            ],
+            "stamps": [
+                {"id": "st-1", "kind": "tv", "x": 150.0, "y": 94.0, "w": 170.0, "h": 18.0, "rot": 0},
+                {"id": "st-2", "kind": "sofa", "x": 140.0, "y": 240.0, "w": 190.0, "h": 74.0, "rot": 0},
+                {"id": "st-3", "kind": "dining", "x": 390.0, "y": 190.0, "w": 170.0, "h": 100.0, "rot": 0},
+                {"id": "st-4", "kind": "kitchen", "x": 640.0, "y": 94.0, "w": 310.0, "h": 54.0, "rot": 0},
+                {"id": "st-5", "kind": "desk", "x": 1090.0, "y": 140.0, "w": 180.0, "h": 76.0, "rot": 0},
+                {"id": "st-6", "kind": "door", "x": 760.0, "y": 410.0, "w": 52.0, "h": 52.0, "rot": 0},
+                {"id": "st-7", "kind": "window", "x": 180.0, "y": 454.0, "w": 300.0, "h": 12.0, "rot": 0},
+            ],
+        },
+        "desk_studio": {
+            "canvas": {"width": 1280.0, "height": 840.0},
+            "boxes": [
+                {"id": "box-studio", "kind": "room", "hue_id": None, "name": "Desk / Gaming Studio", "archetype": "office", "x": 140.0, "y": 90.0, "w": 980.0, "h": 640.0, "entertainment_area_id": None},
+            ],
+            "stamps": [
+                {"id": "st-1", "kind": "desk", "x": 440.0, "y": 150.0, "w": 360.0, "h": 110.0, "rot": 0},
+                {"id": "st-2", "kind": "tv", "x": 490.0, "y": 110.0, "w": 260.0, "h": 20.0, "rot": 0},
+                {"id": "st-3", "kind": "sofa", "x": 470.0, "y": 540.0, "w": 280.0, "h": 95.0, "rot": 0},
+                {"id": "st-4", "kind": "window", "x": 134.0, "y": 240.0, "w": 12.0, "h": 220.0, "rot": 90},
+                {"id": "st-5", "kind": "door", "x": 1068.0, "y": 560.0, "w": 56.0, "h": 56.0, "rot": 180},
+            ],
+        },
+    }
+
+
+def _room_matches_archetype_keyword(room_name, box_archetype):
+    low = (room_name or "").lower()
+    for kw in _ARCHETYPE_KEYWORDS.get(box_archetype, ()):
+        if kw in low:
+            return True
+    return False
+
+
+def build_floorplan_template(template_id, rooms, bridge_id=""):
+    """Build one of the 6 editable starter floorplan prototypes, auto-matching existing Hue rooms."""
+    if template_id not in FLOORPLAN_TEMPLATES:
+        return None
+    rooms_list = [r for r in (rooms or []) if isinstance(r, dict)]
+    bridge_rooms = [r for r in rooms_list if r.get("kind") == "room" and valid_uuid(r.get("id"))]
+    other_group = next((r for r in rooms_list if r.get("kind") == "other"), None)
+    clean_bid = bridge_id.upper() if isinstance(bridge_id, str) and BRIDGE_ID_RE.match(bridge_id.upper()) else ""
+
+    boxes = []
+    stamps = []
+    lamps = {}
+
+    if template_id == "auto_bridge":
+        if not bridge_rooms:
+            box = {
+                "id": "box-room-1",
+                "kind": "room",
+                "hue_id": None,
+                "name": "Living Room",
+                "archetype": "living_room",
+                "x": 100.0,
+                "y": 100.0,
+                "w": 440.0,
+                "h": 320.0,
+                "entertainment_area_id": None,
+            }
+            boxes.append(box)
+            stamps.append({"id": "st-door-1", "kind": "door", "x": 290.0, "y": 392.0, "w": 52.0, "h": 52.0, "rot": 0})
+            c_w, c_h = 1400.0, 900.0
+        else:
+            count = min(len(bridge_rooms), MAX_FLOORPLAN_BOXES)
+            cols = 1 if count <= 1 else (2 if count <= 4 else 3)
+            box_w, box_h = 420.0, 300.0
+            margin_x, margin_y = 80.0, 80.0
+            for idx, room in enumerate(bridge_rooms[:MAX_FLOORPLAN_BOXES]):
+                col = idx % cols
+                row = idx // cols
+                arch = room.get("archetype") if room.get("archetype") in HUE_ARCHETYPES else "other"
+                bname = clean(room.get("name") or "Room", 40) or "Room"
+                bx = margin_x + col * box_w
+                by = margin_y + row * box_h
+                box = {
+                    "id": "box-%d" % (idx + 1),
+                    "kind": "room",
+                    "hue_id": room["id"],
+                    "name": bname,
+                    "archetype": arch,
+                    "x": bx,
+                    "y": by,
+                    "w": box_w,
+                    "h": box_h,
+                    "entertainment_area_id": None,
+                }
+                boxes.append(box)
+                if len(stamps) < MAX_FLOORPLAN_STAMPS:
+                    stamps.append({
+                        "id": "st-door-%d" % (idx + 1),
+                        "kind": "door",
+                        "x": round(bx + box_w * 0.5 - 26.0, 1),
+                        "y": round(by + box_h - 26.0, 1),
+                        "w": 52.0,
+                        "h": 52.0,
+                        "rot": 0,
+                    })
+                _place_lamps_in_box(box, room.get("lights"), lamps)
+            rows_used = int(math.ceil(count / float(cols)))
+            c_w = clamp(margin_x * 2.0 + cols * box_w, 1200.0, 4000.0)
+            c_h = clamp(margin_y * 2.0 + rows_used * box_h + 120.0, 860.0, 3000.0)
+    else:
+        bp = _template_blueprints()[template_id]
+        c_w = float(bp["canvas"]["width"])
+        c_h = float(bp["canvas"]["height"])
+        boxes = [dict(b) for b in bp["boxes"]]
+        stamps = [dict(s) for s in bp["stamps"]]
+
+        matched_rooms = set()
+        matched_boxes = set()
+
+        def bind(box_idx, room):
+            matched_boxes.add(box_idx)
+            matched_rooms.add(room["id"])
+            box = boxes[box_idx]
+            box["hue_id"] = room["id"]
+            bname = clean(room.get("name") or "", 40)
+            if bname:
+                box["name"] = bname
+            if room.get("archetype") in HUE_ARCHETYPES:
+                box["archetype"] = room["archetype"]
+            _place_lamps_in_box(box, room.get("lights"), lamps)
+
+        # Pass 1: exact archetype match
+        for bi, box in enumerate(boxes):
+            if bi in matched_boxes:
+                continue
+            for room in bridge_rooms:
+                if room["id"] not in matched_rooms and room.get("archetype") == box["archetype"]:
+                    bind(bi, room)
+                    break
+
+        # Pass 2: multilingual keyword match on room name
+        for bi, box in enumerate(boxes):
+            if bi in matched_boxes:
+                continue
+            for room in bridge_rooms:
+                if room["id"] not in matched_rooms and _room_matches_archetype_keyword(room.get("name"), box["archetype"]):
+                    bind(bi, room)
+                    break
+
+        # Pass 3: archetype alias match (e.g. lounge -> living_room, studio -> office, garden -> terrace)
+        for bi, box in enumerate(boxes):
+            if bi in matched_boxes:
+                continue
+            aliases = _ARCHETYPE_ALIASES.get(box["archetype"], ())
+            for room in bridge_rooms:
+                if room["id"] not in matched_rooms and room.get("archetype") in aliases:
+                    bind(bi, room)
+                    break
+
+        # Pass 4: remaining unmatched Hue rooms -> remaining empty boxes
+        for bi, box in enumerate(boxes):
+            if bi in matched_boxes:
+                continue
+            for room in bridge_rooms:
+                if room["id"] not in matched_rooms:
+                    bind(bi, room)
+                    break
+
+        # Pass 5: overflow Hue rooms beyond template box count -> tidy extra boxes along bottom
+        extra_rooms = [r for r in bridge_rooms if r["id"] not in matched_rooms]
+        if extra_rooms:
+            max_y = max((b["y"] + b["h"] for b in boxes), default=80.0)
+            extra_y = min(max_y + 40.0, 2600.0)
+            extra_w, extra_h = 340.0, 240.0
+            for ei, room in enumerate(extra_rooms):
+                if len(boxes) >= MAX_FLOORPLAN_BOXES:
+                    break
+                bx = clamp(80.0 + ei * (extra_w + 20.0), 0.0, 3600.0)
+                arch = room.get("archetype") if room.get("archetype") in HUE_ARCHETYPES else "other"
+                bname = clean(room.get("name") or "Room", 40) or "Room"
+                box = {
+                    "id": "box-extra-%d" % (ei + 1),
+                    "kind": "room",
+                    "hue_id": room["id"],
+                    "name": bname,
+                    "archetype": arch,
+                    "x": bx,
+                    "y": extra_y,
+                    "w": extra_w,
+                    "h": extra_h,
+                    "entertainment_area_id": None,
+                }
+                boxes.append(box)
+                _place_lamps_in_box(box, room.get("lights"), lamps)
+            c_w = max(c_w, clamp(80.0 + len(extra_rooms) * (extra_w + 20.0) + 80.0, 1200.0, 4000.0))
+            c_h = max(c_h, clamp(extra_y + extra_h + 100.0, 820.0, 3000.0))
+
+    # Place any unassigned ("other") lights neatly outside boxes at the bottom edge
+    if other_group and other_group.get("lights"):
+        max_y = max((b["y"] + b["h"] for b in boxes), default=80.0)
+        loose_y = clamp(max_y + 60.0, 80.0, 2940.0)
+        for oi, light in enumerate(other_group["lights"]):
+            lid = light.get("id")
+            if valid_uuid(lid) and lid not in lamps and len(lamps) < MAX_FLOORPLAN_LAMPS:
+                lamps[lid] = {
+                    "x": round(clamp(120.0 + oi * 70.0, 40.0, 3960.0), 1),
+                    "y": round(loose_y, 1),
+                    "z": 0.0,
+                    "icon": "bulb",
+                }
+        c_h = max(c_h, clamp(loose_y + 80.0, 820.0, 3000.0))
+
+    fp = {
+        "version": FLOORPLAN_VERSION,
+        "bridge_id": clean_bid,
+        "template_id": template_id,
+        "entertainment_id": None,
+        "canvas": {
+            "width": round(c_w, 1),
+            "height": round(c_h, 1),
+            "grid": 20,
+            "snap": True,
+            "zoom": 1.0,
+            "pan_x": 0.0,
+            "pan_y": 0.0,
+        },
+        "show_wires": True,
+        "show_glows": True,
+        "show_furniture": True,
+        "auto_sync": False,
+        "auto_sync_rooms": False,
+        "background": {"path": "", "opacity": 0.35, "fit": "contain"},
+        "boxes": boxes,
+        "stamps": stamps,
+        "lamps": lamps,
+    }
+    return validate_floorplan(fp)
+
+
+def _point_in_box(lx, ly, box):
+    return (box["x"] <= lx <= box["x"] + box["w"]) and (box["y"] <= ly <= box["y"] + box["h"])
+
+
+def compute_room_membership_diffs(floorplan, rooms):
+    """Spatial point-in-box check returning [{light_id, device_id, from_room_id, to_room_id, to_box_id}].
+
+    Each placed lamp whose center lies inside a `kind == 'room'` box linked to a different Hue room
+    (or an unlinked room box) is reported. Overlapping room boxes prefer the smallest area box.
+    """
+    if not isinstance(floorplan, dict) or not isinstance(rooms, list):
+        return []
+    light_info = {}  # light_id -> (device_id, from_room_id)
+    for room in rooms:
+        if not isinstance(room, dict) or room.get("kind") == "zone":
+            continue
+        from_rid = room["id"] if room.get("kind") == "room" and valid_uuid(room.get("id")) else ""
+        for light in room.get("lights") or []:
+            if not isinstance(light, dict) or not valid_uuid(light.get("id")):
+                continue
+            lid = light["id"]
+            if lid not in light_info or (not light_info[lid][1] and from_rid):
+                did = light.get("device_id") if valid_uuid(light.get("device_id")) else ""
+                light_info[lid] = (did, from_rid)
+
+    room_boxes = [
+        b for b in (floorplan.get("boxes") or [])
+        if isinstance(b, dict) and b.get("kind") == "room"
+    ]
+    diffs = []
+    for lid, lpos in sorted((floorplan.get("lamps") or {}).items()):
+        if lid not in light_info or not isinstance(lpos, dict):
+            continue
+        lx, ly = lpos.get("x"), lpos.get("y")
+        if lx is None or ly is None:
+            continue
+        containing = [b for b in room_boxes if _point_in_box(lx, ly, b)]
+        if not containing:
+            continue
+        # Prefer smallest-area containing box; on shared-wall tie keep current Hue room
+        device_id, from_room_id = light_info[lid]
+        target_box = min(containing, key=lambda b: (b["w"] * b["h"], 0 if b.get("hue_id") == from_room_id else 1))
+        to_room_id = target_box.get("hue_id") or ""
+        if to_room_id != from_room_id:
+            diffs.append({
+                "light_id": lid,
+                "device_id": device_id,
+                "from_room_id": from_room_id,
+                "to_room_id": to_room_id,
+                "to_box_id": target_box["id"],
+            })
+    return diffs
+
+
+def compute_entertainment_positions(box, floorplan, rooms=None):
+    """Normalize placed lamps inside `box` to Hue Entertainment coordinates:
+    x in [-1.0, 1.0] (left -> right), y in [0.0, 1.0] (bottom -> top/front TV wall), z in [-1.0, 1.0]."""
+    if not isinstance(box, dict) or not isinstance(floorplan, dict):
+        return []
+    bx, by, bw, bh = box.get("x", 0.0), box.get("y", 0.0), box.get("w", 0.0), box.get("h", 0.0)
+    if bw <= 0 or bh <= 0:
+        return []
+    known_lights = None
+    if isinstance(rooms, list) and rooms:
+        known_lights = {
+            l["id"] for r in rooms if isinstance(r, dict)
+            for l in (r.get("lights") or []) if isinstance(l, dict) and valid_uuid(l.get("id"))
+        }
+    out = []
+    for lid, lpos in sorted((floorplan.get("lamps") or {}).items()):
+        if not valid_uuid(lid) or not isinstance(lpos, dict):
+            continue
+        if known_lights is not None and lid not in known_lights:
+            continue
+        lx, ly = lpos.get("x"), lpos.get("y")
+        if lx is None or ly is None or not _point_in_box(lx, ly, box):
+            continue
+        nx = round(clamp(((lx - bx) / float(bw)) * 2.0 - 1.0, -1.0, 1.0), 4)
+        ny = round(clamp(1.0 - ((ly - by) / float(bh)), 0.0, 1.0), 4)
+        nz = round(clamp(float(lpos.get("z", 0.0)), -1.0, 1.0), 4)
+        out.append({"light_id": lid, "x": nx, "y": ny, "z": nz})
+    return out
+
+
+def _build_entertainment_service_locations(area, positions, light_to_ent_service):
+    """Map normalized `positions` onto CLIP v2 `service_locations` using known entertainment service UUIDs."""
+    area_svc_by_light = {}
+    for loc in area.get("locations") or []:
+        if valid_uuid(loc.get("light_id")) and valid_uuid(loc.get("service_id")):
+            area_svc_by_light[loc["light_id"]] = (loc["service_id"], loc.get("service_type") or "entertainment")
+    service_locations = []
+    seen_svcs = set()
+    for pos in positions:
+        lid = pos["light_id"]
+        if lid in area_svc_by_light:
+            svc_id, svc_type = area_svc_by_light[lid]
+        elif lid in light_to_ent_service:
+            svc_id, svc_type = light_to_ent_service[lid], "entertainment"
+        else:
+            continue
+        if svc_id in seen_svcs:
+            continue
+        seen_svcs.add(svc_id)
+        service_locations.append({
+            "service": {"rid": svc_id, "rtype": svc_type},
+            "positions": [{"x": pos["x"], "y": pos["y"], "z": pos["z"]}],
+        })
+    return service_locations
+
+
+def build_floorplan_sync_calls(floorplan, rooms, entertainment_areas=None, light_to_ent_service=None):
+    """Build ordered CLIP v2 API calls `(method, path, body)` to sync ALL pending floorplan changes:
+    room/zone creations, renames & archetypes, lamp-to-room/zone membership (removing from old room
+    before adding to new room to respect Hue's 1-room-per-device rule), and linked Entertainment areas."""
+    if not isinstance(floorplan, dict) or not isinstance(rooms, list):
+        return []
+    entertainment_areas = entertainment_areas or []
+    light_to_ent_service = light_to_ent_service or {}
+
+    known_rooms = {}  # id -> room dict (kind == "room")
+    known_zones = {}  # id -> room dict (kind == "zone")
+    room_devices = {}  # room_id -> [unique device_ids]
+    light_to_device = {}  # light_id -> device_id
+    light_to_room = {}  # light_id -> room_id
+    for r in rooms:
+        if not isinstance(r, dict):
+            continue
+        kind = r.get("kind")
+        rid = r.get("id")
+        if kind == "room" and valid_uuid(rid):
+            known_rooms[rid] = r
+            devs = []
+            seen_d = set()
+            for l in r.get("lights") or []:
+                lid = l.get("id")
+                did = l.get("device_id") if valid_uuid(l.get("device_id")) else ""
+                if valid_uuid(lid):
+                    light_to_room[lid] = rid
+                    if did:
+                        light_to_device[lid] = did
+                if did and did not in seen_d:
+                    seen_d.add(did)
+                    devs.append(did)
+            room_devices[rid] = devs
+        elif kind == "zone" and valid_uuid(rid):
+            known_zones[rid] = r
+            for l in r.get("lights") or []:
+                lid = l.get("id")
+                did = l.get("device_id") if valid_uuid(l.get("device_id")) else ""
+                if valid_uuid(lid) and did:
+                    light_to_device.setdefault(lid, did)
+        elif kind == "other":
+            for l in r.get("lights") or []:
+                lid = l.get("id")
+                did = l.get("device_id") if valid_uuid(l.get("device_id")) else ""
+                if valid_uuid(lid) and did:
+                    light_to_device.setdefault(lid, did)
+
+    lamps = floorplan.get("lamps") or {}
+    boxes = floorplan.get("boxes") or []
+
+    # 1. Room metadata changes & new room boxes
+    room_meta_updates = {}  # room_id -> {"name": ..., "archetype": ...}
+    new_room_boxes = []
+    for box in boxes:
+        if box.get("kind") != "room":
+            continue
+        hid = box.get("hue_id")
+        if hid is None:
+            new_room_boxes.append(box)
+        elif hid in known_rooms:
+            existing = known_rooms[hid]
+            bname = clean(box.get("name") or "", 32)
+            ename = clean(existing.get("name") or "", 32)
+            barch = box.get("archetype") or "other"
+            earch = existing.get("archetype") or ""
+            meta = {}
+            if bname and bname != ename:
+                meta["name"] = bname
+            if barch in HUE_ARCHETYPES and barch != earch and (earch or barch != "other"):
+                meta["archetype"] = barch
+            if meta:
+                room_meta_updates[hid] = meta
+
+    # 2. Compute device moves between existing rooms and into new room boxes
+    diffs = compute_room_membership_diffs(floorplan, rooms)
+    removals = {}  # from_room_id -> set(device_ids)
+    additions = {}  # to_room_id -> [device_ids]
+    new_box_devices = {}  # box_id -> [device_ids]
+    moved_devices = set()
+    new_box_ids = {b["id"] for b in new_room_boxes}
+
+    for d in diffs:
+        did = d.get("device_id")
+        if not valid_uuid(did) or did in moved_devices:
+            continue
+        from_rid = d.get("from_room_id") or ""
+        to_rid = d.get("to_room_id") or ""
+        to_bid = d.get("to_box_id") or ""
+        if valid_uuid(to_rid) and to_rid in known_rooms:
+            moved_devices.add(did)
+            if valid_uuid(from_rid) and from_rid in known_rooms:
+                removals.setdefault(from_rid, set()).add(did)
+            additions.setdefault(to_rid, []).append(did)
+        elif not to_rid and to_bid in new_box_ids:
+            moved_devices.add(did)
+            if valid_uuid(from_rid) and from_rid in known_rooms:
+                removals.setdefault(from_rid, set()).add(did)
+            new_box_devices.setdefault(to_bid, []).append(did)
+
+    # Also include unassigned ("other") lamps placed inside newly-drawn unlinked room boxes
+    for box in new_room_boxes:
+        for lid, lpos in sorted(lamps.items()):
+            if lid in light_to_room or lid not in light_to_device:
+                continue
+            did = light_to_device[lid]
+            if did in moved_devices:
+                continue
+            if _point_in_box(lpos["x"], lpos["y"], box):
+                moved_devices.add(did)
+                new_box_devices.setdefault(box["id"], []).append(did)
+
+    calls = []
+    meta_emitted_rooms = set()
+
+    # Phase A: Removals from old rooms FIRST (respects Hue 1-room-per-device rule)
+    for rid in sorted(removals):
+        rem = removals[rid]
+        kept = [d for d in room_devices.get(rid, []) if d not in rem]
+        room_devices[rid] = kept
+        body = {"children": [{"rid": d, "rtype": "device"} for d in kept]}
+        if rid in room_meta_updates and rid not in additions:
+            body["metadata"] = room_meta_updates[rid]
+            meta_emitted_rooms.add(rid)
+        calls.append(("PUT", "/clip/v2/resource/room/%s" % rid, body))
+
+    # Phase B1: Additions to existing rooms
+    for rid in sorted(additions):
+        updated = list(room_devices.get(rid, []))
+        for d in additions[rid]:
+            if d not in updated:
+                updated.append(d)
+        room_devices[rid] = updated
+        body = {"children": [{"rid": d, "rtype": "device"} for d in updated]}
+        if rid in room_meta_updates:
+            body["metadata"] = room_meta_updates[rid]
+            meta_emitted_rooms.add(rid)
+        calls.append(("PUT", "/clip/v2/resource/room/%s" % rid, body))
+
+    # Phase B2: New rooms (POST)
+    for box in new_room_boxes:
+        bname = clean(box.get("name") or "", 32)
+        if not bname:
+            continue
+        arch = box.get("archetype") if box.get("archetype") in HUE_ARCHETYPES else "other"
+        devs = new_box_devices.get(box["id"], [])
+        calls.append(("POST", "/clip/v2/resource/room", {
+            "metadata": {"name": bname, "archetype": arch},
+            "children": [{"rid": d, "rtype": "device"} for d in devs],
+        }))
+
+    # Phase B3: Metadata-only updates for existing rooms
+    for rid in sorted(room_meta_updates):
+        if rid not in meta_emitted_rooms:
+            calls.append(("PUT", "/clip/v2/resource/room/%s" % rid, {"metadata": room_meta_updates[rid]}))
+
+    # Phase C: Zones (existing PUT + new POST)
+    all_known_lights = set(light_to_room) | set(light_to_device)
+    for r in rooms:
+        for l in r.get("lights") or []:
+            if valid_uuid(l.get("id")):
+                all_known_lights.add(l["id"])
+
+    for box in boxes:
+        if box.get("kind") != "zone":
+            continue
+        hid = box.get("hue_id")
+        bname = clean(box.get("name") or "", 32)
+        arch = box.get("archetype") if box.get("archetype") in HUE_ARCHETYPES else "other"
+        placed_inside = [
+            lid for lid, lpos in sorted(lamps.items())
+            if lid in all_known_lights and _point_in_box(lpos["x"], lpos["y"], box)
+        ]
+        if hid is None:
+            if not bname:
+                continue
+            calls.append(("POST", "/clip/v2/resource/zone", {
+                "metadata": {"name": bname, "archetype": arch},
+                "children": [{"rid": lid, "rtype": "light"} for lid in placed_inside],
+            }))
+        elif hid in known_zones:
+            existing = known_zones[hid]
+            current_lights = [l["id"] for l in (existing.get("lights") or []) if valid_uuid(l.get("id"))]
+            unplaced_existing = [lid for lid in current_lights if lid not in lamps]
+            desired = []
+            for lid in unplaced_existing + placed_inside:
+                if lid not in desired:
+                    desired.append(lid)
+            body = {}
+            ename = clean(existing.get("name") or "", 32)
+            earch = existing.get("archetype") or ""
+            meta = {}
+            if bname and bname != ename:
+                meta["name"] = bname
+            if arch in HUE_ARCHETYPES and arch != earch and (earch or arch != "other"):
+                meta["archetype"] = arch
+            if meta:
+                body["metadata"] = meta
+            if set(desired) != set(current_lights):
+                body["children"] = [{"rid": lid, "rtype": "light"} for lid in desired]
+            if body:
+                calls.append(("PUT", "/clip/v2/resource/zone/%s" % hid, body))
+
+    # Phase D: Linked Entertainment Areas (per-box `entertainment_area_id` + top-level `entertainment_id`)
+    ent_by_id = {a["id"]: a for a in entertainment_areas if isinstance(a, dict) and valid_uuid(a.get("id"))}
+    synced_ent_ids = set()
+    for box in boxes:
+        aid = box.get("entertainment_area_id")
+        if not valid_uuid(aid) or aid not in ent_by_id or aid in synced_ent_ids:
+            continue
+        positions = compute_entertainment_positions(box, floorplan, rooms)
+        svc_locs = _build_entertainment_service_locations(ent_by_id[aid], positions, light_to_ent_service)
+        if svc_locs:
+            synced_ent_ids.add(aid)
+            calls.append((
+                "PUT",
+                "/clip/v2/resource/entertainment_configuration/%s" % aid,
+                {"locations": {"service_locations": svc_locs}},
+            ))
+
+    top_ent_id = floorplan.get("entertainment_id")
+    if valid_uuid(top_ent_id) and top_ent_id in ent_by_id and top_ent_id not in synced_ent_ids:
+        canvas = floorplan.get("canvas") or {}
+        if len(boxes) == 1:
+            ref_box = boxes[0]
+        else:
+            ref_box = {"x": 0.0, "y": 0.0, "w": float(canvas.get("width", 1600.0)), "h": float(canvas.get("height", 1000.0))}
+        positions = compute_entertainment_positions(ref_box, floorplan, rooms)
+        svc_locs = _build_entertainment_service_locations(ent_by_id[top_ent_id], positions, light_to_ent_service)
+        if svc_locs:
+            synced_ent_ids.add(top_ent_id)
+            calls.append((
+                "PUT",
+                "/clip/v2/resource/entertainment_configuration/%s" % top_ent_id,
+                {"locations": {"service_locations": svc_locs}},
+            ))
+
+    return calls
+
+
 _HANN_CACHE = {}
 
 
@@ -1458,7 +2713,34 @@ def parse_avahi_hue(lines):
     return sorted(found.values(), key=lambda b: b["ip"])
 
 
+def _json_depth_ok(raw, max_depth=32):
+    text = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    depth = 0
+    in_str = False
+    esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            depth += 1
+            if depth > max_depth:
+                return False
+        elif ch in "}]":
+            depth -= 1
+    return True
+
+
 def parse_command(line):
+    if not _json_depth_ok(line):
+        return None
     try:
         cmd = json.loads(line)
     except (ValueError, TypeError, RecursionError):
@@ -1814,6 +3096,160 @@ def claim_local_schedule_bucket(sid, bucket):
         return bool(_with_local_schedules_lock(_claim))
     except (OSError, ValueError):
         return False
+
+
+def _floorplan_path():
+    return os.path.join(CONFIG_DIR, "floorplan.json")
+
+
+def load_floorplan():
+    """Load persisted floorplan from CONFIG_DIR/floorplan.json (rejecting symlinks, FIFOs, >64 KiB)."""
+    path = _floorplan_path()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > MAX_CONFIG:
+            return None
+        raw = os.read(fd, MAX_CONFIG)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    return validate_floorplan(data)
+
+
+def save_floorplan(data):
+    """Validate and atomically write floorplan.json as 0600 via unique temp file, capped at MAX_CONFIG."""
+    validated = validate_floorplan(data)
+    if validated is None:
+        raise ValueError("invalid floorplan")
+    payload = json.dumps(validated, indent=2, allow_nan=False).encode("utf-8")
+    if len(payload) > MAX_CONFIG:
+        raise ValueError("floorplan file exceeds maximum size")
+    directory = private_config_dir()
+    path = _floorplan_path()
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".floorplan.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return validated
+
+
+def clear_floorplan_background():
+    """Remove any managed `floorplan_bg.*` files strictly inside CONFIG_DIR."""
+    try:
+        dir_info = os.lstat(CONFIG_DIR)
+    except OSError:
+        return
+    if not stat.S_ISDIR(dir_info.st_mode) or dir_info.st_uid != os.getuid():
+        return
+    cfg_real = os.path.realpath(CONFIG_DIR)
+    try:
+        entries = os.listdir(CONFIG_DIR)
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.startswith(FLOORPLAN_BG_PREFIX) or "/" in entry or "\\" in entry or ".." in entry:
+            continue
+        full = os.path.join(CONFIG_DIR, entry)
+        if os.path.realpath(os.path.dirname(full)) != cfg_real:
+            continue
+        try:
+            info = os.lstat(full)
+        except OSError:
+            continue
+        if (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)) and info.st_uid == os.getuid():
+            try:
+                os.unlink(full)
+            except OSError:
+                pass
+
+
+def set_floorplan_background(source_path):
+    """Validate a local image file (PNG/JPEG/WEBP, <= 15 MB, non-symlink, valid magic bytes) and
+    atomically copy it (0600) to CONFIG_DIR/floorplan_bg.<ext>, removing any older background file."""
+    if not isinstance(source_path, str) or not source_path or "\x00" in source_path:
+        raise ValueError("invalid background path")
+    if os.path.islink(source_path):
+        raise ValueError("symlinks are not allowed")
+    _, raw_ext = os.path.splitext(source_path.lower())
+    if raw_ext not in FLOORPLAN_BG_EXTS:
+        raise ValueError("unsupported image extension")
+    fd = os.open(source_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("background source is not a regular file")
+        if info.st_size <= 0 or info.st_size > MAX_FLOORPLAN_BG_BYTES:
+            raise ValueError("background image exceeds size limit")
+        chunks = []
+        total = 0
+        while total <= MAX_FLOORPLAN_BG_BYTES:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total <= 0 or total > MAX_FLOORPLAN_BG_BYTES:
+            raise ValueError("background image exceeds size limit")
+        raw_bytes = b"".join(chunks)
+    finally:
+        os.close(fd)
+
+    detected = _detect_image_ext(raw_bytes)
+    expected = ".jpg" if raw_ext == ".jpeg" else raw_ext
+    if detected is None or detected != expected:
+        raise ValueError("invalid image magic bytes")
+
+    directory = private_config_dir()
+    target_name = FLOORPLAN_BG_PREFIX + detected.lstrip(".")
+    target_path = os.path.join(directory, target_name)
+    tfd, tmp = tempfile.mkstemp(dir=directory, prefix=".floorplan_bg.", suffix=".tmp")
+    try:
+        os.fchmod(tfd, 0o600)
+        with os.fdopen(tfd, "wb") as fh:
+            fh.write(raw_bytes)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target_path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+    # Remove any older managed floorplan_bg.* with a different extension
+    for entry in os.listdir(directory):
+        if entry == target_name or not entry.startswith(FLOORPLAN_BG_PREFIX):
+            continue
+        if "/" in entry or "\\" in entry or ".." in entry:
+            continue
+        old_path = os.path.join(directory, entry)
+        try:
+            old_info = os.lstat(old_path)
+            if (stat.S_ISREG(old_info.st_mode) or stat.S_ISLNK(old_info.st_mode)) and old_info.st_uid == os.getuid():
+                os.unlink(old_path)
+        except OSError:
+            pass
+    return target_path
 
 
 # Children the helper started and has not reaped yet: ended when the helper exits or gets SIGTERM.
@@ -2452,6 +3888,9 @@ class Hue:
         self.light_count = 0
         self.on_count = 0
         self.bridge_home_gl = ""
+        self.entertainment_areas = []
+        self._light_to_ent_service = {}
+        self.floorplan = load_floorplan()
         self.custom_themes = load_themes()
         local_sched_data = load_local_schedules()
         self.schedule_mode = local_sched_data["mode"]
@@ -2536,6 +3975,13 @@ class Hue:
         self.error_code = code
         self.error_args = args
 
+    def _ensure_floorplan(self):
+        """Return current floorplan or auto-bootstrap from 'auto_bridge' (call with lock held)."""
+        if self.floorplan is None:
+            bid = self.config.get("bridge_id", "") if self.config else ""
+            self.floorplan = build_floorplan_template("auto_bridge", self.rooms, bridge_id=bid)
+        return self.floorplan
+
     # -- output
     def snapshot(self):
         with self.lock:
@@ -2543,6 +3989,10 @@ class Hue:
             if self.config:
                 bridge = {"ip": self.config.get("ip", ""), "name": self.config.get("name", "Hue Bridge"),
                           "model": self.config.get("model", "")}
+            fp = getattr(self, "floorplan", None)
+            if fp is None and self.rooms:
+                fp = build_floorplan_template("auto_bridge", self.rooms, bridge_id=self.config.get("bridge_id", "") if self.config else "")
+                self.floorplan = fp
             return {
                 "phase": self.phase, "error": self.error, "bridge": bridge,
                 "error_code": self.error_code if self.error else "", "error_args": self.error_args if self.error else [],
@@ -2561,6 +4011,8 @@ class Hue:
                 "rules": getattr(self, "rules", []),
                 "rules_paused": getattr(self, "rules_paused", False),
                 "rule_log": getattr(self, "rule_log", []),
+                "entertainment_areas": getattr(self, "entertainment_areas", []),
+                "floorplan": fp,
             }
 
     def emit(self):
@@ -2641,11 +4093,19 @@ class Hue:
             rooms, total, on = build_model(data["data"])
             bridge_home_gl = extract_bridge_home_gl(data["data"])
             schedules, script_id = parse_schedules(data["data"], rooms)
+            entertainment_areas = parse_entertainment_areas(data["data"])
+            light_to_ent = _extract_light_entertainment_services(data["data"])
             with self.lock:
                 if self.connection_current(generation):
                     if time.time() >= self.refresh_hold_until:
                         self.rooms, self.light_count, self.on_count = rooms, total, on
                     self.bridge_home_gl = bridge_home_gl
+                    self.entertainment_areas = entertainment_areas
+                    self._light_to_ent_service = light_to_ent
+                    if self.floorplan is None and self.rooms:
+                        self.floorplan = build_floorplan_template(
+                            "auto_bridge", self.rooms, bridge_id=config.get("bridge_id", "")
+                        )
                     self.bridge_schedules = schedules
                     self._rebuild_schedules()
                     if script_id:
@@ -2772,6 +4232,9 @@ class Hue:
                     self.conn_generation += 1
                     self.rooms, self.light_count, self.on_count, self.pending = [], 0, 0, {}
                     self.bridge_home_gl, self.bridge_schedules, self.api_queue = "", [], []
+                    self.entertainment_areas, self._light_to_ent_service = [], {}
+                    if self.floorplan and self.floorplan.get("bridge_id") and self.floorplan["bridge_id"] != bridge_id:
+                        self.floorplan = None
                     self._rebuild_schedules()
                     self.config, self.pair_ip, self.phase, self.error = config, "", "connecting", ""
                 self._reset_sse()
@@ -3271,6 +4734,8 @@ class Hue:
                                     light["mirek"] = None
                                 if "effect" in changes:
                                     light["effect"] = changes["effect"]
+                                if "name" in changes:
+                                    light["name"] = changes["name"]
                                 lit = [l for l in room["lights"] if l["on"]]
                                 room["on"], room["on_count"] = bool(lit), len(lit)
                                 room["color"] = blend_colors([l["color"] for l in lit])
@@ -3503,6 +4968,7 @@ class Hue:
                 self.pair_ip = ""
                 self.config, self.rooms, self.light_count, self.on_count = {}, [], 0, 0
                 self.bridge_home_gl, self.bridge_schedules = "", []
+                self.entertainment_areas, self._light_to_ent_service = [], {}
                 self._local_sched_fired = {}
                 self._rebuild_schedules()
                 self.schedule_script_id = DEFAULT_SCHEDULE_SCRIPT_ID
@@ -3846,6 +5312,378 @@ class Hue:
             if fired:
                 self.emit()
                 self.wake.set()
+        elif name == "floorplan_save":
+            fp = validate_floorplan(cmd.get("floorplan"))
+            if fp is None:
+                return
+            with self.lock:
+                if not fp.get("bridge_id") and self.config.get("bridge_id"):
+                    fp["bridge_id"] = self.config["bridge_id"]
+                fp = save_floorplan(fp)
+                self.floorplan = fp
+            self.emit()
+        elif name == "floorplan_template":
+            tid = cmd.get("template_id")
+            if tid not in FLOORPLAN_TEMPLATES:
+                return
+            with self.lock:
+                bid = self.config.get("bridge_id", "") if self.config else ""
+                fp = build_floorplan_template(tid, self.rooms, bridge_id=bid)
+                if fp is None:
+                    return
+                fp = save_floorplan(fp)
+                self.floorplan = fp
+            self.emit()
+        elif name == "floorplan_bg_set":
+            src = cmd.get("path") if "path" in cmd else cmd.get("source_path")
+            raw_opacity = cmd.get("opacity")
+            raw_fit = cmd.get("fit")
+            opacity = None
+            if raw_opacity is not None:
+                opacity = _strict_finite(raw_opacity, 0.05, 1.0)
+                if opacity is None:
+                    return
+            if raw_fit is not None and raw_fit not in FLOORPLAN_BG_FITS:
+                return
+            try:
+                dest_path = set_floorplan_background(src)
+            except (OSError, ValueError):
+                return
+            with self.lock:
+                fp = dict(self._ensure_floorplan())
+                bg = dict(fp.get("background") or {"path": "", "opacity": 0.35, "fit": "contain"})
+                bg["path"] = dest_path
+                if opacity is not None:
+                    bg["opacity"] = round(opacity, 3)
+                if raw_fit is not None:
+                    bg["fit"] = raw_fit
+                fp["background"] = bg
+                fp = save_floorplan(fp)
+                self.floorplan = fp
+            self.emit()
+        elif name == "floorplan_bg_update":
+            has_op = "opacity" in cmd and cmd["opacity"] is not None
+            has_fit = "fit" in cmd and cmd["fit"] is not None
+            if not has_op and not has_fit:
+                return
+            opacity = None
+            if has_op:
+                opacity = _strict_finite(cmd["opacity"], 0.05, 1.0)
+                if opacity is None:
+                    return
+            fit = cmd.get("fit") if has_fit else None
+            if has_fit and fit not in FLOORPLAN_BG_FITS:
+                return
+            with self.lock:
+                fp = dict(self._ensure_floorplan())
+                bg = dict(fp.get("background") or {"path": "", "opacity": 0.35, "fit": "contain"})
+                if opacity is not None:
+                    bg["opacity"] = round(opacity, 3)
+                if fit is not None:
+                    bg["fit"] = fit
+                fp["background"] = bg
+                fp = save_floorplan(fp)
+                self.floorplan = fp
+            self.emit()
+        elif name == "floorplan_bg_clear":
+            with self.lock:
+                clear_floorplan_background()
+                fp = dict(self._ensure_floorplan())
+                bg = dict(fp.get("background") or {"path": "", "opacity": 0.35, "fit": "contain"})
+                bg["path"] = ""
+                fp["background"] = bg
+                fp = save_floorplan(fp)
+                self.floorplan = fp
+            self.emit()
+        elif name == "light_rename" and self.config:
+            lid = cmd.get("id")
+            raw_name = cmd.get("name")
+            if not valid_uuid(lid) or not isinstance(raw_name, str):
+                return
+            new_name = clean(raw_name, 32)
+            if not new_name:
+                return
+            with self.lock:
+                if not self.known("light", lid):
+                    return
+                light = self._find_light(lid)
+                dev_id = light.get("device_id", "") if light else ""
+                needed = 2 if valid_uuid(dev_id) else 1
+                if len(self.api_queue) + needed > MAX_API_QUEUE:
+                    return
+                self.api_queue.append(("PUT", "/clip/v2/resource/light/%s" % lid, {"metadata": {"name": new_name}}))
+                if valid_uuid(dev_id):
+                    self.api_queue.append(("PUT", "/clip/v2/resource/device/%s" % dev_id, {"metadata": {"name": new_name}}))
+                for room in self.rooms:
+                    for item in room["lights"]:
+                        if item["id"] == lid:
+                            item["name"] = new_name
+            self.emit()
+            self.wake.set()
+        elif name == "room_create" and self.config:
+            kind = cmd.get("kind")
+            raw_name = cmd.get("name")
+            if kind not in ("room", "zone") or not isinstance(raw_name, str):
+                return
+            new_name = clean(raw_name, 32)
+            if not new_name:
+                return
+            arch = cmd.get("archetype", "other")
+            if arch is None or arch == "":
+                arch = "other"
+            if not isinstance(arch, str) or arch not in HUE_ARCHETYPES:
+                return
+            raw_ids = cmd.get("device_ids" if kind == "room" else "light_ids", [])
+            if raw_ids is None:
+                raw_ids = []
+            if not isinstance(raw_ids, list) or len(raw_ids) > MAX_GROUP_LIGHTS:
+                return
+            child_ids = []
+            seen_c = set()
+            for cid in raw_ids:
+                if not valid_uuid(cid):
+                    return
+                if cid not in seen_c:
+                    seen_c.add(cid)
+                    child_ids.append(cid)
+            child_rtype = "device" if kind == "room" else "light"
+            payload = {
+                "metadata": {"name": new_name, "archetype": arch},
+                "children": [{"rid": cid, "rtype": child_rtype} for cid in child_ids],
+            }
+            with self.lock:
+                if len(self.api_queue) >= MAX_API_QUEUE:
+                    return
+                self.api_queue.append(("POST", "/clip/v2/resource/%s" % kind, payload))
+            self.wake.set()
+        elif name == "room_update" and self.config:
+            rid = cmd.get("id")
+            kind = cmd.get("kind")
+            if not valid_uuid(rid) or kind not in ("room", "zone"):
+                return
+            payload = {}
+            metadata = {}
+            if "name" in cmd and cmd["name"] is not None:
+                if not isinstance(cmd["name"], str):
+                    return
+                new_name = clean(cmd["name"], 32)
+                if not new_name:
+                    return
+                metadata["name"] = new_name
+            if "archetype" in cmd and cmd["archetype"] is not None:
+                arch = cmd["archetype"]
+                if not isinstance(arch, str) or arch not in HUE_ARCHETYPES:
+                    return
+                metadata["archetype"] = arch
+            if metadata:
+                payload["metadata"] = metadata
+            if "children" in cmd and cmd["children"] is not None:
+                raw_children = cmd["children"]
+                if not isinstance(raw_children, list) or len(raw_children) > MAX_GROUP_LIGHTS:
+                    return
+                child_ids = []
+                seen_c = set()
+                for cid in raw_children:
+                    if not valid_uuid(cid):
+                        return
+                    if cid not in seen_c:
+                        seen_c.add(cid)
+                        child_ids.append(cid)
+                child_rtype = "device" if kind == "room" else "light"
+                payload["children"] = [{"rid": cid, "rtype": child_rtype} for cid in child_ids]
+            if not payload:
+                return
+            with self.lock:
+                if not self.known_target(kind, rid) or len(self.api_queue) >= MAX_API_QUEUE:
+                    return
+                self.api_queue.append(("PUT", "/clip/v2/resource/%s/%s" % (kind, rid), payload))
+                for room in self.rooms:
+                    if room["kind"] == kind and room["id"] == rid:
+                        if "name" in metadata:
+                            room["name"] = metadata["name"]
+                        if "archetype" in metadata:
+                            room["archetype"] = metadata["archetype"]
+                        break
+            self.emit()
+            self.wake.set()
+        elif name == "room_delete" and self.config:
+            rid = cmd.get("id")
+            kind = cmd.get("kind")
+            if not valid_uuid(rid) or kind not in ("room", "zone"):
+                return
+            with self.lock:
+                if not self.known_target(kind, rid) or len(self.api_queue) >= MAX_API_QUEUE:
+                    return
+                self.api_queue.append(("DELETE", "/clip/v2/resource/%s/%s" % (kind, rid), None))
+            self.wake.set()
+        elif name == "scene_create" and self.config:
+            room_id = cmd.get("room_id")
+            raw_name = cmd.get("name")
+            if not valid_uuid(room_id) or not isinstance(raw_name, str):
+                return
+            scene_name = clean(raw_name, 32)
+            if not scene_name:
+                return
+            with self.lock:
+                target_room = next(
+                    (r for r in self.rooms if r["kind"] in ("room", "zone") and r["id"] == room_id),
+                    None,
+                )
+                if target_room is None or not target_room.get("lights") or len(self.api_queue) >= MAX_API_QUEUE:
+                    return
+                actions = []
+                for light in target_room["lights"]:
+                    lid = light.get("id")
+                    if not valid_uuid(lid):
+                        continue
+                    is_on = bool(light.get("on", False))
+                    act = {"on": {"on": is_on}}
+                    if is_on:
+                        if light.get("dimmable", True):
+                            act["dimming"] = {"brightness": round(clamp(float(light.get("bri", 100.0)), 1.0, 100.0), 1)}
+                        if light.get("mirek") is not None and light.get("supports_ct"):
+                            m_min = light.get("mirek_min", 153)
+                            m_max = light.get("mirek_max", 500)
+                            act["color_temperature"] = {
+                                "mirek": int(round(clamp(float(light["mirek"]), float(m_min), float(m_max))))
+                            }
+                        elif light.get("supports_color"):
+                            xy = hex_to_xy(light.get("color"))
+                            if xy is not None:
+                                act["color"] = {"xy": {"x": xy[0], "y": xy[1]}}
+                    actions.append({
+                        "target": {"rid": lid, "rtype": "light"},
+                        "action": act,
+                    })
+                if not actions:
+                    return
+                payload = {
+                    "metadata": {"name": scene_name},
+                    "group": {"rid": room_id, "rtype": target_room["kind"]},
+                    "actions": actions,
+                }
+                self.api_queue.append(("POST", "/clip/v2/resource/scene", payload))
+            self.wake.set()
+        elif name == "floorplan_sync_rooms" and self.config:
+            queued = False
+            with self.lock:
+                if not self.floorplan:
+                    return
+                diffs = compute_room_membership_diffs(self.floorplan, self.rooms)
+                known_rooms = {r["id"]: r for r in self.rooms if r.get("kind") == "room" and valid_uuid(r.get("id"))}
+                room_devices = {}
+                for rid, r in known_rooms.items():
+                    devs = []
+                    seen_d = set()
+                    for l in r.get("lights") or []:
+                        did = l.get("device_id")
+                        if valid_uuid(did) and did not in seen_d:
+                            seen_d.add(did)
+                            devs.append(did)
+                    room_devices[rid] = devs
+                removals = {}
+                additions = {}
+                moved = set()
+                for d in diffs:
+                    did = d.get("device_id")
+                    from_rid = d.get("from_room_id") or ""
+                    to_rid = d.get("to_room_id") or ""
+                    if not valid_uuid(did) or did in moved or not valid_uuid(to_rid) or to_rid not in known_rooms:
+                        continue
+                    if from_rid == to_rid:
+                        continue
+                    moved.add(did)
+                    if valid_uuid(from_rid) and from_rid in known_rooms:
+                        removals.setdefault(from_rid, set()).add(did)
+                    additions.setdefault(to_rid, []).append(did)
+                calls = []
+                # Phase A: Remove moved devices from old rooms FIRST (Hue 1-room-per-device rule)
+                for rid in sorted(removals):
+                    kept = [d for d in room_devices[rid] if d not in removals[rid]]
+                    room_devices[rid] = kept
+                    calls.append((
+                        "PUT",
+                        "/clip/v2/resource/room/%s" % rid,
+                        {"children": [{"rid": d, "rtype": "device"} for d in kept]},
+                    ))
+                # Phase B: Add moved devices to new rooms SECOND
+                for rid in sorted(additions):
+                    updated = list(room_devices[rid])
+                    for d in additions[rid]:
+                        if d not in updated:
+                            updated.append(d)
+                    room_devices[rid] = updated
+                    calls.append((
+                        "PUT",
+                        "/clip/v2/resource/room/%s" % rid,
+                        {"children": [{"rid": d, "rtype": "device"} for d in updated]},
+                    ))
+                if calls and len(self.api_queue) + len(calls) <= MAX_API_QUEUE:
+                    self.api_queue.extend(calls)
+                    queued = True
+            if queued:
+                self.wake.set()
+        elif name == "floorplan_sync_all" and self.config:
+            queued = False
+            meta_updated = False
+            with self.lock:
+                if not self.floorplan:
+                    return
+                calls = build_floorplan_sync_calls(
+                    self.floorplan,
+                    self.rooms,
+                    getattr(self, "entertainment_areas", []),
+                    getattr(self, "_light_to_ent_service", {}),
+                )
+                if calls and len(self.api_queue) + len(calls) <= MAX_API_QUEUE:
+                    self.api_queue.extend(calls)
+                    queued = True
+                    # Optimistically apply room/zone name & archetype updates locally
+                    for box in self.floorplan.get("boxes") or []:
+                        hid = box.get("hue_id")
+                        if not valid_uuid(hid):
+                            continue
+                        for room in self.rooms:
+                            if room["kind"] == box["kind"] and room["id"] == hid:
+                                bname = clean(box.get("name") or "", 32)
+                                if bname and room["name"] != bname:
+                                    room["name"] = bname
+                                    meta_updated = True
+                                barch = box.get("archetype")
+                                if barch in HUE_ARCHETYPES and room.get("archetype") != barch:
+                                    room["archetype"] = barch
+                                    meta_updated = True
+            if meta_updated:
+                self.emit()
+            if queued:
+                self.wake.set()
+        elif name == "entertainment_sync" and self.config:
+            area_id = cmd.get("area_id")
+            box_id = cmd.get("box_id")
+            if not valid_uuid(area_id) or not isinstance(box_id, str) or FLOORPLAN_ID_RE.match(box_id) is None:
+                return
+            queued = False
+            with self.lock:
+                if not self.floorplan or len(self.api_queue) >= MAX_API_QUEUE:
+                    return
+                area = next((a for a in getattr(self, "entertainment_areas", []) if a["id"] == area_id), None)
+                box = next((b for b in (self.floorplan.get("boxes") or []) if b["id"] == box_id), None)
+                if area is None or box is None:
+                    return
+                positions = compute_entertainment_positions(box, self.floorplan, self.rooms)
+                svc_locs = _build_entertainment_service_locations(
+                    area, positions, getattr(self, "_light_to_ent_service", {})
+                )
+                if not svc_locs:
+                    return
+                self.api_queue.append((
+                    "PUT",
+                    "/clip/v2/resource/entertainment_configuration/%s" % area_id,
+                    {"locations": {"service_locations": svc_locs}},
+                ))
+                queued = True
+            if queued:
+                self.wake.set()
 
     # -- loops
     def worker(self):
@@ -3945,6 +5783,75 @@ def main():
         hue.refresh()
         print(json.dumps(hue.snapshot(), indent=1))
         return
+    if len(sys.argv) >= 2 and sys.argv[1] in ("floorplan_bg_set", "floorplan_bg_update", "floorplan_bg_clear"):
+        sub = sys.argv[1]
+        hue = Hue()
+        if sub == "floorplan_bg_set":
+            if len(sys.argv) < 3:
+                sys.stderr.write("usage: hue-lights.py floorplan_bg_set <source_path> [opacity] [fit]\n")
+                sys.exit(2)
+            src = sys.argv[2]
+            opacity = None
+            if len(sys.argv) >= 4:
+                try:
+                    opacity = _strict_finite(float(sys.argv[3]), 0.05, 1.0)
+                except ValueError:
+                    opacity = None
+                if opacity is None:
+                    sys.stderr.write("invalid opacity\n")
+                    sys.exit(2)
+            fit = sys.argv[4] if len(sys.argv) >= 5 else None
+            if fit is not None and fit not in FLOORPLAN_BG_FITS:
+                sys.stderr.write("invalid fit\n")
+                sys.exit(2)
+            try:
+                dest_path = set_floorplan_background(src)
+            except (OSError, ValueError) as exc:
+                sys.stderr.write("%s\n" % clean(str(exc), 120))
+                sys.exit(1)
+            with hue.lock:
+                fp = dict(hue._ensure_floorplan())
+                bg = dict(fp.get("background") or {"path": "", "opacity": 0.35, "fit": "contain"})
+                bg["path"] = dest_path
+                if opacity is not None:
+                    bg["opacity"] = round(opacity, 3)
+                if fit is not None:
+                    bg["fit"] = fit
+                fp["background"] = bg
+                hue.floorplan = save_floorplan(fp)
+            print(json.dumps(hue.floorplan, indent=1))
+            return
+        if sub == "floorplan_bg_update":
+            if len(sys.argv) < 4:
+                sys.stderr.write("usage: hue-lights.py floorplan_bg_update <opacity> <fit>\n")
+                sys.exit(2)
+            try:
+                opacity = _strict_finite(float(sys.argv[2]), 0.05, 1.0)
+            except ValueError:
+                opacity = None
+            fit = sys.argv[3]
+            if opacity is None or fit not in FLOORPLAN_BG_FITS:
+                sys.stderr.write("invalid opacity or fit\n")
+                sys.exit(2)
+            with hue.lock:
+                fp = dict(hue._ensure_floorplan())
+                bg = dict(fp.get("background") or {"path": "", "opacity": 0.35, "fit": "contain"})
+                bg["opacity"] = round(opacity, 3)
+                bg["fit"] = fit
+                fp["background"] = bg
+                hue.floorplan = save_floorplan(fp)
+            print(json.dumps(hue.floorplan, indent=1))
+            return
+        if sub == "floorplan_bg_clear":
+            with hue.lock:
+                clear_floorplan_background()
+                fp = dict(hue._ensure_floorplan())
+                bg = dict(fp.get("background") or {"path": "", "opacity": 0.35, "fit": "contain"})
+                bg["path"] = ""
+                fp["background"] = bg
+                hue.floorplan = save_floorplan(fp)
+            print(json.dumps(hue.floorplan, indent=1))
+            return
     try:
         Hue().run()
     except (KeyboardInterrupt, BrokenPipeError):

@@ -2,10 +2,11 @@
 //! All-On room exclusions, color/warmth/effect presets, schedule/rule draft builders,
 //! formatting helpers, and unit tests.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use cosmic::iced::Color;
 use maprisma_hue_lights::i18n::{tr, trf};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const FAVORITES_KEY: &str = "favorites";
@@ -32,6 +33,7 @@ pub const SYNTH_BANDS: [&str; 4] = ["all", "bass", "mids", "treble"];
 pub enum Tab {
     #[default]
     Lights,
+    Map,
     Schedules,
     Rules,
     Synth,
@@ -486,8 +488,10 @@ pub struct ScheduleDraft {
     pub time: String,         // "HH:MM"
     pub offset_min: i32,
     pub days: HashSet<String>,
-    pub action: String, // "on" | "off"
+    pub action: String, // "on" | "off" | "scene"
     pub bri: u8,
+    pub scene_id: String,
+    pub scene_name: String,
     pub fade_min: u16,
     pub error: Option<String>,
 }
@@ -510,9 +514,33 @@ impl ScheduleDraft {
             days: DAYS_ORDER.iter().map(|d| (*d).to_string()).collect(),
             action: "on".into(),
             bri: 80,
+            scene_id: String::new(),
+            scene_name: String::new(),
             fade_min: 0,
             error: None,
         }
+    }
+
+    pub fn for_scene(
+        target_kind: String,
+        target_id: String,
+        target_name: String,
+        scene_id: String,
+        scene_name: String,
+    ) -> Self {
+        let mut draft = Self::new(Some(TargetOption {
+            kind: target_kind,
+            id: target_id,
+            label: target_name.clone(),
+        }));
+        draft.action = "scene".into();
+        draft.scene_id = scene_id;
+        draft.scene_name = scene_name.clone();
+        if !scene_name.is_empty() {
+            draft.name = format!("{target_name} · {scene_name}");
+        }
+        draft.time = "20:00".into();
+        draft
     }
 
     pub fn to_command(&self) -> Result<Value, String> {
@@ -521,6 +549,9 @@ impl ScheduleDraft {
         }
         if self.trigger_kind == "time" && !valid_hhmm(&self.time) {
             return Err(tr("Invalid time (use HH:MM)"));
+        }
+        if self.action == "scene" && self.scene_id.is_empty() {
+            return Err(tr("Choose a target first"));
         }
         let days: Vec<&str> = DAYS_ORDER
             .iter()
@@ -539,6 +570,7 @@ impl ScheduleDraft {
             self.name.trim().to_string()
         };
         let bri = if self.action == "on" { json!(self.bri.clamp(1, 100)) } else { Value::Null };
+        let scene_id = if self.action == "scene" { self.scene_id.as_str() } else { "" };
         Ok(json!({
             "cmd": "schedule_create",
             "name": name,
@@ -550,7 +582,7 @@ impl ScheduleDraft {
             "days": days,
             "action": self.action,
             "bri": bri,
-            "scene_id": "",
+            "scene_id": scene_id,
             "fade_min": self.fade_min,
         }))
     }
@@ -933,6 +965,543 @@ pub fn synth_target_lights(stats: &Value, room_id: &str) -> Vec<(String, String)
     out
 }
 
+// ------------------------------------------------------------------------- Floorplan Studio & Bridge Sync Model
+
+pub const FLOORPLAN_TEMPLATES: [&str; 6] = [
+    "auto_bridge",
+    "studio_loft",
+    "one_bed_apt",
+    "three_room_apt",
+    "family_house",
+    "desk_studio",
+];
+
+pub const FLOORPLAN_STAMP_KINDS: [&str; 8] = [
+    "door", "window", "sofa", "tv", "desk", "bed", "dining", "kitchen",
+];
+
+pub const LAMP_ICONS: [&str; 12] = [
+    "bulb", "spot", "strip", "floor", "table", "pendant",
+    "ceiling", "wall", "bar", "desk", "outdoor", "candle",
+];
+
+pub const FLOORPLAN_ARCHETYPES: [&str; 18] = [
+    "living_room", "bedroom", "kitchen", "dining", "office", "bathroom",
+    "hallway", "balcony", "terrace", "kids_bedroom", "toilet", "lounge",
+    "tv", "reading", "studio", "garage", "garden", "other",
+];
+
+fn default_version() -> u32 { 1 }
+fn default_template_id() -> String { "auto_bridge".to_string() }
+fn default_true() -> bool { true }
+fn default_canvas_w() -> f64 { 1600.0 }
+fn default_canvas_h() -> f64 { 1000.0 }
+fn default_grid() -> i32 { 20 }
+fn default_zoom() -> f64 { 1.0 }
+fn default_bg_opacity() -> f64 { 0.35 }
+fn default_bg_fit() -> String { "contain".to_string() }
+fn default_box_kind() -> String { "room".to_string() }
+fn default_archetype() -> String { "other".to_string() }
+pub fn default_lamp_icon() -> String { "bulb".to_string() }
+
+pub fn normalize_lamp_icon(icon: &str) -> &'static str {
+    let mapped = match icon {
+        "floor_lamp" => "floor",
+        "table_lamp" => "table",
+        "desk_lamp" => "desk",
+        "wall_lamp" => "wall",
+        "ceiling_lamp" => "ceiling",
+        "pendant_lamp" => "pendant",
+        "lightstrip" => "strip",
+        "spotlight" => "spot",
+        other => other,
+    };
+    LAMP_ICONS.iter().find(|k| **k == mapped).copied().unwrap_or("bulb")
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FloorplanCanvas {
+    #[serde(default = "default_canvas_w")]
+    pub width: f64,
+    #[serde(default = "default_canvas_h")]
+    pub height: f64,
+    #[serde(default = "default_grid")]
+    pub grid: i32,
+    #[serde(default = "default_true")]
+    pub snap: bool,
+    #[serde(default = "default_zoom")]
+    pub zoom: f64,
+    #[serde(default)]
+    pub pan_x: f64,
+    #[serde(default)]
+    pub pan_y: f64,
+}
+
+impl Default for FloorplanCanvas {
+    fn default() -> Self {
+        Self {
+            width: 1600.0,
+            height: 1000.0,
+            grid: 20,
+            snap: true,
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FloorplanBackground {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default = "default_bg_opacity")]
+    pub opacity: f64,
+    #[serde(default = "default_bg_fit")]
+    pub fit: String,
+}
+
+impl Default for FloorplanBackground {
+    fn default() -> Self {
+        Self { path: String::new(), opacity: 0.35, fit: "contain".to_string() }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FloorplanBox {
+    pub id: String,
+    #[serde(default = "default_box_kind")]
+    pub kind: String, // "room" | "zone"
+    #[serde(default)]
+    pub hue_id: Option<String>,
+    pub name: String,
+    #[serde(default = "default_archetype")]
+    pub archetype: String,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    #[serde(default)]
+    pub entertainment_area_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FloorplanStamp {
+    pub id: String,
+    pub kind: String,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    #[serde(default)]
+    pub rot: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FloorplanLamp {
+    pub x: f64,
+    pub y: f64,
+    #[serde(default)]
+    pub z: f64,
+    #[serde(default = "default_lamp_icon")]
+    pub icon: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FloorplanDocument {
+    #[serde(default = "default_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub bridge_id: String,
+    #[serde(default = "default_template_id")]
+    pub template_id: String,
+    #[serde(default)]
+    pub entertainment_id: Option<String>,
+    #[serde(default)]
+    pub canvas: FloorplanCanvas,
+    #[serde(default = "default_true")]
+    pub show_wires: bool,
+    #[serde(default = "default_true")]
+    pub show_glows: bool,
+    #[serde(default = "default_true")]
+    pub show_furniture: bool,
+    #[serde(default)]
+    pub auto_sync: bool,
+    #[serde(default)]
+    pub auto_sync_rooms: bool,
+    #[serde(default)]
+    pub background: FloorplanBackground,
+    #[serde(default)]
+    pub boxes: Vec<FloorplanBox>,
+    #[serde(default)]
+    pub stamps: Vec<FloorplanStamp>,
+    #[serde(default)]
+    pub lamps: BTreeMap<String, FloorplanLamp>,
+}
+
+impl Default for FloorplanDocument {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            bridge_id: String::new(),
+            template_id: "auto_bridge".to_string(),
+            entertainment_id: None,
+            canvas: FloorplanCanvas::default(),
+            show_wires: true,
+            show_glows: true,
+            show_furniture: true,
+            auto_sync: false,
+            auto_sync_rooms: false,
+            background: FloorplanBackground::default(),
+            boxes: Vec::new(),
+            stamps: Vec::new(),
+            lamps: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntertainmentLocation {
+    #[serde(default)]
+    pub service_id: String,
+    #[serde(default)]
+    pub service_type: String,
+    #[serde(default)]
+    pub light_id: String,
+    #[serde(default)]
+    pub x: f64,
+    #[serde(default)]
+    pub y: f64,
+    #[serde(default)]
+    pub z: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntertainmentArea {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub configuration_type: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub locations: Vec<EntertainmentLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BridgeLightInfo {
+    pub id: String,
+    pub device_id: String,
+    pub name: String,
+    pub on: bool,
+    pub bri: f64,
+    pub color: String,
+    pub reachable: bool,
+    pub room_id: String,
+    pub room_name: String,
+}
+
+pub fn parse_floorplan(stats: &Value) -> Option<FloorplanDocument> {
+    let raw = stats.get("floorplan")?;
+    if !raw.is_object() {
+        return None;
+    }
+    let mut doc: FloorplanDocument = serde_json::from_value(raw.clone()).ok()?;
+    for lamp in doc.lamps.values_mut() {
+        lamp.icon = normalize_lamp_icon(&lamp.icon).to_string();
+    }
+    if doc.background.fit != "cover" {
+        doc.background.fit = "contain".to_string();
+    }
+    doc.background.opacity = doc.background.opacity.clamp(0.05, 1.0);
+    Some(doc)
+}
+
+pub fn parse_entertainment_areas(stats: &Value) -> Vec<EntertainmentArea> {
+    let Some(arr) = stats.get("entertainment_areas").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|item| serde_json::from_value::<EntertainmentArea>(item.clone()).ok())
+        .filter(|a| !a.id.is_empty())
+        .collect()
+}
+
+/// Extracts every unique light from `stats["rooms"]` (preferring room ownership over zone/other),
+/// preserving `device_id` for Bridge 1-room-per-device sync checks.
+pub fn extract_bridge_lights(stats: &Value) -> Vec<BridgeLightInfo> {
+    let mut by_id: BTreeMap<String, BridgeLightInfo> = BTreeMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for room in j_list(stats, "rooms") {
+        let rkind = j_str(room, "kind");
+        let rid = if rkind == "room" { j_str(room, "id") } else { "" };
+        let rname = if rkind == "other" {
+            tr("Other lights")
+        } else {
+            j_str(room, "name").to_string()
+        };
+        for light in j_list(room, "lights") {
+            let lid = j_str(light, "id");
+            if lid.is_empty() {
+                continue;
+            }
+            let dev_id = j_str(light, "device_id").to_string();
+            let info = BridgeLightInfo {
+                id: lid.to_string(),
+                device_id: dev_id,
+                name: j_str(light, "name").to_string(),
+                on: j_bool(light, "on"),
+                bri: light.get("bri").and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(0.0),
+                color: j_str(light, "color").to_string(),
+                reachable: light.get("reachable").and_then(Value::as_bool) != Some(false),
+                room_id: rid.to_string(),
+                room_name: if rkind == "zone" { String::new() } else { rname.clone() },
+            };
+            match by_id.get_mut(lid) {
+                Some(existing) => {
+                    if existing.room_id.is_empty() && !info.room_id.is_empty() {
+                        existing.room_id = info.room_id;
+                        existing.room_name = info.room_name;
+                    }
+                    if existing.device_id.is_empty() && !info.device_id.is_empty() {
+                        existing.device_id = info.device_id;
+                    }
+                }
+                None => {
+                    order.push(lid.to_string());
+                    by_id.insert(lid.to_string(), info);
+                }
+            }
+        }
+    }
+    order.into_iter().filter_map(|id| by_id.remove(&id)).collect()
+}
+
+/// Returns a compact schedule badge (e.g. `"⏰ 20:00"` or `"⏰"`) if the room/zone has an active schedule.
+pub fn room_active_schedule_badge(stats: &Value, hue_id: &str) -> Option<String> {
+    if hue_id.is_empty() {
+        return None;
+    }
+    for sch in j_list(stats, "schedules") {
+        if !j_bool(sch, "enabled") || j_str(sch, "target_id") != hue_id {
+            continue;
+        }
+        if !matches!(j_str(sch, "target_kind"), "room" | "zone") {
+            continue;
+        }
+        let kind = j_str(sch, "trigger_kind");
+        let label = match kind {
+            "sunrise" => format!("⏰ {}", tr("Sunrise")),
+            "sunset" => format!("⏰ {}", tr("Sunset")),
+            _ => {
+                let t = j_str(sch, "time");
+                if t.is_empty() { "⏰".to_string() } else { format!("⏰ {t}") }
+            }
+        };
+        return Some(label);
+    }
+    None
+}
+
+// ------------------------------------------------------------------------- Bridge IPC command builders
+
+pub fn cmd_floorplan_save(doc: &FloorplanDocument) -> Value {
+    let mut normalized = doc.clone();
+    normalized.auto_sync_rooms = normalized.auto_sync;
+    json!({
+        "cmd": "floorplan_save",
+        "floorplan": serde_json::to_value(&normalized).unwrap_or(Value::Null),
+    })
+}
+
+pub fn cmd_floorplan_template(template_id: &str) -> Value {
+    json!({ "cmd": "floorplan_template", "template_id": template_id })
+}
+
+pub fn cmd_floorplan_bg_set(path: &str, opacity: f64, fit: &str) -> Value {
+    json!({
+        "cmd": "floorplan_bg_set",
+        "path": path,
+        "opacity": opacity.clamp(0.05, 1.0),
+        "fit": if fit == "cover" { "cover" } else { "contain" },
+    })
+}
+
+pub fn cmd_floorplan_bg_update(opacity: f64, fit: &str) -> Value {
+    json!({
+        "cmd": "floorplan_bg_update",
+        "opacity": opacity.clamp(0.05, 1.0),
+        "fit": if fit == "cover" { "cover" } else { "contain" },
+    })
+}
+
+pub fn cmd_floorplan_bg_clear() -> Value {
+    json!({ "cmd": "floorplan_bg_clear" })
+}
+
+pub fn cmd_light_rename(id: &str, name: &str) -> Value {
+    json!({ "cmd": "light_rename", "id": id, "name": name })
+}
+
+#[allow(dead_code)]
+pub fn cmd_room_create(kind: &str, name: &str, archetype: &str, child_ids: &[String]) -> Value {
+    let key = if kind == "zone" { "light_ids" } else { "device_ids" };
+    json!({
+        "cmd": "room_create",
+        "kind": if kind == "zone" { "zone" } else { "room" },
+        "name": name,
+        "archetype": archetype,
+        key: child_ids,
+    })
+}
+
+pub fn cmd_room_update(
+    id: &str,
+    kind: &str,
+    name: Option<&str>,
+    archetype: Option<&str>,
+    children: Option<&[String]>,
+) -> Value {
+    let mut obj = json!({
+        "cmd": "room_update",
+        "id": id,
+        "kind": if kind == "zone" { "zone" } else { "room" },
+    });
+    if let Some(n) = name {
+        obj["name"] = json!(n);
+    }
+    if let Some(a) = archetype {
+        obj["archetype"] = json!(a);
+    }
+    if let Some(c) = children {
+        obj["children"] = json!(c);
+    }
+    obj
+}
+
+pub fn cmd_room_delete(id: &str, kind: &str) -> Value {
+    json!({
+        "cmd": "room_delete",
+        "id": id,
+        "kind": if kind == "zone" { "zone" } else { "room" },
+    })
+}
+
+pub fn cmd_scene_create(room_id: &str, name: &str) -> Value {
+    json!({ "cmd": "scene_create", "room_id": room_id, "name": name })
+}
+
+pub fn cmd_floorplan_sync_rooms() -> Value {
+    json!({ "cmd": "floorplan_sync_rooms" })
+}
+
+pub fn cmd_floorplan_sync_all() -> Value {
+    json!({ "cmd": "floorplan_sync_all" })
+}
+
+pub fn cmd_entertainment_sync(area_id: &str, box_id: &str) -> Value {
+    json!({ "cmd": "entertainment_sync", "area_id": area_id, "box_id": box_id })
+}
+
+// ------------------------------------------------------------------------- Floorplan localization labels
+
+pub fn template_label(id: &str) -> String {
+    match id {
+        "studio_loft" => tr("Studio / Loft"),
+        "one_bed_apt" => tr("1-Bedroom Apartment"),
+        "three_room_apt" => tr("3-Room Apartment"),
+        "family_house" => tr("Family House + Terrace"),
+        "desk_studio" => tr("Desk / Gaming Studio"),
+        _ => tr("Auto from Hue Bridge"),
+    }
+}
+
+pub fn stamp_kind_label(kind: &str) -> String {
+    match kind {
+        "door" => tr("Door"),
+        "window" => tr("Window"),
+        "sofa" => tr("Sofa"),
+        "tv" => tr("TV"),
+        "desk" => tr("Desk"),
+        "bed" => tr("Bed"),
+        "dining" => tr("Dining table"),
+        "kitchen" => tr("Kitchen counter"),
+        other => other.to_string(),
+    }
+}
+
+pub fn lamp_icon_label(icon: &str) -> String {
+    match normalize_lamp_icon(icon) {
+        "spot" => tr("Spotlight"),
+        "strip" => tr("Lightstrip"),
+        "floor" => tr("Floor lamp"),
+        "table" => tr("Table lamp"),
+        "pendant" => tr("Pendant"),
+        "ceiling" => tr("Ceiling"),
+        "wall" => tr("Wall sconce"),
+        "bar" => tr("Play bar"),
+        "desk" => tr("Desk lamp"),
+        "outdoor" => tr("Outdoor"),
+        "candle" => tr("Candle"),
+        _ => tr("Bulb"),
+    }
+}
+
+pub fn lamp_icon_glyph(icon: &str) -> &'static str {
+    match normalize_lamp_icon(icon) {
+        "spot" => "◎",
+        "strip" => "═",
+        "floor" => "⌅",
+        "table" => "⏅",
+        "pendant" => "⏚",
+        "ceiling" => "◠",
+        "wall" => "◧",
+        "bar" => "▬",
+        "desk" => "⌙",
+        "outdoor" => "☀",
+        "candle" => "▲",
+        _ => "◉",
+    }
+}
+
+pub fn archetype_label(arch: &str) -> String {
+    match arch {
+        "living_room" => tr("Living Room"),
+        "bedroom" => tr("Bedroom"),
+        "kitchen" => tr("Kitchen"),
+        "dining" => tr("Dining"),
+        "office" => tr("Office"),
+        "bathroom" => tr("Bathroom"),
+        "hallway" => tr("Hallway"),
+        "balcony" => tr("Balcony"),
+        "terrace" => tr("Terrace"),
+        "kids_bedroom" => tr("Kids Bedroom"),
+        "toilet" => tr("Toilet"),
+        "lounge" => tr("Lounge"),
+        "tv" => tr("TV"),
+        "reading" => tr("Reading"),
+        "studio" => tr("Studio"),
+        "garage" => tr("Garage"),
+        "garden" => tr("Garden"),
+        _ => tr("Other"),
+    }
+}
+
+pub fn archetype_glyph(arch: &str) -> &'static str {
+    match arch {
+        "living_room" | "lounge" | "tv" => "▢",
+        "bedroom" | "kids_bedroom" | "guest_room" | "nursery" => "☾",
+        "kitchen" | "dining" => "◈",
+        "office" | "computer" | "studio" | "reading" => "⌘",
+        "bathroom" | "toilet" => "◎",
+        "balcony" | "terrace" | "garden" | "porch" => "✿",
+        "hallway" | "staircase" => "⇄",
+        "garage" | "carport" => "⌂",
+        _ => "◇",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1202,5 +1771,98 @@ mod tests {
         assert_eq!(r1, vec![("l1".into(), "Desk".into()), ("l2".into(), "Floor".into())]);
         let missing = synth_target_lights(&stats, "r999");
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn floorplan_deserialization_icons_and_ipc_commands() {
+        let stats = json!({
+            "rooms": [{
+                "id": "11111111-1111-1111-1111-111111111111",
+                "kind": "room",
+                "name": "Living Room",
+                "lights": [{
+                    "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    "device_id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+                    "name": "Arc Lamp",
+                    "on": true,
+                    "bri": 85.0,
+                    "color": "#ff7a3c",
+                    "reachable": true
+                }]
+            }],
+            "entertainment_areas": [{
+                "id": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+                "name": "TV Sync",
+                "configuration_type": "screen",
+                "status": "inactive",
+                "locations": [{"service_id": "1234", "service_type": "entertainment", "light_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "x": -0.5, "y": 0.8, "z": 0.0}]
+            }],
+            "floorplan": {
+                "version": 1,
+                "bridge_id": "001788FFFE123456",
+                "template_id": "family_house",
+                "auto_sync": true,
+                "background": {"path": "/tmp/bg.png", "opacity": 0.4, "fit": "cover"},
+                "boxes": [{
+                    "id": "box-1", "kind": "room", "hue_id": "11111111-1111-1111-1111-111111111111",
+                    "name": "Living Room", "archetype": "living_room", "x": 80.0, "y": 80.0, "w": 420.0, "h": 300.0
+                }],
+                "stamps": [{"id": "st-1", "kind": "sofa", "x": 150.0, "y": 200.0, "w": 160.0, "h": 70.0, "rot": 90}],
+                "lamps": {
+                    "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa": {"x": 160.0, "y": 140.0, "z": 0.25, "icon": "pendant"},
+                    "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb": {"x": 200.0, "y": 180.0}
+                }
+            }
+        });
+
+        let doc = parse_floorplan(&stats).expect("floorplan should deserialize");
+        assert_eq!(doc.template_id, "family_house");
+        assert!(doc.auto_sync);
+        assert_eq!(doc.background.fit, "cover");
+        assert_eq!(doc.boxes.len(), 1);
+        assert_eq!(doc.stamps.len(), 1);
+        assert_eq!(doc.lamps["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"].icon, "pendant");
+        // Missing icon defaults to "bulb"
+        assert_eq!(doc.lamps["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"].icon, "bulb");
+
+        let ent = parse_entertainment_areas(&stats);
+        assert_eq!(ent.len(), 1);
+        assert_eq!(ent[0].name, "TV Sync");
+
+        let lights = extract_bridge_lights(&stats);
+        assert_eq!(lights.len(), 1);
+        assert_eq!(lights[0].device_id, "dddddddd-dddd-dddd-dddd-dddddddddddd");
+
+        // All 12 lamp icons normalize & have labels/glyphs
+        assert_eq!(LAMP_ICONS.len(), 12);
+        for ic in LAMP_ICONS {
+            assert_eq!(normalize_lamp_icon(ic), ic);
+            assert!(!lamp_icon_label(ic).is_empty());
+            assert!(!lamp_icon_glyph(ic).is_empty());
+        }
+        assert_eq!(normalize_lamp_icon("floor_lamp"), "floor");
+        assert_eq!(normalize_lamp_icon("bogus"), "bulb");
+
+        // IPC builders match hue-lights.py command names
+        assert_eq!(cmd_floorplan_save(&doc)["cmd"], "floorplan_save");
+        assert_eq!(cmd_floorplan_template("studio_loft")["cmd"], "floorplan_template");
+        assert_eq!(cmd_floorplan_bg_set("/a.png", 0.5, "contain")["cmd"], "floorplan_bg_set");
+        assert_eq!(cmd_floorplan_bg_update(0.5, "cover")["cmd"], "floorplan_bg_update");
+        assert_eq!(cmd_floorplan_bg_clear()["cmd"], "floorplan_bg_clear");
+        assert_eq!(cmd_light_rename("l1", "Arc")["cmd"], "light_rename");
+        assert_eq!(cmd_room_create("room", "Office", "office", &["d1".into()])["device_ids"][0], "d1");
+        assert_eq!(cmd_room_create("zone", "Downstairs", "other", &["l1".into()])["light_ids"][0], "l1");
+        assert_eq!(cmd_room_update("r1", "room", Some("New"), None, None)["cmd"], "room_update");
+        assert_eq!(cmd_room_delete("r1", "room")["cmd"], "room_delete");
+        assert_eq!(cmd_scene_create("r1", "Sunset")["cmd"], "scene_create");
+        assert_eq!(cmd_floorplan_sync_rooms()["cmd"], "floorplan_sync_rooms");
+        assert_eq!(cmd_floorplan_sync_all()["cmd"], "floorplan_sync_all");
+        assert_eq!(cmd_entertainment_sync("e1", "box-1")["cmd"], "entertainment_sync");
+
+        // Scene schedule draft
+        let sd = ScheduleDraft::for_scene("room".into(), "r1".into(), "Living".into(), "sc1".into(), "Sunset".into());
+        let scmd = sd.to_command().unwrap();
+        assert_eq!(scmd["action"], "scene");
+        assert_eq!(scmd["scene_id"], "sc1");
     }
 }

@@ -1254,5 +1254,557 @@ class AudioSynthTests(Base):
             h.synth.stop(emit=False)
 
 
+D1 = "aaaa1111-1111-1111-1111-111111111111"
+D2 = "aaaa2222-2222-2222-2222-222222222222"
+D3 = "aaaa3333-3333-3333-3333-333333333333"
+D4 = "aaaa4444-4444-4444-4444-444444444444"
+ENT_AREA1 = "eeeeeeee-aaaa-1111-1111-111111111111"
+ENT_SVC1 = "eeeeeeee-1111-1111-1111-111111111111"
+ENT_SVC2 = "eeeeeeee-2222-2222-2222-222222222222"
+ENT_SVC3 = "eeeeeeee-3333-3333-3333-333333333333"
+
+MINIMAL_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + b"\x00" * 16
+MINIMAL_JPG = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+MINIMAL_WEBP = b"RIFF\x14\x00\x00\x00WEBPVP8 \x08\x00\x00\x00\x00\x00\x00\x00"
+
+
+def sample_floorplan_resources():
+    """Rich CLIP v2 resources with devices, entertainment services & entertainment_configuration."""
+    return [
+        {
+            "id": D1, "type": "device",
+            "services": [{"rid": L1, "rtype": "light"}, {"rid": ENT_SVC1, "rtype": "entertainment"}],
+        },
+        {
+            "id": D2, "type": "device",
+            "services": [{"rid": L2, "rtype": "light"}, {"rid": ENT_SVC2, "rtype": "entertainment"}],
+        },
+        {
+            "id": D3, "type": "device",
+            "services": [{"rid": L3, "rtype": "light"}, {"rid": ENT_SVC3, "rtype": "entertainment"}],
+        },
+        {"id": D4, "type": "device", "services": [{"rid": L4, "rtype": "light"}]},
+        {"id": ENT_SVC1, "type": "entertainment", "owner": {"rid": D1, "rtype": "device"}},
+        {"id": ENT_SVC2, "type": "entertainment", "owner": {"rid": D2, "rtype": "device"}},
+        {"id": ENT_SVC3, "type": "entertainment", "owner": {"rid": D3, "rtype": "device"}},
+        {
+            "id": L1, "type": "light", "owner": {"rid": D1, "rtype": "device"},
+            "metadata": {"name": "Desk Lamp"},
+            "on": {"on": True}, "dimming": {"brightness": 80.0},
+            "color_temperature": {"mirek": 280, "mirek_valid": True, "mirek_schema": {"mirek_minimum": 153, "mirek_maximum": 454}},
+            "color": {"xy": {"x": 0.4, "y": 0.4}},
+        },
+        {
+            "id": L2, "type": "light", "owner": {"rid": D2, "rtype": "device"},
+            "metadata": {"name": "Floor Lamp"},
+            "on": {"on": True}, "dimming": {"brightness": 65.0},
+            "color": {"xy": {"x": 0.65, "y": 0.32}},
+        },
+        {
+            "id": L3, "type": "light",  # omit owner to also test reverse device->light fallback
+            "metadata": {"name": "Bedside"},
+            "on": {"on": False}, "dimming": {"brightness": 40.0},
+        },
+        {
+            "id": L4, "type": "light", "owner": {"rid": D4, "rtype": "device"},
+            "metadata": {"name": "Loose Lamp"},
+            "on": {"on": False}, "dimming": {"brightness": 100.0},
+        },
+        {"id": GL1, "type": "grouped_light", "on": {"on": True}, "dimming": {"brightness": 72.5}},
+        {"id": GL2, "type": "grouped_light", "on": {"on": False}, "dimming": {"brightness": 40.0}},
+        {
+            "id": R1, "type": "room", "metadata": {"name": "Wohnzimmer", "archetype": "living_room"},
+            "children": [{"rid": D1, "rtype": "device"}, {"rid": D2, "rtype": "device"}],
+            "services": [{"rid": GL1, "rtype": "grouped_light"}],
+        },
+        {
+            "id": R2, "type": "room", "metadata": {"name": "Schlafzimmer", "archetype": "bedroom"},
+            "children": [{"rid": D3, "rtype": "device"}],
+            "services": [{"rid": GL2, "rtype": "grouped_light"}],
+        },
+        {
+            "id": Z1, "type": "zone", "metadata": {"name": "Evening Zone", "archetype": "lounge"},
+            "children": [{"rid": L1, "rtype": "light"}, {"rid": L3, "rtype": "light"}],
+        },
+        {
+            "id": ENT_AREA1, "type": "entertainment_configuration",
+            "metadata": {"name": "<b>TV Area</b>"},
+            "channels": [{
+                "channel_id": 0,
+                "position": {"x": -0.5, "y": 0.8, "z": 0.2},
+                "members": [{"service": {"rid": ENT_SVC1, "rtype": "entertainment"}, "index": 0}],
+            }],
+            "locations": {
+                "service_locations": [
+                    {"service": {"rid": ENT_SVC1, "rtype": "entertainment"}, "positions": [{"x": -0.5, "y": 0.8, "z": 0.2}]},
+                    {"service": {"rid": ENT_SVC2, "rtype": "entertainment"}, "position": {"x": 0.5, "y": 0.4, "z": -0.1}},
+                ]
+            },
+        },
+    ]
+
+
+class FloorplanAndBridgeSyncTests(Base):
+    def test_device_id_and_entertainment_areas_in_model_and_snapshot(self):
+        res = sample_floorplan_resources()
+        rooms, total, on = hue.build_model(res)
+        self.assertEqual((total, on), (4, 2))
+        living = next(r for r in rooms if r["id"] == R1)
+        bed = next(r for r in rooms if r["id"] == R2)
+        desk = next(l for l in living["lights"] if l["id"] == L1)
+        bedside = next(l for l in bed["lights"] if l["id"] == L3)
+        self.assertEqual(desk["device_id"], D1)
+        # L3 had no owner field -> resolved via device.services reverse map
+        self.assertEqual(bedside["device_id"], D3)
+
+        areas = hue.parse_entertainment_areas(res)
+        self.assertEqual(len(areas), 1)
+        self.assertEqual(areas[0]["id"], ENT_AREA1)
+        self.assertEqual(areas[0]["name"], "bTV Area/b")
+        self.assertEqual(len(areas[0]["channels"]), 1)
+        self.assertEqual(len(areas[0]["locations"]), 2)
+        loc_by_light = {loc["light_id"]: loc for loc in areas[0]["locations"]}
+        self.assertEqual(loc_by_light[L1]["service_id"], ENT_SVC1)
+        self.assertEqual((loc_by_light[L1]["x"], loc_by_light[L1]["y"], loc_by_light[L1]["z"]), (-0.5, 0.8, 0.2))
+        self.assertEqual(loc_by_light[L2]["service_id"], ENT_SVC2)
+
+        h = self.make_hue(res)
+        snap = h.snapshot()
+        self.assertEqual(len(snap["entertainment_areas"]), 1)
+        # Auto-bootstrapped from auto_bridge when no saved floorplan exists
+        self.assertIsNotNone(snap["floorplan"])
+        self.assertEqual(snap["floorplan"]["template_id"], "auto_bridge")
+        self.assertEqual(len(snap["floorplan"]["boxes"]), 2)
+        self.assertEqual(hue.compute_room_membership_diffs(snap["floorplan"], h.rooms), [])
+
+    def test_all_six_templates_and_hue_room_auto_matching(self):
+        rooms, _, _ = hue.build_model(sample_floorplan_resources())
+        # Also test multilingual keyword matching when archetype is empty
+        rooms_no_arch = [dict(r, archetype="") for r in rooms]
+        for tid in hue.FLOORPLAN_TEMPLATES:
+            fp = hue.build_floorplan_template(tid, rooms, bridge_id=BRIDGE_ID)
+            self.assertIsNotNone(fp, tid)
+            self.assertEqual(fp["template_id"], tid)
+            self.assertEqual(fp["bridge_id"], BRIDGE_ID)
+            self.assertIsNotNone(hue.validate_floorplan(fp), tid)
+            self.assertGreaterEqual(len(fp["boxes"]), 1, tid)
+            self.assertGreaterEqual(len(fp["stamps"]), 1, tid)
+            # All 4 lights placed, and all room lights sit inside their matched room box (0 diffs!)
+            self.assertEqual(set(fp["lamps"].keys()), {L1, L2, L3, L4}, tid)
+            self.assertEqual(hue.compute_room_membership_diffs(fp, rooms), [], tid)
+
+        # Multilingual German room names auto-match right boxes even without archetypes
+        fp_house = hue.build_floorplan_template("one_bed_apt", rooms_no_arch, bridge_id=BRIDGE_ID)
+        box_by_hue = {b["hue_id"]: b for b in fp_house["boxes"] if b["hue_id"]}
+        self.assertEqual(box_by_hue[R1]["id"], "box-living")
+        self.assertEqual(box_by_hue[R2]["id"], "box-bedroom")
+        self.assertIsNone(hue.build_floorplan_template("nonexistent_template", rooms))
+
+    def test_validate_floorplan_rejects_hostile_inputs_and_hardens_persistence(self):
+        rooms, _, _ = hue.build_model(sample_floorplan_resources())
+        good = hue.build_floorplan_template("family_house", rooms, bridge_id=BRIDGE_ID)
+        self.assertIsNotNone(hue.validate_floorplan(good))
+
+        # Auto-sync preference round-trip
+        good_sync = dict(good, auto_sync=True)
+        good_sync.pop("auto_sync_rooms", None)
+        v_sync = hue.validate_floorplan(good_sync)
+        self.assertTrue(v_sync["auto_sync"])
+        self.assertTrue(v_sync["auto_sync_rooms"])
+
+        # Selectable lamp icons: allowlisted icons persist, legacy aliases map, unknown safe names fall back to bulb
+        for ic in hue.LAMP_ICONS:
+            fp_ic = json.loads(json.dumps(good))
+            fp_ic["lamps"][L1]["icon"] = ic
+            v_ic = hue.validate_floorplan(fp_ic)
+            self.assertIsNotNone(v_ic, ic)
+            self.assertEqual(v_ic["lamps"][L1]["icon"], ic)
+        fp_unk = json.loads(json.dumps(good))
+        fp_unk["lamps"][L1]["icon"] = "unknown_icon_name"
+        self.assertEqual(hue.validate_floorplan(fp_unk)["lamps"][L1]["icon"], "bulb")
+        fp_alias = json.loads(json.dumps(good))
+        fp_alias["lamps"][L1]["icon"] = "floor_lamp"
+        self.assertEqual(hue.validate_floorplan(fp_alias)["lamps"][L1]["icon"], "floor")
+
+        def mutated(**changes):
+            copy = json.loads(json.dumps(good))
+            copy.update(changes)
+            return copy
+
+        hostile_cases = [
+            None, "nope", [],
+            mutated(version=2),
+            mutated(version=True),
+            mutated(bridge_id="NOT_A_BRIDGE"),
+            mutated(template_id="<script>"),
+            mutated(entertainment_id="bad-uuid"),
+            mutated(show_wires="yes"),
+            mutated(auto_sync="true"),
+            mutated(canvas=dict(good["canvas"], width=float("nan"))),
+            mutated(canvas=dict(good["canvas"], zoom=float("inf"))),
+            mutated(canvas=dict(good["canvas"], pan_x=float("-inf"))),
+            mutated(canvas=dict(good["canvas"], snap="yes")),
+            # Markup & bad UUIDs in boxes
+            mutated(boxes=[dict(good["boxes"][0], name="<script>alert(1)</script>")]),
+            mutated(boxes=[dict(good["boxes"][0], name="Living & Dining")]),
+            mutated(boxes=[dict(good["boxes"][0], id="<bad>")]),
+            mutated(boxes=[dict(good["boxes"][0], hue_id="not-a-uuid")]),
+            mutated(boxes=[dict(good["boxes"][0], entertainment_area_id="not-a-uuid")]),
+            mutated(boxes=[dict(good["boxes"][0], kind="evil")]),
+            mutated(boxes=[dict(good["boxes"][0], archetype="<b>bad</b>")]),
+            mutated(boxes=[dict(good["boxes"][0], x=float("nan"))]),
+            mutated(boxes=[dict(good["boxes"][0], w=float("inf"))]),
+            # Duplicate box id
+            mutated(boxes=[good["boxes"][0], dict(good["boxes"][0])]),
+            # Oversized boxes (>40)
+            mutated(boxes=[dict(good["boxes"][0], id="b-%d" % i, hue_id=None) for i in range(41)]),
+            # Invalid stamps & oversized stamps (>80)
+            mutated(stamps=[{"id": "s1", "kind": "invalid", "x": 10, "y": 10, "w": 40, "h": 40, "rot": 0}]),
+            mutated(stamps=[{"id": "s1", "kind": "sofa", "x": 10, "y": 10, "w": 40, "h": 40, "rot": 45}]),
+            mutated(stamps=[{"id": "s1", "kind": "sofa", "x": float("nan"), "y": 10, "w": 40, "h": 40, "rot": 0}]),
+            mutated(stamps=[{"id": "s-%d" % i, "kind": "door", "x": 10, "y": 10, "w": 40, "h": 40, "rot": 0} for i in range(81)]),
+            # Invalid lamps & oversized lamps (>120)
+            mutated(lamps={"not-a-uuid": {"x": 10, "y": 10, "z": 0.0, "icon": "bulb"}}),
+            mutated(lamps={L1: {"x": float("nan"), "y": 10, "z": 0.0, "icon": "bulb"}}),
+            mutated(lamps={L1: {"x": 10, "y": 10, "z": float("inf"), "icon": "bulb"}}),
+            mutated(lamps={L1: {"x": 10, "y": 10, "z": 0.0, "icon": "<svg>"}}),
+            mutated(lamps={"%08x-1111-1111-1111-111111111111" % i: {"x": 10, "y": 10, "z": 0.0, "icon": "bulb"} for i in range(121)}),
+            # Invalid background
+            mutated(background={"path": "/etc/passwd", "opacity": 0.5, "fit": "contain"}),
+            mutated(background={"path": "", "opacity": float("nan"), "fit": "contain"}),
+            mutated(background={"path": "", "opacity": 0.5, "fit": "stretch"}),
+        ]
+        for bad in hostile_cases:
+            self.assertIsNone(hue.validate_floorplan(bad), bad)
+
+        # Save -> 0600 atomic write + symlink & oversized rejection on load
+        h = self.make_hue(sample_floorplan_resources())
+        h.handle({"cmd": "floorplan_template", "template_id": "studio_loft"})
+        fp_path = os.path.join(hue.CONFIG_DIR, "floorplan.json")
+        self.assertEqual(os.stat(fp_path).st_mode & 0o777, 0o600)
+        self.assertEqual(hue.load_floorplan()["template_id"], "studio_loft")
+
+        # Symlinked floorplan.json rejected
+        other = os.path.join(self.dir, "other_fp.json")
+        with open(other, "w") as fh:
+            json.dump(good, fh)
+        os.unlink(fp_path)
+        os.symlink(other, fp_path)
+        self.assertIsNone(hue.load_floorplan())
+        os.unlink(fp_path)
+
+        # Oversized floorplan.json rejected
+        with open(fp_path, "w") as fh:
+            fh.write(" " * (hue.MAX_CONFIG + 1))
+        self.assertIsNone(hue.load_floorplan())
+
+    def test_light_rename_room_crud_and_scene_create(self):
+        h = self.make_hue(sample_floorplan_resources())
+        sent = []
+        hue.https_request = lambda ip, method, path, body=None, headers=None, **k: sent.append((method, path, body)) or (200, {"data": []}, None)
+
+        # 1. light_rename queues PUT light AND PUT device + optimistic update across rooms & zones
+        h.handle({"cmd": "light_rename", "id": L1, "name": "  <b>Arc Lamp</b>  "})
+        self.assertEqual(h.api_queue, [
+            ("PUT", "/clip/v2/resource/light/" + L1, {"metadata": {"name": "bArc Lamp/b"}}),
+            ("PUT", "/clip/v2/resource/device/" + D1, {"metadata": {"name": "bArc Lamp/b"}}),
+        ])
+        self.assertEqual(h._find_light(L1)["name"], "bArc Lamp/b")
+        zone = next(r for r in h.rooms if r["id"] == Z1)
+        self.assertEqual(next(l for l in zone["lights"] if l["id"] == L1)["name"], "bArc Lamp/b")
+
+        # Hostile/empty/unknown light_rename rejected
+        h.api_queue.clear()
+        for bad in (
+            {"cmd": "light_rename", "id": "bad", "name": "Ok"},
+            {"cmd": "light_rename", "id": L5, "name": "Ok"},
+            {"cmd": "light_rename", "id": L1, "name": "<><>"},
+            {"cmd": "light_rename", "id": L1, "name": 123},
+        ):
+            h.handle(bad)
+        self.assertEqual(h.api_queue, [])
+
+        # 2. room_create (room & zone) + invalid rejection
+        h.handle({"cmd": "room_create", "kind": "room", "name": "Home Office", "archetype": "office", "device_ids": [D4, D4]})
+        h.handle({"cmd": "room_create", "kind": "zone", "name": "Reading Corner", "archetype": "reading", "light_ids": [L1, L2]})
+        h.handle({"cmd": "room_create", "kind": "room", "name": "Bad Arch", "archetype": "evil_type", "device_ids": []})
+        h.handle({"cmd": "room_create", "kind": "room", "name": "Bad Child", "archetype": "office", "device_ids": ["bad"]})
+        self.assertEqual(h.api_queue, [
+            ("POST", "/clip/v2/resource/room", {
+                "metadata": {"name": "Home Office", "archetype": "office"},
+                "children": [{"rid": D4, "rtype": "device"}],
+            }),
+            ("POST", "/clip/v2/resource/zone", {
+                "metadata": {"name": "Reading Corner", "archetype": "reading"},
+                "children": [{"rid": L1, "rtype": "light"}, {"rid": L2, "rtype": "light"}],
+            }),
+        ])
+
+        # 3. room_update + optimistic rename + room_delete
+        h.api_queue.clear()
+        h.handle({"cmd": "room_update", "id": R1, "kind": "room", "name": "Living Studio", "archetype": "lounge", "children": [D1]})
+        h.handle({"cmd": "room_update", "id": R1, "kind": "room", "archetype": "bad_arch"})
+        h.handle({"cmd": "room_delete", "id": Z1, "kind": "zone"})
+        h.handle({"cmd": "room_delete", "id": "99999999-9999-9999-9999-999999999999", "kind": "room"})
+        self.assertEqual(next(r for r in h.rooms if r["id"] == R1)["name"], "Living Studio")
+        self.assertEqual(h.api_queue, [
+            ("PUT", "/clip/v2/resource/room/" + R1, {
+                "metadata": {"name": "Living Studio", "archetype": "lounge"},
+                "children": [{"rid": D1, "rtype": "device"}],
+            }),
+            ("DELETE", "/clip/v2/resource/zone/" + Z1, None),
+        ])
+
+        # 4. scene_create captures on, bri, mirek/color for every light in room
+        h.api_queue.clear()
+        h.handle({"cmd": "scene_create", "room_id": R1, "name": "Sunset Vibe"})
+        h.handle({"cmd": "scene_create", "room_id": R2, "name": "All Off Scene"})
+        h.handle({"cmd": "scene_create", "room_id": "99999999-9999-9999-9999-999999999999", "name": "Nope"})
+        self.assertEqual(len(h.api_queue), 2)
+        m1, p1, b1 = h.api_queue[0]
+        self.assertEqual((m1, p1), ("POST", "/clip/v2/resource/scene"))
+        self.assertEqual(b1["metadata"], {"name": "Sunset Vibe"})
+        self.assertEqual(b1["group"], {"rid": R1, "rtype": "room"})
+        acts = {a["target"]["rid"]: a["action"] for a in b1["actions"]}
+        self.assertEqual(acts[L1], {"on": {"on": True}, "dimming": {"brightness": 80.0}, "color_temperature": {"mirek": 280}})
+        self.assertTrue(acts[L2]["on"]["on"])
+        self.assertEqual(acts[L2]["dimming"]["brightness"], 65.0)
+        self.assertIn("color", acts[L2])
+        # Off light in R2 only sets on: false
+        acts_r2 = {a["target"]["rid"]: a["action"] for a in h.api_queue[1][2]["actions"]}
+        self.assertEqual(acts_r2[L3], {"on": {"on": False}})
+
+        # SSE metadata name update reflects external Hue app rename
+        ev_rename = "data: " + json.dumps([{"type": "update", "data": [{"id": L2, "type": "light", "metadata": {"name": "Tall Lamp"}}]}])
+        self.assertTrue(h.handle_sse_line(ev_rename))
+        self.assertEqual(h._find_light(L2)["name"], "Tall Lamp")
+
+    def test_floorplan_sync_rooms_respects_one_room_per_device_rule(self):
+        h = self.make_hue(sample_floorplan_resources())
+        fp = json.loads(json.dumps(h.snapshot()["floorplan"]))
+        box_r1 = next(b for b in fp["boxes"] if b["hue_id"] == R1)
+        box_r2 = next(b for b in fp["boxes"] if b["hue_id"] == R2)
+        # Swap: move L2 (D2, in R1) into R2 box AND move L3 (D3, in R2) into R1 box!
+        fp["lamps"][L2] = {"x": box_r2["x"] + 80.0, "y": box_r2["y"] + 80.0, "z": 0.0, "icon": "floor_lamp"}
+        fp["lamps"][L3] = {"x": box_r1["x"] + 80.0, "y": box_r1["y"] + 80.0, "z": 0.0, "icon": "bulb"}
+        h.handle({"cmd": "floorplan_save", "floorplan": fp})
+
+        diffs = hue.compute_room_membership_diffs(h.floorplan, h.rooms)
+        self.assertEqual({(d["light_id"], d["from_room_id"], d["to_room_id"]) for d in diffs}, {
+            (L2, R1, R2), (L3, R2, R1),
+        })
+
+        h.handle({"cmd": "floorplan_sync_rooms"})
+        # Phase A (removals) MUST precede Phase B (additions) so no device is ever in 2 rooms!
+        self.assertEqual(len(h.api_queue), 4)
+        # First 2 PUTs remove D2 from R1 and D3 from R2
+        rem_calls = h.api_queue[:2]
+        add_calls = h.api_queue[2:]
+        rem_map = {path: [c["rid"] for c in body["children"]] for m, path, body in rem_calls}
+        add_map = {path: [c["rid"] for c in body["children"]] for m, path, body in add_calls}
+        self.assertEqual(rem_map["/clip/v2/resource/room/" + R1], [D1])
+        self.assertEqual(rem_map["/clip/v2/resource/room/" + R2], [])
+        self.assertEqual(add_map["/clip/v2/resource/room/" + R1], [D1, D3])
+        self.assertEqual(add_map["/clip/v2/resource/room/" + R2], [D2])
+
+    def test_entertainment_sync_and_floorplan_sync_all(self):
+        h = self.make_hue(sample_floorplan_resources())
+        fp = json.loads(json.dumps(h.snapshot()["floorplan"]))
+        box_r1 = next(b for b in fp["boxes"] if b["hue_id"] == R1)
+        box_r2 = next(b for b in fp["boxes"] if b["hue_id"] == R2)
+
+        # Link box_r1 to ENT_AREA1 and place L1 at top-left, L2 at bottom-right of box_r1
+        box_r1["entertainment_area_id"] = ENT_AREA1
+        fp["lamps"][L1] = {"x": box_r1["x"], "y": box_r1["y"], "z": 0.5, "icon": "desk_lamp"}
+        fp["lamps"][L2] = {"x": box_r1["x"] + box_r1["w"], "y": box_r1["y"] + box_r1["h"], "z": -0.25, "icon": "floor_lamp"}
+        h.handle({"cmd": "floorplan_save", "floorplan": fp})
+
+        positions = hue.compute_entertainment_positions(box_r1, h.floorplan, h.rooms)
+        pos_map = {p["light_id"]: (p["x"], p["y"], p["z"]) for p in positions}
+        # Top-left -> x=-1.0, y=1.0 (front TV wall); Bottom-right -> x=1.0, y=0.0 (back)
+        self.assertEqual(pos_map[L1], (-1.0, 1.0, 0.5))
+        self.assertEqual(pos_map[L2], (1.0, 0.0, -0.25))
+
+        h.handle({"cmd": "entertainment_sync", "area_id": ENT_AREA1, "box_id": box_r1["id"]})
+        self.assertEqual(len(h.api_queue), 1)
+        m, p, b = h.api_queue[0]
+        self.assertEqual((m, p), ("PUT", "/clip/v2/resource/entertainment_configuration/" + ENT_AREA1))
+        locs = {sl["service"]["rid"]: sl["positions"][0] for sl in b["locations"]["service_locations"]}
+        self.assertEqual(locs[ENT_SVC1], {"x": -1.0, "y": 1.0, "z": 0.5})
+        self.assertEqual(locs[ENT_SVC2], {"x": 1.0, "y": 0.0, "z": -0.25})
+
+        # Now test 1-click floorplan_sync_all: room rename + device move + new room + zone update + entertainment sync!
+        h.api_queue.clear()
+        fp2 = json.loads(json.dumps(h.floorplan))
+        b_r1 = next(b for b in fp2["boxes"] if b["hue_id"] == R1)
+        b_r2 = next(b for b in fp2["boxes"] if b["hue_id"] == R2)
+        b_r1["name"] = "Cinema Room"
+        b_r1["entertainment_area_id"] = None  # test top-level entertainment_id too!
+        fp2["entertainment_id"] = ENT_AREA1
+        # Move L2 into R2 box; add an unlinked new room box containing L4; add zone Z1 box containing L1 & L2
+        fp2["lamps"][L2] = {"x": b_r2["x"] + 60.0, "y": b_r2["y"] + 60.0, "z": 0.0, "icon": "floor_lamp"}
+        fp2["boxes"].append({
+            "id": "box-new-office", "kind": "room", "hue_id": None,
+            "name": "New Study", "archetype": "office",
+            "x": 960.0, "y": 80.0, "w": 300.0, "h": 240.0, "entertainment_area_id": None,
+        })
+        fp2["lamps"][L4] = {"x": 1060.0, "y": 180.0, "z": 0.0, "icon": "desk_lamp"}
+        fp2["boxes"].append({
+            "id": "box-zone-1", "kind": "zone", "hue_id": Z1,
+            "name": "Movie Zone", "archetype": "tv",
+            "x": min(b_r1["x"], b_r2["x"]), "y": min(b_r1["y"], b_r2["y"]),
+            "w": b_r1["w"] + b_r2["w"], "h": max(b_r1["h"], b_r2["h"]), "entertainment_area_id": None,
+        })
+        h.handle({"cmd": "floorplan_save", "floorplan": fp2})
+        h.handle({"cmd": "floorplan_sync_all"})
+
+        methods_paths = [(m, p) for m, p, _ in h.api_queue]
+        # R1 removal MUST happen before R2 addition!
+        idx_r1 = methods_paths.index(("PUT", "/clip/v2/resource/room/" + R1))
+        idx_r2 = methods_paths.index(("PUT", "/clip/v2/resource/room/" + R2))
+        self.assertLess(idx_r1, idx_r2)
+        self.assertEqual(h.api_queue[idx_r1][2]["metadata"], {"name": "Cinema Room"})
+        self.assertEqual([c["rid"] for c in h.api_queue[idx_r1][2]["children"]], [D1])
+        self.assertEqual([c["rid"] for c in h.api_queue[idx_r2][2]["children"]], [D3, D2])
+        # New room created with D4
+        self.assertIn(("POST", "/clip/v2/resource/room"), methods_paths)
+        post_room = next(b for m, p, b in h.api_queue if (m, p) == ("POST", "/clip/v2/resource/room"))
+        self.assertEqual(post_room["metadata"], {"name": "New Study", "archetype": "office"})
+        self.assertEqual(post_room["children"], [{"rid": D4, "rtype": "device"}])
+        # Zone Z1 updated (name + archetype + lights L1, L2, L3 inside big zone box)
+        self.assertIn(("PUT", "/clip/v2/resource/zone/" + Z1), methods_paths)
+        put_zone = next(b for m, p, b in h.api_queue if (m, p) == ("PUT", "/clip/v2/resource/zone/" + Z1))
+        self.assertEqual(put_zone["metadata"], {"name": "Movie Zone", "archetype": "tv"})
+        self.assertEqual({c["rid"] for c in put_zone["children"]}, {L1, L2, L3})
+        # Entertainment area synced via top-level entertainment_id
+        self.assertIn(("PUT", "/clip/v2/resource/entertainment_configuration/" + ENT_AREA1), methods_paths)
+
+    def test_floorplan_background_commands_and_security(self):
+        h = self.make_hue(sample_floorplan_resources())
+        png_src = os.path.join(self.dir, "plan.png")
+        jpg_src = os.path.join(self.dir, "plan.jpeg")
+        webp_src = os.path.join(self.dir, "plan.webp")
+        fake_png = os.path.join(self.dir, "fake.png")
+        bad_ext = os.path.join(self.dir, "evil.svg")
+        link_png = os.path.join(self.dir, "link.png")
+        with open(png_src, "wb") as fh:
+            fh.write(MINIMAL_PNG)
+        with open(jpg_src, "wb") as fh:
+            fh.write(MINIMAL_JPG)
+        with open(webp_src, "wb") as fh:
+            fh.write(MINIMAL_WEBP)
+        with open(fake_png, "wb") as fh:
+            fh.write(b"<html>not a png</html>")
+        with open(bad_ext, "wb") as fh:
+            fh.write(MINIMAL_PNG)
+        os.symlink(png_src, link_png)
+
+        # 1. Valid PNG background set -> atomic 0600 copy into CONFIG_DIR/floorplan_bg.png
+        h.handle({"cmd": "floorplan_bg_set", "path": png_src, "opacity": 0.45, "fit": "cover"})
+        bg = h.snapshot()["floorplan"]["background"]
+        managed_png = os.path.join(hue.CONFIG_DIR, "floorplan_bg.png")
+        self.assertEqual(bg["path"], managed_png)
+        self.assertEqual(bg["opacity"], 0.45)
+        self.assertEqual(bg["fit"], "cover")
+        self.assertEqual(os.stat(managed_png).st_mode & 0o777, 0o600)
+        self.assertEqual(hue.load_floorplan()["background"]["path"], managed_png)
+
+        # 2. Switch to JPEG removes old .png and writes floorplan_bg.jpg
+        h.handle({"cmd": "floorplan_bg_set", "source_path": jpg_src})
+        managed_jpg = os.path.join(hue.CONFIG_DIR, "floorplan_bg.jpg")
+        self.assertFalse(os.path.exists(managed_png))
+        self.assertTrue(os.path.exists(managed_jpg))
+        self.assertEqual(h.floorplan["background"]["path"], managed_jpg)
+
+        # 3. Switch to WEBP works too
+        h.handle({"cmd": "floorplan_bg_set", "path": webp_src})
+        managed_webp = os.path.join(hue.CONFIG_DIR, "floorplan_bg.webp")
+        self.assertFalse(os.path.exists(managed_jpg))
+        self.assertTrue(os.path.exists(managed_webp))
+
+        # 4. floorplan_bg_update clamps opacity to [0.05, 1.0] and validates fit
+        h.handle({"cmd": "floorplan_bg_update", "opacity": 0.01, "fit": "contain"})
+        self.assertEqual(h.floorplan["background"]["opacity"], 0.05)
+        self.assertEqual(h.floorplan["background"]["fit"], "contain")
+        h.handle({"cmd": "floorplan_bg_update", "opacity": 5.0, "fit": "cover"})
+        self.assertEqual(h.floorplan["background"]["opacity"], 1.0)
+        self.assertEqual(h.floorplan["background"]["fit"], "cover")
+        # Invalid update ignored
+        h.handle({"cmd": "floorplan_bg_update", "opacity": float("nan"), "fit": "contain"})
+        h.handle({"cmd": "floorplan_bg_update", "opacity": 0.5, "fit": "fill"})
+        self.assertEqual(h.floorplan["background"]["opacity"], 1.0)
+        self.assertEqual(h.floorplan["background"]["fit"], "cover")
+
+        # 5. Hostile sources rejected (symlink, bad magic, bad extension, missing file)
+        for bad_src in (link_png, fake_png, bad_ext, os.path.join(self.dir, "missing.png")):
+            h.handle({"cmd": "floorplan_bg_set", "path": bad_src})
+            self.assertEqual(h.floorplan["background"]["path"], managed_webp, bad_src)
+
+        # 6. Hostile background.path smuggled into floorplan.json rejected on load_floorplan()
+        fp_path = os.path.join(hue.CONFIG_DIR, "floorplan.json")
+        # Path traversal outside CONFIG_DIR
+        tampered = json.loads(json.dumps(h.floorplan))
+        tampered["background"]["path"] = os.path.join(hue.CONFIG_DIR, "..", "plan.png")
+        with open(fp_path, "w") as fh:
+            json.dump(tampered, fh)
+        self.assertIsNone(hue.load_floorplan())
+
+        # Symlink planted at CONFIG_DIR/floorplan_bg.png rejected by validate_floorplan / load_floorplan
+        os.unlink(managed_webp)
+        os.symlink(png_src, managed_png)
+        tampered["background"]["path"] = managed_png
+        with open(fp_path, "w") as fh:
+            json.dump(tampered, fh)
+        self.assertIsNone(hue.load_floorplan())
+        os.unlink(managed_png)
+
+        # 7. floorplan_bg_clear removes managed bg file without touching unrelated files in CONFIG_DIR
+        keep_file = os.path.join(hue.CONFIG_DIR, "keep.txt")
+        with open(keep_file, "w") as fh:
+            fh.write("keep")
+        h.handle({"cmd": "floorplan_bg_set", "path": png_src})
+        self.assertTrue(os.path.exists(managed_png))
+        h.handle({"cmd": "floorplan_bg_clear"})
+        self.assertFalse(os.path.exists(managed_png))
+        self.assertTrue(os.path.exists(keep_file))
+        self.assertEqual(h.floorplan["background"]["path"], "")
+        self.assertEqual(hue.load_floorplan()["background"]["path"], "")
+
+        # 8. Direct CLI subcommands (floorplan_bg_set / floorplan_bg_update / floorplan_bg_clear)
+        script = os.path.join(HERE, "..", "scripts", "hue-lights.py")
+        cli_env = dict(os.environ, XDG_CONFIG_HOME=self.dir)
+        r_set = subprocess.run(
+            ["python3", script, "floorplan_bg_set", png_src, "0.4", "cover"],
+            capture_output=True, text=True, env=cli_env, check=True,
+        )
+        out_set = json.loads(r_set.stdout)
+        self.assertEqual(out_set["background"]["path"], managed_png)
+        self.assertEqual(out_set["background"]["opacity"], 0.4)
+        self.assertEqual(out_set["background"]["fit"], "cover")
+
+        r_upd = subprocess.run(
+            ["python3", script, "floorplan_bg_update", "0.75", "contain"],
+            capture_output=True, text=True, env=cli_env, check=True,
+        )
+        out_upd = json.loads(r_upd.stdout)
+        self.assertEqual(out_upd["background"]["opacity"], 0.75)
+        self.assertEqual(out_upd["background"]["fit"], "contain")
+
+        r_clr = subprocess.run(
+            ["python3", script, "floorplan_bg_clear"],
+            capture_output=True, text=True, env=cli_env, check=True,
+        )
+        out_clr = json.loads(r_clr.stdout)
+        self.assertEqual(out_clr["background"]["path"], "")
+        self.assertFalse(os.path.exists(managed_png))
+
+        # CLI rejects symlink source with non-zero exit code
+        r_bad = subprocess.run(
+            ["python3", script, "floorplan_bg_set", link_png],
+            capture_output=True, text=True, env=cli_env, check=False,
+        )
+        self.assertNotEqual(r_bad.returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
