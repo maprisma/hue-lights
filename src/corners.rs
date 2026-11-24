@@ -41,9 +41,23 @@ pub fn radius(setting: &str, desktop: f32) -> f32 {
     }
 }
 
+/// Cached COSMIC/system fallback radius (updated in [system_theme_update] or lazily from [system]).
+static SYSTEM_RADIUS: RwLock<Option<f32>> = RwLock::new(None);
+
+fn system_radius() -> f32 {
+    if let Some(r) = SYSTEM_RADIUS.read().ok().and_then(|r| *r) {
+        return r;
+    }
+    let r = system().cosmic().corner_radii.radius_m[0];
+    if let Ok(mut cached) = SYSTEM_RADIUS.write() {
+        *cached = Some(r);
+    }
+    r
+}
+
 /// The desktop's window corners (what "Like the desktop" follows).
 pub fn desktop_radius() -> f32 {
-    crate::look::window_radius().unwrap_or_else(|| system().cosmic().corner_radii.radius_m[0])
+    crate::look::window_radius().unwrap_or_else(system_radius)
 }
 
 /// The last system (COSMIC Settings) theme libcosmic reported (see [system_theme_update]).
@@ -81,6 +95,17 @@ pub fn system_theme_update<M: Send + 'static>(
     if let Ok(mut stored) = SYSTEM.write() {
         *stored = Some(cosmic::Theme::system(Arc::new(new_theme.clone())));
     }
+    if let Ok(mut cached) = SYSTEM_RADIUS.write() {
+        *cached = Some(new_theme.corner_radii.radius_m[0]);
+    }
+    if let Ok(mut cached) = THEME_CACHE.write() {
+        *cached = None;
+    }
+    if let Ok(mut current) = CURRENT.write()
+        && current.setting == "desktop"
+    {
+        current.sizes = None;
+    }
     match theme(setting) {
         Some(theme) if window_mode => cosmic::command::set_theme(theme),
         _ => cosmic::Task::none(),
@@ -88,25 +113,76 @@ pub fn system_theme_update<M: Send + 'static>(
 }
 
 pub fn sizes(setting: &str) -> Sizes {
-    Sizes::new(radius(setting, desktop_radius()))
+    let r = match normalize(setting) {
+        "slight" => 6.0,
+        "rounded" => 12.0,
+        "square" => 0.0,
+        _ => desktop_radius(),
+    };
+    Sizes::new(r)
 }
 
-static CURRENT: RwLock<&'static str> = RwLock::new("desktop");
+#[derive(Clone, Copy)]
+struct CurrentState {
+    setting: &'static str,
+    look_radius: Option<f32>,
+    sizes: Option<Sizes>,
+}
+
+static CURRENT: RwLock<CurrentState> = RwLock::new(CurrentState {
+    setting: "desktop",
+    look_radius: None,
+    sizes: None,
+});
 
 /// The setting in effect, for the app's own drawing (bars, swatches, dots, badges).
 pub fn set_current(setting: &str) {
+    let norm = normalize(setting);
+    let (look_radius, computed) = if norm == "desktop" {
+        let lr = crate::look::window_radius();
+        (lr, Sizes::new(lr.unwrap_or_else(system_radius)))
+    } else {
+        (None, sizes(norm))
+    };
     if let Ok(mut current) = CURRENT.write() {
-        *current = normalize(setting);
+        *current = CurrentState { setting: norm, look_radius, sizes: Some(computed) };
     }
 }
 
 pub fn current() -> &'static str {
-    CURRENT.read().map(|c| *c).unwrap_or("desktop")
+    CURRENT.read().map(|c| c.setting).unwrap_or("desktop")
 }
 
 /// The sizes in effect (see set_current).
 pub fn now() -> Sizes {
-    sizes(current())
+    let cur = CURRENT.read().map(|c| *c).unwrap_or(CurrentState {
+        setting: "desktop",
+        look_radius: None,
+        sizes: None,
+    });
+    if cur.setting != "desktop"
+        && let Some(s) = cur.sizes
+    {
+        return s;
+    }
+    let lr = if cur.setting == "desktop" { crate::look::window_radius() } else { None };
+    if let Some(s) = cur.sizes
+        && cur.look_radius == lr
+    {
+        return s;
+    }
+    let computed = if cur.setting == "desktop" {
+        Sizes::new(lr.unwrap_or_else(system_radius))
+    } else {
+        sizes(cur.setting)
+    };
+    if let Ok(mut current) = CURRENT.write()
+        && current.setting == cur.setting
+    {
+        current.look_radius = lr;
+        current.sizes = Some(computed);
+    }
+    computed
 }
 
 /// The theme's corner radii set to these sizes, so libcosmic's own widgets (buttons, menu rows,
@@ -122,14 +198,53 @@ pub fn radii(sizes: Sizes) -> cosmic::cosmic_theme::CornerRadii {
     }
 }
 
+struct CachedTheme {
+    /// Kept alive so the pointer address cannot be reused.
+    base: cosmic::Theme,
+    sizes: Sizes,
+    theme: cosmic::Theme,
+}
+
+static THEME_CACHE: RwLock<Option<CachedTheme>> = RwLock::new(None);
+
+fn radii_eq(a: &cosmic::cosmic_theme::CornerRadii, b: &cosmic::cosmic_theme::CornerRadii) -> bool {
+    a.radius_0 == b.radius_0
+        && a.radius_xs == b.radius_xs
+        && a.radius_s == b.radius_s
+        && a.radius_m == b.radius_m
+        && a.radius_l == b.radius_l
+        && a.radius_xl == b.radius_xl
+}
+
 /// The desktop's theme (look.rs) with the chosen corners; None for "desktop" on COSMIC (the
 /// theme libcosmic has stays as it is).
 pub fn theme(setting: &str) -> Option<cosmic::Theme> {
+    let norm = normalize(setting);
     let desktop = crate::look::theme();
-    if normalize(setting) == "desktop" && desktop.is_none() {
+    if norm == "desktop" && desktop.is_none() {
         return None;
     }
-    Some(with_corners(desktop.unwrap_or_else(system), sizes(setting)))
+    let s = sizes(norm);
+    let base = desktop.unwrap_or_else(system);
+    let base_ptr: *const cosmic::cosmic_theme::Theme = base.cosmic();
+    if let Ok(guard) = THEME_CACHE.read()
+        && let Some(cached) = guard.as_ref()
+        && std::ptr::eq(cached.base.cosmic(), base_ptr)
+        && cached.sizes == s
+    {
+        return Some(cached.theme.clone());
+    }
+    let built = if matches!(base.theme_type, cosmic::theme::ThemeType::Custom(_))
+        && radii_eq(&base.cosmic().corner_radii, &radii(s))
+    {
+        base.clone()
+    } else {
+        with_corners(base.clone(), s)
+    };
+    if let Ok(mut guard) = THEME_CACHE.write() {
+        *guard = Some(CachedTheme { base, sizes: s, theme: built.clone() });
+    }
+    Some(built)
 }
 
 /// `base` with these corners, as a custom theme.
@@ -216,5 +331,19 @@ mod tests {
         let again = with_corners(t.clone(), Sizes::new(12.0));
         assert_eq!(again.cosmic().corner_radii.radius_m, [12.0; 4]);
         assert_eq!(again.cosmic().bg_color(), t.cosmic().bg_color());
+    }
+
+    #[test]
+    fn current_sizes_cache_tracks_setting() {
+        set_current("rounded");
+        assert_eq!(current(), "rounded");
+        assert_eq!(now(), Sizes::new(12.0));
+        set_current("slight");
+        assert_eq!(now(), Sizes::new(6.0));
+        set_current("square");
+        assert_eq!(now(), Sizes::new(0.0));
+        set_current("desktop");
+        assert_eq!(current(), "desktop");
+        assert_eq!(now(), sizes("desktop"));
     }
 }

@@ -20,7 +20,14 @@ pub fn icon_for(stats: &Value) -> &'static str {
 }
 pub const WINDOW_BUS: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights.Window";
 pub fn script_path() -> Option<PathBuf> {
-    let name = "hue-lights.py";
+    find_script("hue-lights.py")
+}
+
+pub fn mcp_script_path() -> Option<PathBuf> {
+    find_script("hue-mcp.py")
+}
+
+fn find_script(name: &str) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(dir) = std::env::var_os("HUE_LIGHTS_SCRIPTS") {
         dirs.push(dir.into());

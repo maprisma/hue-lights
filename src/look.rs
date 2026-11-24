@@ -456,6 +456,8 @@ struct State {
     radius_read: std::time::Instant,
     /// The desktop's text size as a factor (see [text_scale]).
     scale: f32,
+    /// Cached libcosmic theme built from `(palette, radius)` (rebuilt only when they change).
+    cached_theme: Option<cosmic::Theme>,
 }
 
 static STATE: RwLock<Option<State>> = RwLock::new(None);
@@ -464,22 +466,44 @@ static STATE: RwLock<Option<State>> = RwLock::new(None);
 pub fn reload() -> bool {
     let d = desktop();
     let now = std::time::Instant::now();
-    let fresh = State {
-        palette: read_palette(d),
-        radius: read_window_radius(d),
-        fonts: desktop_fonts(),
+    let palette = read_palette(d);
+    let radius = read_window_radius(d);
+    let fonts = desktop_fonts();
+    let scale = read_text_scale();
+    let Ok(mut state) = STATE.write() else { return false };
+    let theme_changed = state
+        .as_ref()
+        .is_none_or(|s| s.palette != palette || s.radius != radius);
+    let changed = theme_changed
+        || state
+            .as_ref()
+            .is_none_or(|s| s.fonts != fonts || s.scale != scale);
+    let cached_theme = if theme_changed {
+        palette.as_ref().map(|p| theme_from(p, radius))
+    } else {
+        state.as_ref().and_then(|s| s.cached_theme.clone())
+    };
+    *state = Some(State {
+        palette,
+        radius,
+        fonts,
         read: now,
         radius_read: now,
-        scale: read_text_scale(),
-    };
-    let Ok(mut state) = STATE.write() else { return false };
-    let changed = state
-        .as_ref()
-        .is_none_or(|s| s.palette != fresh.palette || s.radius != fresh.radius || s.fonts != fresh.fonts || s.scale != fresh.scale);
-    *state = Some(fresh);
+        scale,
+        cached_theme,
+    });
     drop(state);
     keep_fonts();
     changed
+}
+
+/// Cheaply reports whether [refresh] is due (never spawns processes or reads files).
+pub fn is_refresh_due() -> bool {
+    STATE
+        .read()
+        .ok()
+        .and_then(|s| s.as_ref().map(|s| s.read.elapsed().as_secs() >= 5))
+        .unwrap_or(true)
 }
 
 /// [reload] for a periodic tick (where the app re-reads its settings): the colour files at most
@@ -502,17 +526,23 @@ pub fn refresh() -> bool {
     let radius = if radius_due { Some((read_window_radius(d), desktop_fonts())) } else { None };
     let Ok(mut guard) = STATE.write() else { return false };
     let Some(state) = guard.as_mut() else { return false };
-    let mut changed = state.palette != palette || state.scale != scale;
+    let mut theme_changed = state.palette != palette;
+    let mut changed = theme_changed || state.scale != scale;
     state.palette = palette;
     state.scale = scale;
     state.read = std::time::Instant::now();
     let mut fonts_changed = false;
     if let Some((radius, fonts)) = radius {
-        changed |= state.radius != radius;
+        let radius_changed = state.radius != radius;
+        theme_changed |= radius_changed;
+        changed |= radius_changed;
         fonts_changed = state.fonts != fonts;
         state.radius = radius;
         state.fonts = fonts;
         state.radius_read = state.read;
+    }
+    if theme_changed {
+        state.cached_theme = state.palette.as_ref().map(|p| theme_from(p, state.radius));
     }
     drop(guard);
     if fonts_changed {
@@ -567,7 +597,7 @@ pub fn window_radius() -> Option<f32> {
 
 /// The desktop's theme for this window, None where libcosmic's own is right (COSMIC).
 pub fn theme() -> Option<cosmic::Theme> {
-    with_state(|s| s.palette.as_ref().map(|p| theme_from(p, s.radius)))
+    with_state(|s| s.cached_theme.clone())
 }
 
 /// `content` with a window's background in the theme's colour (for `--window` mode; an applet
@@ -753,5 +783,27 @@ mod tests {
         assert_eq!(parse_text_scale("0.1"), 0.5);
         assert_eq!(parse_text_scale("nonsense"), 1.0);
         assert_eq!(parse_text_scale("-2"), 1.0);
+    }
+
+    #[test]
+    fn refresh_due_and_theme_cache() {
+        // Right after reload(), refresh is not due and cached_theme is reused across theme() calls.
+        let _ = reload();
+        assert!(!is_refresh_due());
+        assert!(!refresh());
+
+        let p = Palette { accent: Some([0xe7, 0x8a, 0x4e]), background: Some([0x23, 0x1a, 0x13]), ..Default::default() };
+        let built = theme_from(&p, None);
+        if let Ok(mut guard) = STATE.write()
+            && let Some(state) = guard.as_mut()
+        {
+            state.palette = Some(p);
+            state.cached_theme = Some(built);
+        }
+        let t1 = theme().expect("cached theme");
+        let t2 = theme().expect("cached theme");
+        assert!(std::ptr::eq(t1.cosmic(), t2.cosmic()), "theme() must reuse cached Arc");
+        // Restore test state so other tests see Desktop::Other's None palette.
+        let _ = reload();
     }
 }

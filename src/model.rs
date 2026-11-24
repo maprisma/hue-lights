@@ -17,6 +17,7 @@ pub const SKIN_KEY: &str = "skin";
 pub const PANEL_ICON_KEY: &str = "panel_icon";
 pub const SHOW_COUNT_KEY: &str = "show_count";
 pub const FONT_SCALE_KEY: &str = "font_scale";
+pub const ASK_AI_KEY: &str = "ask_ai";
 
 pub const DAYS_ORDER: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 pub const SCHEDULE_MODES: [&str; 2] = ["bridge", "local"];
@@ -319,6 +320,111 @@ pub fn all_targets(stats: &Value) -> Vec<TargetOption> {
     out
 }
 
+/// Collects all rule trigger candidates: rooms, zones, lights, physical Hue sensors,
+/// and Bridge Pro MotionAware areas.
+pub fn all_rule_triggers(stats: &Value) -> Vec<TargetOption> {
+    let mut out = all_targets(stats);
+    for sensor in parse_sensors(stats) {
+        let prefix = match sensor.kind.as_str() {
+            "motion" => tr("Motion"),
+            "contact" => tr("Contact"),
+            "button" => tr("Switch"),
+            _ => String::new(),
+        };
+        let label = if prefix.is_empty() {
+            sensor.name
+        } else {
+            format!("{prefix} · {}", sensor.name)
+        };
+        out.push(TargetOption { kind: sensor.kind, id: sensor.id, label });
+    }
+    for area in parse_motion_areas(stats) {
+        let label = format!("{} · {}", tr("MotionAware"), area.name);
+        out.push(TargetOption { kind: "motion_area".into(), id: area.id, label });
+    }
+    out
+}
+
+pub fn default_trigger_state(trigger_kind: &str) -> &'static str {
+    match trigger_kind {
+        "motion" | "motion_area" => "motion",
+        "contact" => "open",
+        "button" => "press",
+        _ => "on",
+    }
+}
+
+pub fn normalize_trigger_state(trigger_kind: &str, state: &str) -> &'static str {
+    match trigger_kind {
+        "motion" | "motion_area" => {
+            if state == "clear" {
+                "clear"
+            } else {
+                "motion"
+            }
+        }
+        "contact" => {
+            if state == "closed" {
+                "closed"
+            } else {
+                "open"
+            }
+        }
+        "button" => {
+            if state == "long_press" {
+                "long_press"
+            } else {
+                "press"
+            }
+        }
+        _ => {
+            if state == "off" {
+                "off"
+            } else {
+                "on"
+            }
+        }
+    }
+}
+
+pub fn is_light_or_room_trigger(trigger_kind: &str) -> bool {
+    matches!(trigger_kind, "light" | "room" | "zone")
+}
+
+pub fn trigger_state_options(trigger_kind: &str) -> Vec<(&'static str, String)> {
+    match trigger_kind {
+        "motion" | "motion_area" => vec![
+            ("motion", tr("Motion detected")),
+            ("clear", tr("No motion")),
+        ],
+        "contact" => vec![
+            ("open", tr("Opens")),
+            ("closed", tr("Closes")),
+        ],
+        "button" => vec![
+            ("press", tr("Pressed")),
+            ("long_press", tr("Long press")),
+        ],
+        _ => vec![
+            ("on", tr("Turns on")),
+            ("off", tr("Turns off")),
+        ],
+    }
+}
+
+pub fn trigger_state_label(trigger_kind: &str, state: &str) -> String {
+    match (trigger_kind, state) {
+        ("motion" | "motion_area", "clear") => tr("No motion"),
+        ("motion" | "motion_area", _) => tr("Motion detected"),
+        ("contact", "closed") => tr("Closes"),
+        ("contact", _) => tr("Opens"),
+        ("button", "long_press") => tr("Long press"),
+        ("button", _) => tr("Pressed"),
+        (_, "off") => tr("Turns off"),
+        _ => tr("Turns on"),
+    }
+}
+
 /// Resolves a `(kind, id)` to its human-readable name from the snapshot.
 pub fn resolve_name(stats: &Value, kind: &str, id: &str) -> String {
     if kind == "desktop" {
@@ -328,6 +434,26 @@ pub fn resolve_name(stats: &Value, kind: &str, id: &str) -> String {
             other if !other.is_empty() => other.to_string(),
             _ => "Desktop".into(),
         };
+    }
+    if matches!(kind, "motion" | "contact" | "button") {
+        for sensor in j_list(stats, "sensors") {
+            if j_str(sensor, "id") == id {
+                let name = j_str(sensor, "name");
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+        }
+    }
+    if kind == "motion_area" {
+        for area in j_list(stats, "motion_areas") {
+            if j_str(area, "id") == id {
+                let name = j_str(area, "name");
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+        }
     }
     if matches!(kind, "room" | "zone") {
         for room in j_list(stats, "rooms") {
@@ -622,6 +748,8 @@ impl RuleDraft {
             Some(t) => (norm_kind(t.kind), t.id, t.label),
             None => (String::new(), String::new(), String::new()),
         };
+        let trigger_state = default_trigger_state(&trigger_kind).into();
+        let mirror_off = trigger_kind != "button";
         Self {
             name: String::new(),
             kind: "follow".into(),
@@ -629,12 +757,12 @@ impl RuleDraft {
             trigger_id,
             trigger_name,
             trigger_picker_open: false,
-            trigger_state: "on".into(),
+            trigger_state,
             target_kind,
             target_id,
             target_name,
             target_picker_open: false,
-            mirror_off: true,
+            mirror_off,
             match_bri: false,
             only_if_off: false,
             time_start: String::new(),
@@ -656,16 +784,32 @@ impl RuleDraft {
         if (!ts.is_empty() && !valid_hhmm(ts)) || (!te.is_empty() && !valid_hhmm(te)) {
             return Err(tr("Invalid time (use HH:MM)"));
         }
+        let is_light_or_room = is_light_or_room_trigger(&self.trigger_kind);
         let name = if self.name.trim().is_empty() {
-            let a = self.trigger_name.split(" · ").next().unwrap_or(&self.trigger_name);
+            let a = if is_light_or_room {
+                self.trigger_name.split(" · ").next().unwrap_or(&self.trigger_name)
+            } else {
+                self.trigger_name
+                    .split_once(" · ")
+                    .map_or(self.trigger_name.as_str(), |(_, n)| n)
+            };
             let b = self.target_name.split(" · ").next().unwrap_or(&self.target_name);
             format!("{a} → {b}")
         } else {
             self.name.trim().to_string()
         };
         let action = self.target_action();
-        let mirror_off = if self.kind == "exclusive" { false } else { self.mirror_off };
-        let match_bri = if self.kind == "exclusive" { false } else { self.match_bri };
+        let trigger_state = normalize_trigger_state(&self.trigger_kind, &self.trigger_state);
+        let mirror_off = if self.kind == "exclusive" || self.trigger_kind == "button" {
+            false
+        } else {
+            self.mirror_off
+        };
+        let match_bri = if self.kind == "exclusive" || !is_light_or_room {
+            false
+        } else {
+            self.match_bri
+        };
         Ok(json!({
             "cmd": "rule_save",
             "rule": {
@@ -674,7 +818,7 @@ impl RuleDraft {
                 "kind": self.kind,
                 "trigger_kind": self.trigger_kind,
                 "trigger_id": self.trigger_id,
-                "trigger_state": self.trigger_state,
+                "trigger_state": trigger_state,
                 "targets": [{
                     "kind": self.target_kind,
                     "id": self.target_id,
@@ -775,9 +919,25 @@ pub fn schedule_mode_label(mode: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SkinStyle {
     pub accent: Color,
+    pub accent_rgb: [u8; 3],
     pub border_tint: Color,
     pub bg_tint: Color,
+    pub window_bg: [u8; 3],
+    pub foreground: [u8; 3],
     pub border_width: f32,
+}
+
+impl SkinStyle {
+    pub fn palette(&self) -> maprisma_hue_lights::look::Palette {
+        maprisma_hue_lights::look::Palette {
+            accent: Some(self.accent_rgb),
+            background: Some(self.window_bg),
+            foreground: Some(self.foreground),
+            red: None,
+            yellow: None,
+            green: None,
+        }
+    }
 }
 
 pub fn normalize_skin(skin: &str) -> &'static str {
@@ -788,33 +948,48 @@ pub fn normalize_skin(skin: &str) -> &'static str {
 pub fn skin_style(skin: &str) -> Option<SkinStyle> {
     match normalize_skin(skin) {
         "synthwave" => Some(SkinStyle {
-            accent: Color::from_rgb(1.0, 0.18, 0.62),
-            border_tint: Color::from_rgb(0.0, 0.88, 1.0),
-            bg_tint: Color::from_rgb(0.38, 0.10, 0.54),
+            accent: Color::from_rgb8(0xff, 0x2e, 0x93),
+            accent_rgb: [0xff, 0x2e, 0x93],
+            border_tint: Color::from_rgb8(0x00, 0xe5, 0xff),
+            bg_tint: Color::from_rgb8(0x3a, 0x12, 0x59),
+            window_bg: [0x13, 0x09, 0x24],
+            foreground: [0xf4, 0xea, 0xff],
             border_width: 1.5,
         }),
         "cozy" => Some(SkinStyle {
-            accent: Color::from_rgb(0.98, 0.65, 0.24),
-            border_tint: Color::from_rgb(0.95, 0.56, 0.22),
-            bg_tint: Color::from_rgb(0.48, 0.26, 0.08),
+            accent: Color::from_rgb8(0xf0, 0x9a, 0x36),
+            accent_rgb: [0xf0, 0x9a, 0x36],
+            border_tint: Color::from_rgb8(0xe0, 0x82, 0x2a),
+            bg_tint: Color::from_rgb8(0x59, 0x30, 0x12),
+            window_bg: [0x21, 0x15, 0x0e],
+            foreground: [0xf5, 0xe8, 0xd6],
             border_width: 1.25,
         }),
         "terminal" => Some(SkinStyle {
-            accent: Color::from_rgb(0.20, 0.92, 0.42),
-            border_tint: Color::from_rgb(0.18, 0.85, 0.38),
-            bg_tint: Color::from_rgb(0.06, 0.28, 0.12),
+            accent: Color::from_rgb8(0x2c, 0xe8, 0x68),
+            accent_rgb: [0x2c, 0xe8, 0x68],
+            border_tint: Color::from_rgb8(0x22, 0xc5, 0x5e),
+            bg_tint: Color::from_rgb8(0x0d, 0x38, 0x1a),
+            window_bg: [0x09, 0x13, 0x0b],
+            foreground: [0xd2, 0xfc, 0xe0],
             border_width: 1.25,
         }),
         "disco" => Some(SkinStyle {
-            accent: Color::from_rgb(0.86, 0.30, 1.0),
-            border_tint: Color::from_rgb(1.0, 0.78, 0.18),
-            bg_tint: Color::from_rgb(0.40, 0.14, 0.52),
+            accent: Color::from_rgb8(0xd9, 0x46, 0xef),
+            accent_rgb: [0xd9, 0x46, 0xef],
+            border_tint: Color::from_rgb8(0xfa, 0xcc, 0x15),
+            bg_tint: Color::from_rgb8(0x4c, 0x16, 0x66),
+            window_bg: [0x1c, 0x0c, 0x2b],
+            foreground: [0xf8, 0xec, 0xff],
             border_width: 1.5,
         }),
         "zen" => Some(SkinStyle {
-            accent: Color::from_rgb(0.42, 0.78, 0.66),
-            border_tint: Color::from_rgb(0.48, 0.76, 0.65),
-            bg_tint: Color::from_rgb(0.16, 0.32, 0.27),
+            accent: Color::from_rgb8(0x52, 0xb7, 0x98),
+            accent_rgb: [0x52, 0xb7, 0x98],
+            border_tint: Color::from_rgb8(0x64, 0xc2, 0xa4),
+            bg_tint: Color::from_rgb8(0x1e, 0x38, 0x32),
+            window_bg: [0x14, 0x1d, 0x1c],
+            foreground: [0xe2, 0xf0, 0xec],
             border_width: 1.0,
         }),
         _ => None,
@@ -1107,6 +1282,12 @@ pub struct FloorplanLamp {
     pub icon: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FloorplanSensor {
+    pub x: f64,
+    pub y: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FloorplanDocument {
     #[serde(default = "default_version")]
@@ -1137,6 +1318,8 @@ pub struct FloorplanDocument {
     pub stamps: Vec<FloorplanStamp>,
     #[serde(default)]
     pub lamps: BTreeMap<String, FloorplanLamp>,
+    #[serde(default)]
+    pub sensors: BTreeMap<String, FloorplanSensor>,
 }
 
 impl Default for FloorplanDocument {
@@ -1156,8 +1339,37 @@ impl Default for FloorplanDocument {
             boxes: Vec::new(),
             stamps: Vec::new(),
             lamps: BTreeMap::new(),
+            sensors: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HueSensor {
+    pub id: String,
+    pub device_id: String,
+    pub kind: String, // "motion" | "contact" | "button"
+    pub name: String,
+    pub room_id: String,
+    pub enabled: bool,
+    pub motion: bool,
+    pub open: bool,
+    pub temperature: Option<f64>,
+    pub lux: Option<f64>,
+    pub battery: Option<u8>,
+    pub last_event: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MotionArea {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub room_id: String,
+    pub motion: bool,
+    pub sensitivity: Option<i64>,
+    pub sensitivity_max: Option<i64>,
+    pub light_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1200,6 +1412,65 @@ pub struct BridgeLightInfo {
     pub reachable: bool,
     pub room_id: String,
     pub room_name: String,
+    pub motion_aware: bool,
+    pub motion_active: bool,
+}
+
+pub fn parse_sensors(stats: &Value) -> Vec<HueSensor> {
+    let mut out = Vec::new();
+    for item in j_list(stats, "sensors") {
+        let id = j_str(item, "id");
+        let kind = j_str(item, "kind");
+        if id.is_empty() || kind.is_empty() {
+            continue;
+        }
+        let battery = item
+            .get("battery")
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64)))
+            .map(|b| b.clamp(0, 100) as u8);
+        out.push(HueSensor {
+            id: id.to_string(),
+            device_id: j_str(item, "device_id").to_string(),
+            kind: kind.to_string(),
+            name: j_str(item, "name").to_string(),
+            room_id: j_str(item, "room_id").to_string(),
+            enabled: item.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            motion: j_bool(item, "motion"),
+            open: j_bool(item, "open"),
+            temperature: item.get("temperature").and_then(Value::as_f64).filter(|v| v.is_finite()),
+            lux: item.get("lux").and_then(Value::as_f64).filter(|v| v.is_finite()),
+            battery,
+            last_event: j_str(item, "last_event").to_string(),
+        });
+    }
+    out
+}
+
+pub fn parse_motion_areas(stats: &Value) -> Vec<MotionArea> {
+    let mut out = Vec::new();
+    for item in j_list(stats, "motion_areas") {
+        let id = j_str(item, "id");
+        if id.is_empty() {
+            continue;
+        }
+        let light_ids = j_list(item, "light_ids")
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        out.push(MotionArea {
+            id: id.to_string(),
+            name: j_str(item, "name").to_string(),
+            enabled: j_bool(item, "enabled"),
+            room_id: j_str(item, "room_id").to_string(),
+            motion: j_bool(item, "motion"),
+            sensitivity: j_i64(item, "sensitivity"),
+            sensitivity_max: j_i64(item, "sensitivity_max"),
+            light_ids,
+        });
+    }
+    out
 }
 
 pub fn parse_floorplan(stats: &Value) -> Option<FloorplanDocument> {
@@ -1257,6 +1528,8 @@ pub fn extract_bridge_lights(stats: &Value) -> Vec<BridgeLightInfo> {
                 reachable: light.get("reachable").and_then(Value::as_bool) != Some(false),
                 room_id: rid.to_string(),
                 room_name: if rkind == "zone" { String::new() } else { rname.clone() },
+                motion_aware: j_bool(light, "motion_aware"),
+                motion_active: j_bool(light, "motion_active"),
             };
             match by_id.get_mut(lid) {
                 Some(existing) => {
@@ -1267,6 +1540,8 @@ pub fn extract_bridge_lights(stats: &Value) -> Vec<BridgeLightInfo> {
                     if existing.device_id.is_empty() && !info.device_id.is_empty() {
                         existing.device_id = info.device_id;
                     }
+                    existing.motion_aware |= info.motion_aware;
+                    existing.motion_active |= info.motion_active;
                 }
                 None => {
                     order.push(lid.to_string());
@@ -1404,6 +1679,29 @@ pub fn cmd_entertainment_sync(area_id: &str, box_id: &str) -> Value {
     json!({ "cmd": "entertainment_sync", "area_id": area_id, "box_id": box_id })
 }
 
+pub fn cmd_sensor_toggle(kind: &str, id: &str, enabled: bool) -> Value {
+    json!({
+        "cmd": "sensor_toggle",
+        "kind": kind,
+        "id": id,
+        "enabled": enabled,
+    })
+}
+
+pub fn cmd_motion_area_update(id: &str, enabled: Option<bool>, sensitivity: Option<i64>) -> Value {
+    let mut obj = json!({
+        "cmd": "motion_area_update",
+        "id": id,
+    });
+    if let Some(en) = enabled {
+        obj["enabled"] = json!(en);
+    }
+    if let Some(sens) = sensitivity {
+        obj["sensitivity"] = json!(sens);
+    }
+    obj
+}
+
 // ------------------------------------------------------------------------- Floorplan localization labels
 
 pub fn template_label(id: &str) -> String {
@@ -1448,6 +1746,7 @@ pub fn lamp_icon_label(icon: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn lamp_icon_glyph(icon: &str) -> &'static str {
     match normalize_lamp_icon(icon) {
         "spot" => "◎",
@@ -1462,6 +1761,24 @@ pub fn lamp_icon_glyph(icon: &str) -> &'static str {
         "outdoor" => "☀",
         "candle" => "▲",
         _ => "◉",
+    }
+}
+
+/// Crisp 16×16 symbolic SVG matching the Floorplan canvas's `draw_lamp_icon` silhouettes 1:1.
+pub fn lamp_icon_svg(icon: &str) -> &'static [u8] {
+    match normalize_lamp_icon(icon) {
+        "spot" => br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M5 1.5h6l2.8 7.5H2.2L5 1.5zM7.2 10.5h1.6v4H7.2v-4zm-3.4-.3l1.3.7-1.6 3-1.3-.7 1.6-3zm8.4 0l1.6 3-1.3.7-1.6-3 1.3-.7z"/></svg>"#,
+        "strip" => br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><rect fill="none" stroke="currentColor" stroke-width="1.8" x="1.5" y="5.2" width="13" height="5.6" rx="2.5"/><circle fill="currentColor" cx="4.8" cy="8" r="1.3"/><circle fill="currentColor" cx="8" cy="8" r="1.3"/><circle fill="currentColor" cx="11.2" cy="8" r="1.3"/></svg>"#,
+        "floor" => br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M5 1.5h6l2 5.2H3L5 1.5zM7.2 7h1.6v6.5h3V15H4.2v-1.5h3V7z"/></svg>"#,
+        "table" => br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M4.2 2.5h7.6L14 8.8H2L4.2 2.5zM7 9.2h2v3.6h2.8v1.7H4.2v-1.7H7V9.2z"/></svg>"#,
+        "pendant" => br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><rect fill="currentColor" x="7.2" y="1" width="1.6" height="4.5"/><path fill="currentColor" d="M2.5 11.2a5.5 5.5 0 0 1 11 0H2.5z"/><circle fill="currentColor" cx="8" cy="12.8" r="1.7"/></svg>"#,
+        "ceiling" => br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><rect fill="currentColor" x="1.8" y="3" width="12.4" height="1.8" rx="0.9"/><path fill="currentColor" d="M3.5 5.2h9a4.5 4.5 0 0 1-9 0z"/><rect fill="currentColor" x="7.2" y="11" width="1.6" height="3.4" rx="0.8"/><path fill="currentColor" d="M3.6 10.5l1.3.9-1.5 2.3-1.3-.9 1.5-2.3zm8.8 0l1.5 2.3-1.3.9-1.5-2.3 1.3-.9z"/></svg>"#,
+        "wall" => br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><rect fill="currentColor" x="2" y="2.2" width="2" height="11.6" rx="1"/><path fill="currentColor" d="M4.5 6.4l7.5-3.2v9.6L4.5 9.6V6.4z"/><rect fill="currentColor" x="13" y="7.2" width="1.8" height="1.6" rx="0.6"/></svg>"#,
+        "bar" => br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><rect fill="currentColor" x="5.5" y="1.5" width="5" height="13" rx="2.2"/></svg>"#,
+        "desk" => br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M5 13L7 7.5 11.2 3.8"/><path fill="currentColor" d="M9.6 1.8l4.4 3.4-2.2 2.4-3.4-2.6 1.2-3.2z"/><rect fill="currentColor" x="2.2" y="12.5" width="7.6" height="2" rx="1"/></svg>"#,
+        "outdoor" => br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><circle fill="currentColor" cx="8" cy="8" r="3.4"/><path fill="currentColor" d="M7.2 1h1.6v2.2H7.2V1zm0 11.8h1.6V15H7.2v-2.2zM1 7.2h2.2v1.6H1V7.2zm11.8 0H15v1.6h-2.2V7.2zM2.5 3.6l1.1-1.1 1.6 1.6-1.1 1.1-1.6-1.6zm8.3 8.3l1.1-1.1 1.6 1.6-1.1 1.1-1.6-1.6zm1.6-9.4l1.1 1.1-1.6 1.6-1.1-1.1 1.6-1.6zm-8.3 8.3l1.1 1.1-1.6 1.6-1.1-1.1 1.6-1.6z"/></svg>"#,
+        "candle" => br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M8 1.2C9.9 3.4 11 5.2 11 6.7a3 3 0 1 1-6 0C5 5.2 6.1 3.4 8 1.2z"/><rect fill="currentColor" x="5.4" y="10.2" width="5.2" height="4.6" rx="1"/></svg>"#,
+        _ => br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M8 1.5a4.6 4.6 0 0 0-2.6 8.4c.4.3.6.7.6 1.2v.4h4v-.4c0-.5.2-.9.6-1.2A4.6 4.6 0 0 0 8 1.5zM6 12.6h4v1.1H6v-1.1zm.8 1.8h2.4v.9H6.8v-.9z"/></svg>"#,
     }
 }
 
@@ -1684,6 +2001,27 @@ mod tests {
     }
 
     #[test]
+    fn skin_palettes_populate_theme_colors() {
+        assert!(skin_style("native").is_none());
+        for skin in SKINS {
+            if skin == "native" {
+                continue;
+            }
+            let st = skin_style(skin).expect("non-native skin must have SkinStyle");
+            let pal = st.palette();
+            assert!(!pal.is_empty(), "skin {skin} palette must not be empty");
+            assert_eq!(pal.accent, Some(st.accent_rgb));
+            assert_eq!(pal.background, Some(st.window_bg));
+            assert_eq!(pal.foreground, Some(st.foreground));
+            assert!(pal.red.is_none());
+            assert!(pal.yellow.is_none());
+            assert!(pal.green.is_none());
+            let theme = maprisma_hue_lights::look::theme_from(&pal, Some(12.0));
+            assert!(theme.cosmic().is_dark);
+        }
+    }
+
+    #[test]
     fn panel_icons_normalize_glyphs_and_svgs() {
         assert_eq!(normalize_panel_icon(""), "bulb");
         assert_eq!(normalize_panel_icon("invalid"), "bulb");
@@ -1839,6 +2177,8 @@ mod tests {
             assert_eq!(normalize_lamp_icon(ic), ic);
             assert!(!lamp_icon_label(ic).is_empty());
             assert!(!lamp_icon_glyph(ic).is_empty());
+            let svg = std::str::from_utf8(lamp_icon_svg(ic)).expect("valid utf8 lamp svg");
+            assert!(svg.contains("<svg") && svg.contains("currentColor"));
         }
         assert_eq!(normalize_lamp_icon("floor_lamp"), "floor");
         assert_eq!(normalize_lamp_icon("bogus"), "bulb");
@@ -1864,5 +2204,171 @@ mod tests {
         let scmd = sd.to_command().unwrap();
         assert_eq!(scmd["action"], "scene");
         assert_eq!(scmd["scene_id"], "sc1");
+    }
+
+    #[test]
+    fn sensors_motion_areas_floorplan_and_rule_triggers() {
+        let stats = json!({
+            "bridge": {"name": "Hue Bridge Pro", "ip": "192.168.1.2", "is_pro": true, "model_id": "BSB003"},
+            "rooms": [{
+                "id": "r1",
+                "kind": "room",
+                "name": "Living Room",
+                "lights": [{
+                    "id": "l1",
+                    "device_id": "d1",
+                    "name": "Arc Lamp",
+                    "on": true,
+                    "bri": 80.0,
+                    "color": "#ffaa44",
+                    "reachable": true,
+                    "motion_aware": true,
+                    "motion_active": true
+                }]
+            }],
+            "sensors": [
+                {
+                    "id": "s-mot",
+                    "device_id": "dev-mot",
+                    "kind": "motion",
+                    "name": "Hallway",
+                    "room_id": "r1",
+                    "enabled": true,
+                    "motion": true,
+                    "open": false,
+                    "temperature": 21.4,
+                    "lux": 120.5,
+                    "battery": 88,
+                    "battery_state": "normal",
+                    "sensitivity": 2,
+                    "sensitivity_max": 4,
+                    "last_event": "2026-11-24T20:00:00Z"
+                },
+                {
+                    "id": "s-con",
+                    "device_id": "dev-con",
+                    "kind": "contact",
+                    "name": "Front Door",
+                    "room_id": "r1",
+                    "enabled": true,
+                    "motion": false,
+                    "open": true,
+                    "temperature": null,
+                    "lux": null,
+                    "battery": 95,
+                    "last_event": ""
+                },
+                {
+                    "id": "s-btn",
+                    "device_id": "dev-btn",
+                    "kind": "button",
+                    "name": "Dimmer",
+                    "room_id": "r1",
+                    "enabled": true,
+                    "motion": false,
+                    "open": false,
+                    "battery": 70,
+                    "last_event": "short_release"
+                }
+            ],
+            "motion_areas": [
+                {
+                    "id": "ma-1",
+                    "name": "Living Room",
+                    "enabled": true,
+                    "room_id": "r1",
+                    "motion": true,
+                    "motion_valid": true,
+                    "sensitivity": 3,
+                    "sensitivity_max": 5,
+                    "convenience_id": "conv-1",
+                    "light_ids": ["l1"],
+                    "health": "ok"
+                }
+            ],
+            "floorplan": {
+                "version": 1,
+                "lamps": {"l1": {"x": 100.0, "y": 100.0}},
+                "sensors": {"s-mot": {"x": 220.0, "y": 140.0}}
+            }
+        });
+
+        let lights = extract_bridge_lights(&stats);
+        assert_eq!(lights.len(), 1);
+        assert!(lights[0].motion_aware);
+        assert!(lights[0].motion_active);
+
+        let sensors = parse_sensors(&stats);
+        assert_eq!(sensors.len(), 3);
+        assert_eq!(sensors[0].id, "s-mot");
+        assert_eq!(sensors[0].kind, "motion");
+        assert!(sensors[0].motion);
+        assert_eq!(sensors[0].temperature, Some(21.4));
+        assert_eq!(sensors[0].lux, Some(120.5));
+        assert_eq!(sensors[0].battery, Some(88));
+        assert!(sensors[1].open);
+        assert_eq!(sensors[2].kind, "button");
+
+        let areas = parse_motion_areas(&stats);
+        assert_eq!(areas.len(), 1);
+        assert_eq!(areas[0].id, "ma-1");
+        assert!(areas[0].enabled);
+        assert!(areas[0].motion);
+        assert_eq!(areas[0].sensitivity, Some(3));
+        assert_eq!(areas[0].sensitivity_max, Some(5));
+        assert_eq!(areas[0].light_ids, vec!["l1".to_string()]);
+
+        // FloorplanDocument.sensors round-trip
+        let doc = parse_floorplan(&stats).expect("floorplan with sensors should parse");
+        assert_eq!(doc.sensors.get("s-mot"), Some(&FloorplanSensor { x: 220.0, y: 140.0 }));
+        let saved = cmd_floorplan_save(&doc);
+        assert_eq!(saved["floorplan"]["sensors"]["s-mot"]["x"], 220.0);
+        assert_eq!(saved["floorplan"]["sensors"]["s-mot"]["y"], 140.0);
+
+        // Name resolution
+        assert_eq!(resolve_name(&stats, "motion", "s-mot"), "Hallway");
+        assert_eq!(resolve_name(&stats, "contact", "s-con"), "Front Door");
+        assert_eq!(resolve_name(&stats, "button", "s-btn"), "Dimmer");
+        assert_eq!(resolve_name(&stats, "motion_area", "ma-1"), "Living Room");
+
+        // all_rule_triggers includes rooms, lights, sensors, and motion_areas
+        let triggers = all_rule_triggers(&stats);
+        assert!(triggers.iter().any(|t| t.kind == "room" && t.id == "r1"));
+        assert!(triggers.iter().any(|t| t.kind == "light" && t.id == "l1"));
+        assert!(triggers.iter().any(|t| t.kind == "motion" && t.id == "s-mot" && t.label.contains("Hallway")));
+        assert!(triggers.iter().any(|t| t.kind == "contact" && t.id == "s-con" && t.label.contains("Front Door")));
+        assert!(triggers.iter().any(|t| t.kind == "button" && t.id == "s-btn" && t.label.contains("Dimmer")));
+        assert!(triggers.iter().any(|t| t.kind == "motion_area" && t.id == "ma-1" && t.label.contains("Living Room")));
+
+        // Command builders
+        let st_cmd = cmd_sensor_toggle("motion", "s-mot", false);
+        assert_eq!(st_cmd, json!({"cmd": "sensor_toggle", "kind": "motion", "id": "s-mot", "enabled": false}));
+        let ma_cmd = cmd_motion_area_update("ma-1", Some(true), Some(4));
+        assert_eq!(ma_cmd, json!({"cmd": "motion_area_update", "id": "ma-1", "enabled": true, "sensitivity": 4}));
+        let ma_sens_only = cmd_motion_area_update("ma-1", None, Some(2));
+        assert!(ma_sens_only.get("enabled").is_none());
+        assert_eq!(ma_sens_only["sensitivity"], 2);
+
+        // RuleDraft with motion & button triggers disables match_bri and preserves trigger_state
+        let mot_opt = triggers.iter().find(|t| t.id == "s-mot").cloned().unwrap();
+        let lamp_opt = triggers.iter().find(|t| t.id == "l1").cloned().unwrap();
+        let mut mot_draft = RuleDraft::new(Some(mot_opt), Some(lamp_opt.clone()));
+        assert_eq!(mot_draft.trigger_state, "motion");
+        mot_draft.match_bri = true;
+        let mot_cmd = mot_draft.to_command().unwrap();
+        assert_eq!(mot_cmd["rule"]["trigger_kind"], "motion");
+        assert_eq!(mot_cmd["rule"]["trigger_state"], "motion");
+        assert_eq!(mot_cmd["rule"]["match_bri"], false);
+        assert_eq!(mot_cmd["rule"]["mirror_off"], true);
+
+        let btn_opt = triggers.iter().find(|t| t.id == "s-btn").cloned().unwrap();
+        let mut btn_draft = RuleDraft::new(Some(btn_opt), Some(lamp_opt));
+        assert_eq!(btn_draft.trigger_state, "press");
+        btn_draft.trigger_state = "long_press".into();
+        btn_draft.mirror_off = true;
+        let btn_cmd = btn_draft.to_command().unwrap();
+        assert_eq!(btn_cmd["rule"]["trigger_state"], "long_press");
+        assert_eq!(btn_cmd["rule"]["mirror_off"], false);
+        assert_eq!(btn_cmd["rule"]["match_bri"], false);
     }
 }

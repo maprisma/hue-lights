@@ -14,6 +14,7 @@ import atexit
 import fcntl
 import hashlib
 import http.client
+import importlib.util
 import ipaddress
 import json
 import math
@@ -80,9 +81,12 @@ MAX_RULE_LOG = 20
 MAX_API_QUEUE = 64
 MAX_EFFECTS = 64
 MAX_ENTERTAINMENT_AREAS = 32
+MAX_MOTION_AREAS = 64
+MAX_SENSORS = 128
 MAX_FLOORPLAN_BOXES = 40
 MAX_FLOORPLAN_STAMPS = 80
 MAX_FLOORPLAN_LAMPS = 120
+MAX_FLOORPLAN_SENSORS = 128
 MAX_FLOORPLAN_BG_BYTES = 15 * 1024 * 1024
 FLOORPLAN_VERSION = 1
 FLOORPLAN_TEMPLATES = (
@@ -140,7 +144,7 @@ DAY_SHORT_TO_FULL = {
 }
 DAY_FULL_TO_SHORT = {v: k for k, v in DAY_SHORT_TO_FULL.items()}
 DAY_ORDER = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-RULE_KINDS = ("follow", "exclusive", "companion", "desktop")
+RULE_KINDS = ("follow", "exclusive", "companion", "desktop", "sensor")
 SCHEDULE_MODES = ("bridge", "local")
 MAX_SECRETS = 8
 
@@ -414,6 +418,8 @@ def build_model(resources):
             "mirek_max": mirek_max,
             "effect": effect,
             "available_effects": avail_effects,
+            "motion_aware": False,
+            "motion_active": False,
         }
 
     device_lights = {}   # each device's light services, once and capped
@@ -538,6 +544,472 @@ def extract_bridge_home_gl(resources):
             if isinstance(svc, dict) and svc.get("rtype") == "grouped_light" and valid_uuid(svc.get("rid")):
                 return svc["rid"]
     return ""
+
+
+def extract_bridge_model_id(resources):
+    """Extract the Hue Bridge device's product_data.model_id (e.g. 'BSB003' for Bridge Pro)."""
+    if not isinstance(resources, list):
+        return ""
+    fallback = ""
+    for res in resources:
+        if not isinstance(res, dict) or res.get("type") != "device":
+            continue
+        pd = res.get("product_data") if isinstance(res.get("product_data"), dict) else {}
+        raw_mid = pd.get("model_id")
+        mid = clean(raw_mid, 32) if isinstance(raw_mid, str) else ""
+        services = res.get("services") if isinstance(res.get("services"), list) else []
+        is_bridge = any(isinstance(s, dict) and s.get("rtype") == "bridge" for s in services)
+        if is_bridge and mid:
+            return mid
+        if not fallback and mid.upper().startswith("BSB"):
+            fallback = mid
+    return fallback
+
+
+def _extract_motion_state(motion_obj, sse=False):
+    """Extract (motion_bool, motion_valid_bool) from a CLIP v2 motion dict."""
+    if not isinstance(motion_obj, dict):
+        return (None, None) if sse else (False, False)
+    has_valid = isinstance(motion_obj.get("motion_valid"), bool)
+    motion_valid = motion_obj["motion_valid"] if has_valid else None
+    report = motion_obj.get("motion_report") if isinstance(motion_obj.get("motion_report"), dict) else {}
+    rep_motion = report.get("motion") if isinstance(report.get("motion"), bool) else None
+    raw_motion = motion_obj.get("motion") if isinstance(motion_obj.get("motion"), bool) else None
+    if sse:
+        if has_valid:
+            if motion_valid:
+                val = rep_motion if rep_motion is not None else raw_motion
+            else:
+                val = raw_motion
+        else:
+            val = rep_motion if rep_motion is not None else raw_motion
+        return val, motion_valid
+    if has_valid:
+        if motion_valid:
+            val = rep_motion if rep_motion is not None else (raw_motion if raw_motion is not None else False)
+        else:
+            val = raw_motion if raw_motion is not None else False
+        return val, motion_valid
+    if rep_motion is not None:
+        return rep_motion, True
+    if raw_motion is not None:
+        return raw_motion, False
+    return False, False
+
+
+def _lux_from_light_level(raw):
+    """Convert CLIP v2 raw light_level to lux: round(10 ** ((raw - 1) / 10000.0), 1)."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    val = finite(raw, None, 0.0, 65535.0)
+    if val is None:
+        return None
+    return round(10.0 ** ((val - 1.0) / 10000.0), 1)
+
+
+def parse_motion_areas(resources, rooms=None):
+    """Parse Hue Bridge Pro MotionAware resources from CLIP v2 /resource list."""
+    if not isinstance(resources, list):
+        return []
+    device_to_lights = {}
+    if isinstance(rooms, list):
+        for r in rooms:
+            if not isinstance(r, dict):
+                continue
+            for l in r.get("lights") or []:
+                if not isinstance(l, dict):
+                    continue
+                lid = l.get("id")
+                did = l.get("device_id")
+                if valid_uuid(did) and valid_uuid(lid):
+                    lids = device_to_lights.setdefault(did, [])
+                    if lid not in lids:
+                        lids.append(lid)
+
+    cand_to_device = {}
+    conv_by_owner = {}
+    sec_by_owner = {}
+    configs = []
+    for res in resources:
+        if not isinstance(res, dict) or not valid_uuid(res.get("id")):
+            continue
+        rtype = res.get("type")
+        if rtype == "light":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                lids = device_to_lights.setdefault(owner, [])
+                if res["id"] not in lids:
+                    lids.append(res["id"])
+        elif rtype == "device":
+            did = res["id"]
+            for svc in res.get("services") or []:
+                if isinstance(svc, dict) and svc.get("rtype") == "light" and valid_uuid(svc.get("rid")):
+                    lids = device_to_lights.setdefault(did, [])
+                    if svc["rid"] not in lids:
+                        lids.append(svc["rid"])
+        elif rtype == "motion_area_candidate":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                cand_to_device[res["id"]] = owner
+        elif rtype == "convenience_area_motion":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                conv_by_owner.setdefault(owner, res)
+        elif rtype == "security_area_motion":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                sec_by_owner.setdefault(owner, res)
+        elif rtype == "motion_area_configuration":
+            configs.append(res)
+
+    areas = []
+    seen = set()
+    for cfg in configs:
+        if len(areas) >= MAX_MOTION_AREAS:
+            break
+        cid = cfg["id"]
+        if cid in seen:
+            continue
+        seen.add(cid)
+        meta = cfg.get("metadata") if isinstance(cfg.get("metadata"), dict) else {}
+        name = clean(cfg.get("name") or meta.get("name") or "Motion Area", 60) or "Motion Area"
+        conv = conv_by_owner.get(cid) or sec_by_owner.get(cid)
+        if isinstance(cfg.get("enabled"), bool):
+            enabled = cfg["enabled"]
+        elif conv is not None and isinstance(conv.get("enabled"), bool):
+            enabled = conv["enabled"]
+        else:
+            enabled = True
+        grp = cfg.get("group") if isinstance(cfg.get("group"), dict) else {}
+        room_id = grp.get("rid") if valid_uuid(grp.get("rid")) else ""
+
+        light_ids = []
+        seen_lights = set()
+        healths = []
+        for part in (cfg.get("participants") if isinstance(cfg.get("participants"), list) else [])[:MAX_GROUP_LIGHTS]:
+            if not isinstance(part, dict):
+                continue
+            pres = part.get("resource") if isinstance(part.get("resource"), dict) else {}
+            prid = pres.get("rid")
+            prtype = pres.get("rtype")
+            if valid_uuid(prid):
+                if prtype == "light":
+                    resolved = [prid]
+                elif prtype == "device":
+                    resolved = device_to_lights.get(prid, [])
+                else:
+                    did = cand_to_device.get(prid)
+                    resolved = device_to_lights.get(did, []) if did else []
+                for lid in resolved:
+                    if lid not in seen_lights:
+                        seen_lights.add(lid)
+                        light_ids.append(lid)
+            pstatus = part.get("status") if isinstance(part.get("status"), dict) else {}
+            ph = pstatus.get("health") if isinstance(pstatus.get("health"), str) else (
+                part.get("health") if isinstance(part.get("health"), str) else ""
+            )
+            ph = clean(ph, 32)
+            if ph:
+                healths.append(ph)
+
+        bad_health = next((h for h in healths if h.lower() != "healthy"), "")
+        if bad_health:
+            health = bad_health
+        elif healths:
+            health = healths[0]
+        else:
+            top_status = cfg.get("status") if isinstance(cfg.get("status"), dict) else {}
+            top_h = clean(top_status.get("health") or "", 32) if isinstance(top_status.get("health"), str) else ""
+            health = top_h or "healthy"
+
+        if conv is not None:
+            convenience_id = conv["id"]
+            motion_val, motion_valid = _extract_motion_state(conv.get("motion"), sse=False)
+            sens_obj = conv.get("sensitivity") if isinstance(conv.get("sensitivity"), dict) else {}
+            raw_smax = sens_obj.get("sensitivity_max")
+            if raw_smax is not None and not isinstance(raw_smax, bool):
+                smax_f = finite(raw_smax, 4.0, 0.0, 100.0)
+                sens_max = int(round(smax_f))
+            else:
+                sens_max = 4
+            raw_s = sens_obj.get("sensitivity")
+            if raw_s is not None and not isinstance(raw_s, bool):
+                s_f = finite(raw_s, 0.0, 0.0, float(sens_max))
+                sens = int(round(s_f))
+            else:
+                sens = 0
+        else:
+            convenience_id = ""
+            motion_val = False
+            motion_valid = False
+            sens = 0
+            sens_max = 4
+
+        areas.append({
+            "id": cid,
+            "name": name,
+            "enabled": enabled,
+            "room_id": room_id,
+            "motion": motion_val,
+            "motion_valid": motion_valid,
+            "sensitivity": sens,
+            "sensitivity_max": sens_max,
+            "convenience_id": convenience_id,
+            "light_ids": light_ids,
+            "health": health,
+        })
+    areas.sort(key=lambda a: (a["name"].lower(), a["id"]))
+    return areas
+
+
+def annotate_motion_aware_lights(rooms, motion_areas):
+    """Set `motion_aware` and `motion_active` flags on every light in `rooms`."""
+    aware_ids = set()
+    active_ids = set()
+    for area in motion_areas or []:
+        if not isinstance(area, dict) or not area.get("enabled", False):
+            continue
+        lids = area.get("light_ids") or []
+        aware_ids.update(lids)
+        if area.get("motion"):
+            active_ids.update(lids)
+    for room in rooms or []:
+        if not isinstance(room, dict):
+            continue
+        for light in room.get("lights") or []:
+            if not isinstance(light, dict):
+                continue
+            lid = light.get("id")
+            light["motion_aware"] = lid in aware_ids
+            light["motion_active"] = lid in active_ids
+
+
+def _extract_sensor_service_owners(resources):
+    """Map companion/sensor service UUID -> device UUID for SSE correlation."""
+    owners = {}
+    if not isinstance(resources, list):
+        return owners
+    svc_types = ("motion", "contact", "button", "temperature", "light_level", "device_power")
+    for res in resources:
+        if not isinstance(res, dict) or not valid_uuid(res.get("id")):
+            continue
+        rtype = res.get("type")
+        if rtype in svc_types:
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                owners[res["id"]] = owner
+        elif rtype == "device":
+            did = res["id"]
+            for svc in res.get("services") or []:
+                if isinstance(svc, dict) and svc.get("rtype") in svc_types and valid_uuid(svc.get("rid")):
+                    owners.setdefault(svc["rid"], did)
+    return owners
+
+
+def parse_sensors(resources):
+    """Parse physical Hue motion sensors, contact sensors, and buttons/switches from CLIP v2 /resource."""
+    if not isinstance(resources, list):
+        return []
+    devices = {}
+    device_to_room = {}
+    temperatures = {}
+    light_levels = {}
+    device_powers = {}
+    motion_svcs = []
+    contact_svcs = []
+    button_groups = {}  # device_id -> list of button resources
+
+    for res in resources:
+        if not isinstance(res, dict) or not valid_uuid(res.get("id")):
+            continue
+        rtype = res.get("type")
+        if rtype == "device":
+            devices[res["id"]] = res
+        elif rtype == "room":
+            room_id = res["id"]
+            for child in res.get("children") or []:
+                if isinstance(child, dict) and child.get("rtype") == "device" and valid_uuid(child.get("rid")):
+                    device_to_room.setdefault(child["rid"], room_id)
+        elif rtype == "temperature":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                tobj = res.get("temperature") if isinstance(res.get("temperature"), dict) else {}
+                if tobj.get("temperature_valid"):
+                    rep = tobj.get("temperature_report") if isinstance(tobj.get("temperature_report"), dict) else {}
+                    raw_t = rep.get("temperature")
+                    if raw_t is None or isinstance(raw_t, bool):
+                        raw_t = tobj.get("temperature")
+                    if raw_t is not None and not isinstance(raw_t, bool):
+                        tval = finite(raw_t, None, -50.0, 120.0)
+                        if tval is not None:
+                            temperatures[owner] = round(tval, 1)
+        elif rtype == "light_level":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                lobj = res.get("light") if isinstance(res.get("light"), dict) else (
+                    res.get("light_level") if isinstance(res.get("light_level"), dict) else {}
+                )
+                if lobj.get("light_level_valid"):
+                    rep = lobj.get("light_level_report") if isinstance(lobj.get("light_level_report"), dict) else {}
+                    raw_ll = rep.get("light_level")
+                    if raw_ll is None or isinstance(raw_ll, bool):
+                        raw_ll = lobj.get("light_level")
+                    lux = _lux_from_light_level(raw_ll)
+                    if lux is not None:
+                        light_levels[owner] = lux
+        elif rtype == "device_power":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            if valid_uuid(owner):
+                ps = res.get("power_state") if isinstance(res.get("power_state"), dict) else {}
+                raw_bat = ps.get("battery_level")
+                bat = None
+                if raw_bat is not None and not isinstance(raw_bat, bool):
+                    bf = finite(raw_bat, None, 0.0, 100.0)
+                    if bf is not None:
+                        bat = int(round(bf))
+                bstate = clean(ps.get("battery_state") or "", 24) if isinstance(ps.get("battery_state"), str) else ""
+                device_powers[owner] = (bat, bstate)
+        elif rtype == "motion":
+            motion_svcs.append(res)
+        elif rtype == "contact":
+            contact_svcs.append(res)
+        elif rtype == "button":
+            owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+            key = owner if valid_uuid(owner) else res["id"]
+            button_groups.setdefault(key, []).append(res)
+
+    def _device_name(did, res_obj, fallback):
+        dev = devices.get(did) if did else None
+        dev_name = ((dev.get("metadata") if isinstance(dev.get("metadata"), dict) else {}).get("name") if dev else "")
+        res_name = ((res_obj.get("metadata") if isinstance(res_obj.get("metadata"), dict) else {}).get("name") if res_obj else "")
+        return clean(dev_name or res_name or fallback, 60) or fallback
+
+    sensors = []
+    seen = set()
+
+    for res in motion_svcs:
+        if len(sensors) >= MAX_SENSORS:
+            break
+        sid = res["id"]
+        if ("motion", sid) in seen:
+            continue
+        seen.add(("motion", sid))
+        owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+        did = owner if valid_uuid(owner) else ""
+        bat, bstate = device_powers.get(did, (None, ""))
+        motion_val, _ = _extract_motion_state(res.get("motion"), sse=False)
+        sens_obj = res.get("sensitivity") if isinstance(res.get("sensitivity"), dict) else {}
+        raw_smax = sens_obj.get("sensitivity_max")
+        sens_max = None
+        if raw_smax is not None and not isinstance(raw_smax, bool):
+            sf = finite(raw_smax, None, 0.0, 100.0)
+            if sf is not None:
+                sens_max = int(round(sf))
+        raw_s = sens_obj.get("sensitivity")
+        sens = None
+        if raw_s is not None and not isinstance(raw_s, bool):
+            hi = float(sens_max) if sens_max is not None else 100.0
+            sf = finite(raw_s, None, 0.0, hi)
+            if sf is not None:
+                sens = int(round(sf))
+        sensors.append({
+            "id": sid,
+            "device_id": did,
+            "kind": "motion",
+            "name": _device_name(did, res, "Motion Sensor"),
+            "room_id": device_to_room.get(did, ""),
+            "enabled": res["enabled"] if isinstance(res.get("enabled"), bool) else True,
+            "motion": motion_val,
+            "open": False,
+            "temperature": temperatures.get(did),
+            "lux": light_levels.get(did),
+            "battery": bat,
+            "battery_state": bstate,
+            "sensitivity": sens,
+            "sensitivity_max": sens_max,
+            "button_ids": [],
+            "last_event": "",
+        })
+
+    for res in contact_svcs:
+        if len(sensors) >= MAX_SENSORS:
+            break
+        sid = res["id"]
+        if ("contact", sid) in seen:
+            continue
+        seen.add(("contact", sid))
+        owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+        did = owner if valid_uuid(owner) else ""
+        bat, bstate = device_powers.get(did, (None, ""))
+        rep = res.get("contact_report") if isinstance(res.get("contact_report"), dict) else {}
+        is_open = rep.get("state") == "no_contact"
+        sensors.append({
+            "id": sid,
+            "device_id": did,
+            "kind": "contact",
+            "name": _device_name(did, res, "Contact Sensor"),
+            "room_id": device_to_room.get(did, ""),
+            "enabled": res["enabled"] if isinstance(res.get("enabled"), bool) else True,
+            "motion": False,
+            "open": is_open,
+            "temperature": None,
+            "lux": None,
+            "battery": bat,
+            "battery_state": bstate,
+            "sensitivity": None,
+            "sensitivity_max": None,
+            "button_ids": [],
+            "last_event": "",
+        })
+
+    for did, btn_list in button_groups.items():
+        if len(sensors) >= MAX_SENSORS:
+            break
+        if ("button", did) in seen:
+            continue
+        seen.add(("button", did))
+        bat, bstate = device_powers.get(did, (None, ""))
+        btn_ids = []
+        seen_bids = set()
+        best_ts = ""
+        best_ev = ""
+        fallback_ev = ""
+        for bres in btn_list:
+            bid = bres["id"]
+            if bid not in seen_bids:
+                seen_bids.add(bid)
+                btn_ids.append(bid)
+            bobj = bres.get("button") if isinstance(bres.get("button"), dict) else {}
+            brep = bobj.get("button_report") if isinstance(bobj.get("button_report"), dict) else {}
+            ev = clean(brep.get("event") or "", 32) if isinstance(brep.get("event"), str) else ""
+            ts = brep.get("updated") if isinstance(brep.get("updated"), str) else ""
+            if ev:
+                if not best_ev or (ts and ts >= best_ts):
+                    best_ts = ts
+                    best_ev = ev
+            elif not fallback_ev and isinstance(bobj.get("last_event"), str):
+                fallback_ev = clean(bobj["last_event"], 32)
+        sensors.append({
+            "id": did,
+            "device_id": did,
+            "kind": "button",
+            "name": _device_name(did, btn_list[0], "Switch"),
+            "room_id": device_to_room.get(did, ""),
+            "enabled": True,
+            "motion": False,
+            "open": False,
+            "temperature": None,
+            "lux": None,
+            "battery": bat,
+            "battery_state": bstate,
+            "sensitivity": None,
+            "sensitivity_max": None,
+            "button_ids": btn_ids,
+            "last_event": best_ev or fallback_ev,
+        })
+
+    sensors.sort(key=lambda s: (s["kind"], s["name"].lower(), s["id"]))
+    return sensors
 
 
 def _extract_light_entertainment_services(resources):
@@ -1038,6 +1510,12 @@ def parse_sse_events(payload):
         return []
     if not isinstance(events, list):
         return []
+    supported = (
+        "light", "grouped_light",
+        "motion", "contact", "button",
+        "temperature", "light_level", "device_power",
+        "convenience_area_motion", "security_area_motion", "motion_area_configuration",
+    )
     updates = []
     for ev in events:
         if not isinstance(ev, dict) or ev.get("type") != "update":
@@ -1050,44 +1528,121 @@ def parse_sse_events(payload):
                 continue
             kind = item.get("type")
             rid = item.get("id")
-            if kind not in ("light", "grouped_light") or not valid_uuid(rid):
+            if kind not in supported or not valid_uuid(rid):
                 continue
             changes = {}
-            on_obj = item.get("on")
-            if isinstance(on_obj, dict) and isinstance(on_obj.get("on"), bool):
-                changes["on"] = on_obj["on"]
-            dim_obj = item.get("dimming")
-            if isinstance(dim_obj, dict) and dim_obj.get("brightness") is not None and not isinstance(dim_obj.get("brightness"), bool):
-                b = finite(dim_obj.get("brightness"), None, 0.0, 100.0)
-                if b is not None:
-                    changes["bri"] = round(b, 1)
-            ct_obj = item.get("color_temperature")
-            if isinstance(ct_obj, dict):
-                if ct_obj.get("mirek_valid") is False:
-                    changes["mirek"] = None
-                elif ct_obj.get("mirek") is not None and not isinstance(ct_obj.get("mirek"), bool):
-                    m = finite(ct_obj.get("mirek"), None, 153.0, 500.0)
-                    if m is not None:
-                        changes["mirek"] = int(round(m))
-            col_obj = item.get("color")
-            if isinstance(col_obj, dict) and isinstance(col_obj.get("xy"), dict):
-                xy = col_obj["xy"]
-                rx, ry = xy.get("x"), xy.get("y")
-                if not isinstance(rx, bool) and not isinstance(ry, bool):
-                    x, y = finite(rx, None, 0.0, 1.0), finite(ry, None, 0.0, 1.0)
-                    if x is not None and y is not None and y > 0:
-                        changes["xy"] = (round(x, 4), round(y, 4))
-            eff_obj = item.get("effects")
-            if isinstance(eff_obj, dict):
-                st = eff_obj.get("status")
-                if isinstance(st, str) and EFFECT_RE.match(st):
-                    changes["effect"] = st
-            meta_obj = item.get("metadata")
-            if isinstance(meta_obj, dict) and isinstance(meta_obj.get("name"), str):
-                nm = clean(meta_obj["name"], 60)
-                if nm:
-                    changes["name"] = nm
+            if kind in ("light", "grouped_light"):
+                on_obj = item.get("on")
+                if isinstance(on_obj, dict) and isinstance(on_obj.get("on"), bool):
+                    changes["on"] = on_obj["on"]
+                dim_obj = item.get("dimming")
+                if isinstance(dim_obj, dict) and dim_obj.get("brightness") is not None and not isinstance(dim_obj.get("brightness"), bool):
+                    b = finite(dim_obj.get("brightness"), None, 0.0, 100.0)
+                    if b is not None:
+                        changes["bri"] = round(b, 1)
+                ct_obj = item.get("color_temperature")
+                if isinstance(ct_obj, dict):
+                    if ct_obj.get("mirek_valid") is False:
+                        changes["mirek"] = None
+                    elif ct_obj.get("mirek") is not None and not isinstance(ct_obj.get("mirek"), bool):
+                        m = finite(ct_obj.get("mirek"), None, 153.0, 500.0)
+                        if m is not None:
+                            changes["mirek"] = int(round(m))
+                col_obj = item.get("color")
+                if isinstance(col_obj, dict) and isinstance(col_obj.get("xy"), dict):
+                    xy = col_obj["xy"]
+                    rx, ry = xy.get("x"), xy.get("y")
+                    if not isinstance(rx, bool) and not isinstance(ry, bool):
+                        x, y = finite(rx, None, 0.0, 1.0), finite(ry, None, 0.0, 1.0)
+                        if x is not None and y is not None and y > 0:
+                            changes["xy"] = (round(x, 4), round(y, 4))
+                eff_obj = item.get("effects")
+                if isinstance(eff_obj, dict):
+                    st = eff_obj.get("status")
+                    if isinstance(st, str) and EFFECT_RE.match(st):
+                        changes["effect"] = st
+                meta_obj = item.get("metadata")
+                if isinstance(meta_obj, dict) and isinstance(meta_obj.get("name"), str):
+                    nm = clean(meta_obj["name"], 60)
+                    if nm:
+                        changes["name"] = nm
+            elif kind in ("motion", "convenience_area_motion", "security_area_motion"):
+                if isinstance(item.get("enabled"), bool):
+                    changes["enabled"] = item["enabled"]
+                mval, mvalid = _extract_motion_state(item.get("motion"), sse=True)
+                if mval is not None:
+                    changes["motion"] = mval
+                if mvalid is not None:
+                    changes["motion_valid"] = mvalid
+                sens_obj = item.get("sensitivity")
+                if isinstance(sens_obj, dict):
+                    raw_s = sens_obj.get("sensitivity")
+                    if raw_s is not None and not isinstance(raw_s, bool):
+                        sf = finite(raw_s, None, 0.0, 100.0)
+                        if sf is not None:
+                            changes["sensitivity"] = int(round(sf))
+            elif kind == "motion_area_configuration":
+                if isinstance(item.get("enabled"), bool):
+                    changes["enabled"] = item["enabled"]
+                meta_obj = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+                raw_nm = item.get("name") if isinstance(item.get("name"), str) else meta_obj.get("name")
+                if isinstance(raw_nm, str):
+                    nm = clean(raw_nm, 60)
+                    if nm:
+                        changes["name"] = nm
+            elif kind == "contact":
+                if isinstance(item.get("enabled"), bool):
+                    changes["enabled"] = item["enabled"]
+                rep = item.get("contact_report")
+                if isinstance(rep, dict) and isinstance(rep.get("state"), str):
+                    changes["open"] = (rep["state"] == "no_contact")
+            elif kind == "button":
+                bobj = item.get("button")
+                if isinstance(bobj, dict):
+                    brep = bobj.get("button_report") if isinstance(bobj.get("button_report"), dict) else {}
+                    raw_ev = brep.get("event") if isinstance(brep.get("event"), str) else bobj.get("last_event")
+                    if isinstance(raw_ev, str):
+                        ev_clean = clean(raw_ev, 32)
+                        if ev_clean:
+                            changes["last_event"] = ev_clean
+            elif kind == "temperature":
+                tobj = item.get("temperature")
+                if isinstance(tobj, dict) and tobj.get("temperature_valid") is not False:
+                    rep = tobj.get("temperature_report") if isinstance(tobj.get("temperature_report"), dict) else {}
+                    raw_t = rep.get("temperature")
+                    if raw_t is None or isinstance(raw_t, bool):
+                        raw_t = tobj.get("temperature")
+                    if raw_t is not None and not isinstance(raw_t, bool):
+                        tv = finite(raw_t, None, -50.0, 120.0)
+                        if tv is not None:
+                            changes["temperature"] = round(tv, 1)
+            elif kind == "light_level":
+                lobj = item.get("light") if isinstance(item.get("light"), dict) else item.get("light_level")
+                if isinstance(lobj, dict) and lobj.get("light_level_valid") is not False:
+                    rep = lobj.get("light_level_report") if isinstance(lobj.get("light_level_report"), dict) else {}
+                    raw_ll = rep.get("light_level")
+                    if raw_ll is None or isinstance(raw_ll, bool):
+                        raw_ll = lobj.get("light_level")
+                    lux = _lux_from_light_level(raw_ll)
+                    if lux is not None:
+                        changes["lux"] = lux
+            elif kind == "device_power":
+                ps = item.get("power_state")
+                if isinstance(ps, dict):
+                    raw_bat = ps.get("battery_level")
+                    if raw_bat is not None and not isinstance(raw_bat, bool):
+                        bf = finite(raw_bat, None, 0.0, 100.0)
+                        if bf is not None:
+                            changes["battery"] = int(round(bf))
+                    if isinstance(ps.get("battery_state"), str):
+                        bs = clean(ps["battery_state"], 24)
+                        if bs:
+                            changes["battery_state"] = bs
             if changes:
+                if kind not in ("light", "grouped_light"):
+                    owner_obj = item.get("owner")
+                    if isinstance(owner_obj, dict) and valid_uuid(owner_obj.get("rid")):
+                        changes["owner_id"] = owner_obj["rid"]
                 updates.append((kind, rid, changes))
     return updates
 
@@ -1135,6 +1690,21 @@ def validate_rule(raw):
         if not valid_uuid(trigger_id):
             return None
         if trigger_state not in ("on", "off"):
+            return None
+    elif trigger_kind in ("motion", "motion_area"):
+        if not valid_uuid(trigger_id):
+            return None
+        if trigger_state not in ("motion", "clear"):
+            return None
+    elif trigger_kind == "contact":
+        if not valid_uuid(trigger_id):
+            return None
+        if trigger_state not in ("open", "closed"):
+            return None
+    elif trigger_kind == "button":
+        if not valid_uuid(trigger_id):
+            return None
+        if trigger_state not in ("press", "long_press"):
             return None
     else:
         return None
@@ -1735,6 +2305,24 @@ def validate_floorplan(raw):
             "icon": icon,
         }
 
+    raw_sensors = raw.get("sensors", {})
+    if raw_sensors is None:
+        raw_sensors = {}
+    if not isinstance(raw_sensors, dict) or len(raw_sensors) > MAX_FLOORPLAN_SENSORS:
+        return None
+    sensors = {}
+    for sid, spos in raw_sensors.items():
+        if not valid_uuid(sid) or not isinstance(spos, dict):
+            return None
+        sx = _strict_finite(spos.get("x"), 0.0, 4000.0)
+        sy = _strict_finite(spos.get("y"), 0.0, 3000.0)
+        if sx is None or sy is None:
+            return None
+        sensors[sid] = {
+            "x": round(sx, 1),
+            "y": round(sy, 1),
+        }
+
     return {
         "version": FLOORPLAN_VERSION,
         "bridge_id": bridge_id,
@@ -1750,6 +2338,7 @@ def validate_floorplan(raw):
         "boxes": boxes,
         "stamps": stamps,
         "lamps": lamps,
+        "sensors": sensors,
     }
 
 
@@ -2117,6 +2706,7 @@ def build_floorplan_template(template_id, rooms, bridge_id=""):
         "boxes": boxes,
         "stamps": stamps,
         "lamps": lamps,
+        "sensors": {},
     }
     return validate_floorplan(fp)
 
@@ -3873,6 +4463,26 @@ class SynthController:
 
 
 # ---------------------------------------------------------------------------
+# Lazy loader for optional local Ask AI engine (sibling hue-ai.py, works under python3 -I)
+_AI_MOD_LOCK = threading.Lock()
+_AI_MOD = None
+
+
+def _load_ai_module():
+    global _AI_MOD
+    with _AI_MOD_LOCK:
+        if _AI_MOD is not None:
+            return _AI_MOD
+        ai_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hue-ai.py")
+        spec = importlib.util.spec_from_file_location("hue_ai", ai_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("Ask AI module not found")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _AI_MOD = mod
+        return _AI_MOD
+
+
 # Main state machine
 
 class Hue:
@@ -3888,6 +4498,10 @@ class Hue:
         self.light_count = 0
         self.on_count = 0
         self.bridge_home_gl = ""
+        self.bridge_model_id = ""
+        self.sensors = []
+        self._sensor_service_owners = {}
+        self.motion_areas = []
         self.entertainment_areas = []
         self._light_to_ent_service = {}
         self.floorplan = load_floorplan()
@@ -3907,6 +4521,15 @@ class Hue:
         self.rule_last_fired = {}     # rule_id -> last_fired_monotonic
         self.api_queue = []           # [(method, path, body), ...]
         self.synth = SynthController(self)
+        self.ai_state = {
+            "running": False,
+            "last_prompt": "",
+            "last_reply": "",
+            "last_actions": [],
+            "engine": "",
+            "error": "",
+        }
+        self._ai_seq = 0
         self.phase = "connecting" if self.config else "unpaired"
         self.error = ""
         # error_code/error_args let the panel show the message in its language.
@@ -3986,9 +4609,18 @@ class Hue:
     def snapshot(self):
         with self.lock:
             bridge = {}
+            motion_areas = getattr(self, "motion_areas", [])
+            sensors = getattr(self, "sensors", [])
             if self.config:
-                bridge = {"ip": self.config.get("ip", ""), "name": self.config.get("name", "Hue Bridge"),
-                          "model": self.config.get("model", "")}
+                model_id = getattr(self, "bridge_model_id", "") or self.config.get("model", "")
+                is_pro = (model_id == "BSB003") or (len(motion_areas) > 0)
+                bridge = {
+                    "ip": self.config.get("ip", ""),
+                    "name": self.config.get("name", "Hue Bridge"),
+                    "model": self.config.get("model", ""),
+                    "model_id": model_id,
+                    "is_pro": is_pro,
+                }
             fp = getattr(self, "floorplan", None)
             if fp is None and self.rooms:
                 fp = build_floorplan_template("auto_bridge", self.rooms, bridge_id=self.config.get("bridge_id", "") if self.config else "")
@@ -4012,7 +4644,19 @@ class Hue:
                 "rules_paused": getattr(self, "rules_paused", False),
                 "rule_log": getattr(self, "rule_log", []),
                 "entertainment_areas": getattr(self, "entertainment_areas", []),
+                "motion_areas": motion_areas,
+                "sensors": sensors,
                 "floorplan": fp,
+                "ai": {
+                    "running": bool(self.ai_state.get("running", False)),
+                    "last_prompt": str(self.ai_state.get("last_prompt", "")),
+                    "last_reply": str(self.ai_state.get("last_reply", "")),
+                    "last_actions": list(self.ai_state.get("last_actions", [])),
+                    "engine": str(self.ai_state.get("engine", "")),
+                    "error": str(self.ai_state.get("error", "")),
+                } if isinstance(getattr(self, "ai_state", None), dict) else {
+                    "running": False, "last_prompt": "", "last_reply": "", "last_actions": [], "engine": "", "error": "",
+                },
             }
 
     def emit(self):
@@ -4092,6 +4736,11 @@ class Hue:
                 raise ValueError("unexpected reply")
             rooms, total, on = build_model(data["data"])
             bridge_home_gl = extract_bridge_home_gl(data["data"])
+            bridge_model_id = extract_bridge_model_id(data["data"])
+            motion_areas = parse_motion_areas(data["data"], rooms)
+            annotate_motion_aware_lights(rooms, motion_areas)
+            sensors = parse_sensors(data["data"])
+            sensor_svc_owners = _extract_sensor_service_owners(data["data"])
             schedules, script_id = parse_schedules(data["data"], rooms)
             entertainment_areas = parse_entertainment_areas(data["data"])
             light_to_ent = _extract_light_entertainment_services(data["data"])
@@ -4099,7 +4748,13 @@ class Hue:
                 if self.connection_current(generation):
                     if time.time() >= self.refresh_hold_until:
                         self.rooms, self.light_count, self.on_count = rooms, total, on
+                    else:
+                        annotate_motion_aware_lights(self.rooms, motion_areas)
                     self.bridge_home_gl = bridge_home_gl
+                    self.bridge_model_id = bridge_model_id
+                    self.motion_areas = motion_areas
+                    self.sensors = sensors
+                    self._sensor_service_owners = sensor_svc_owners
                     self.entertainment_areas = entertainment_areas
                     self._light_to_ent_service = light_to_ent
                     if self.floorplan is None and self.rooms:
@@ -4232,6 +4887,7 @@ class Hue:
                     self.conn_generation += 1
                     self.rooms, self.light_count, self.on_count, self.pending = [], 0, 0, {}
                     self.bridge_home_gl, self.bridge_schedules, self.api_queue = "", [], []
+                    self.bridge_model_id, self.sensors, self._sensor_service_owners, self.motion_areas = "", [], {}, []
                     self.entertainment_areas, self._light_to_ent_service = [], {}
                     if self.floorplan and self.floorplan.get("bridge_id") and self.floorplan["bridge_id"] != bridge_id:
                         self.floorplan = None
@@ -4615,7 +5271,7 @@ class Hue:
         }
         fired = 0
         for kind, rid, old_state, new_state in transitions:
-            if kind != "desktop" and (kind, rid) in self.echo_suppress:
+            if kind not in ("desktop", "motion", "motion_area", "contact", "button") and (kind, rid) in self.echo_suppress:
                 exp, expected_on = _echo_entry(self.echo_suppress[(kind, rid)])
                 if exp > now_mono:
                     new_on = new_state.get("on") if isinstance(new_state, dict) else None
@@ -4633,15 +5289,35 @@ class Hue:
                     continue
                 mode = None
                 new_bri = new_state.get("bri") if isinstance(new_state, dict) else None
+                tstate = rule.get("trigger_state")
                 if kind == "desktop":
                     mode = "desktop"
+                elif kind == "button":
+                    new_ev = new_state.get("event") if isinstance(new_state, dict) else ""
+                    if new_ev and new_ev == tstate:
+                        mode = "trigger"
+                elif kind in ("motion", "motion_area"):
+                    old_on = old_state.get("on") if isinstance(old_state, dict) else None
+                    new_on = new_state.get("on") if isinstance(new_state, dict) else None
+                    on_changed = (old_on is not None and new_on is not None and old_on != new_on)
+                    if on_changed and ((new_on is True and tstate == "motion") or (new_on is False and tstate == "clear")):
+                        mode = "trigger"
+                    elif on_changed and rule.get("mirror_off") and tstate == "motion" and new_on is False:
+                        mode = "mirror_off"
+                elif kind == "contact":
+                    old_on = old_state.get("on") if isinstance(old_state, dict) else None
+                    new_on = new_state.get("on") if isinstance(new_state, dict) else None
+                    on_changed = (old_on is not None and new_on is not None and old_on != new_on)
+                    if on_changed and ((new_on is True and tstate == "open") or (new_on is False and tstate == "closed")):
+                        mode = "trigger"
+                    elif on_changed and rule.get("mirror_off") and tstate == "open" and new_on is False:
+                        mode = "mirror_off"
                 else:
                     old_on = old_state.get("on") if isinstance(old_state, dict) else None
                     new_on = new_state.get("on") if isinstance(new_state, dict) else None
                     old_bri = old_state.get("bri") if isinstance(old_state, dict) else None
                     on_changed = (old_on is not None and new_on is not None and old_on != new_on)
                     bri_changed = (old_bri is not None and new_bri is not None and abs(float(old_bri) - float(new_bri)) >= 0.5)
-                    tstate = rule.get("trigger_state")
                     if on_changed and ((new_on is True and tstate == "on") or (new_on is False and tstate == "off")):
                         mode = "trigger"
                     elif on_changed and rule.get("mirror_off") and tstate == "on" and new_on is False:
@@ -4710,6 +5386,10 @@ class Hue:
             if generation is not None and not self.connection_current(generation):
                 return False
             transitions = []
+            sensors = getattr(self, "sensors", [])
+            motion_areas = getattr(self, "motion_areas", [])
+            svc_owners = getattr(self, "_sensor_service_owners", {})
+            motion_areas_changed = False
             for kind, rid, changes in updates:
                 if kind == "light":
                     old_light = None
@@ -4772,6 +5452,114 @@ class Hue:
                                 transitions.append(("grouped_light", rid, old_rs, new_rs))
                                 if room["kind"] == "room" and valid_uuid(room["id"]):
                                     transitions.append(("room", room["id"], old_rs, new_rs))
+                elif kind == "motion":
+                    for sensor in sensors:
+                        if sensor.get("kind") == "motion" and sensor.get("id") == rid:
+                            old_m = bool(sensor.get("motion", False))
+                            if "enabled" in changes:
+                                sensor["enabled"] = changes["enabled"]
+                            if "motion" in changes:
+                                sensor["motion"] = changes["motion"]
+                            if "sensitivity" in changes:
+                                smax = sensor.get("sensitivity_max")
+                                s = changes["sensitivity"]
+                                sensor["sensitivity"] = int(clamp(s, 0, smax)) if smax is not None else s
+                            changed = True
+                            new_m = bool(sensor.get("motion", False))
+                            if "motion" in changes and new_m != old_m:
+                                transitions.append(("motion", sensor["id"], {"on": old_m}, {"on": new_m}))
+                            break
+                elif kind == "contact":
+                    for sensor in sensors:
+                        if sensor.get("kind") == "contact" and sensor.get("id") == rid:
+                            old_o = bool(sensor.get("open", False))
+                            if "enabled" in changes:
+                                sensor["enabled"] = changes["enabled"]
+                            if "open" in changes:
+                                sensor["open"] = changes["open"]
+                            changed = True
+                            new_o = bool(sensor.get("open", False))
+                            if "open" in changes and new_o != old_o:
+                                transitions.append(("contact", sensor["id"], {"on": old_o}, {"on": new_o}))
+                            break
+                elif kind == "button":
+                    owner_id = changes.get("owner_id") or svc_owners.get(rid) or ""
+                    for sensor in sensors:
+                        if sensor.get("kind") != "button":
+                            continue
+                        if (rid in (sensor.get("button_ids") or ())
+                                or sensor.get("id") == rid
+                                or (owner_id and sensor.get("device_id") == owner_id)):
+                            if "last_event" in changes:
+                                raw_ev = changes["last_event"]
+                                sensor["last_event"] = raw_ev
+                                changed = True
+                                if raw_ev in ("long_press", "long_release"):
+                                    norm_ev = "long_press"
+                                elif raw_ev in ("short_release", "initial_press"):
+                                    norm_ev = "press"
+                                else:
+                                    norm_ev = ""
+                                if norm_ev:
+                                    transitions.append(("button", sensor["id"], {"event": ""}, {"event": norm_ev}))
+                            break
+                elif kind == "temperature":
+                    owner_id = changes.get("owner_id") or svc_owners.get(rid) or ""
+                    if owner_id and "temperature" in changes:
+                        for sensor in sensors:
+                            if sensor.get("device_id") == owner_id:
+                                sensor["temperature"] = changes["temperature"]
+                                changed = True
+                elif kind == "light_level":
+                    owner_id = changes.get("owner_id") or svc_owners.get(rid) or ""
+                    if owner_id and "lux" in changes:
+                        for sensor in sensors:
+                            if sensor.get("device_id") == owner_id:
+                                sensor["lux"] = changes["lux"]
+                                changed = True
+                elif kind == "device_power":
+                    owner_id = changes.get("owner_id") or svc_owners.get(rid) or ""
+                    if owner_id:
+                        for sensor in sensors:
+                            if sensor.get("device_id") == owner_id:
+                                if "battery" in changes:
+                                    sensor["battery"] = changes["battery"]
+                                    changed = True
+                                if "battery_state" in changes:
+                                    sensor["battery_state"] = changes["battery_state"]
+                                    changed = True
+                elif kind in ("convenience_area_motion", "security_area_motion"):
+                    owner_id = changes.get("owner_id") or ""
+                    for area in motion_areas:
+                        if area.get("convenience_id") == rid or (owner_id and area.get("id") == owner_id):
+                            old_m = bool(area.get("motion", False))
+                            if "enabled" in changes:
+                                area["enabled"] = changes["enabled"]
+                            if "motion" in changes:
+                                area["motion"] = changes["motion"]
+                            if "motion_valid" in changes:
+                                area["motion_valid"] = changes["motion_valid"]
+                            if "sensitivity" in changes:
+                                smax = area.get("sensitivity_max", 4)
+                                area["sensitivity"] = int(clamp(changes["sensitivity"], 0, smax))
+                            changed = True
+                            motion_areas_changed = True
+                            new_m = bool(area.get("motion", False))
+                            if "motion" in changes and new_m != old_m:
+                                transitions.append(("motion_area", area["id"], {"on": old_m}, {"on": new_m}))
+                            break
+                elif kind == "motion_area_configuration":
+                    for area in motion_areas:
+                        if area.get("id") == rid:
+                            if "enabled" in changes:
+                                area["enabled"] = changes["enabled"]
+                            if "name" in changes:
+                                area["name"] = changes["name"]
+                            changed = True
+                            motion_areas_changed = True
+                            break
+            if motion_areas_changed:
+                annotate_motion_aware_lights(self.rooms, motion_areas)
             if changed:
                 self.on_count = sum(1 for r in self.rooms if r["kind"] != "zone" for l in r["lights"] if l["on"])
                 if transitions:
@@ -4968,6 +5756,7 @@ class Hue:
                 self.pair_ip = ""
                 self.config, self.rooms, self.light_count, self.on_count = {}, [], 0, 0
                 self.bridge_home_gl, self.bridge_schedules = "", []
+                self.bridge_model_id, self.sensors, self._sensor_service_owners, self.motion_areas = "", [], {}, []
                 self.entertainment_areas, self._light_to_ent_service = [], {}
                 self._local_sched_fired = {}
                 self._rebuild_schedules()
@@ -5684,6 +6473,167 @@ class Hue:
                 queued = True
             if queued:
                 self.wake.set()
+        elif name == "sensor_toggle" and self.config:
+            kind = cmd.get("kind")
+            rid = cmd.get("id")
+            enabled = cmd.get("enabled")
+            if kind not in ("motion", "contact") or not valid_uuid(rid) or not isinstance(enabled, bool):
+                return
+            with self.lock:
+                sensor = next(
+                    (s for s in getattr(self, "sensors", []) if s.get("kind") == kind and s.get("id") == rid),
+                    None,
+                )
+                if sensor is None or len(self.api_queue) >= MAX_API_QUEUE:
+                    return
+                self.api_queue.append(("PUT", "/clip/v2/resource/%s/%s" % (kind, rid), {"enabled": enabled}))
+                sensor["enabled"] = enabled
+            self.emit()
+            self.wake.set()
+        elif name == "motion_area_update" and self.config:
+            rid = cmd.get("id")
+            if not valid_uuid(rid):
+                return
+            has_enabled = "enabled" in cmd and cmd["enabled"] is not None
+            has_sens = "sensitivity" in cmd and cmd["sensitivity"] is not None
+            if not has_enabled and not has_sens:
+                return
+            if has_enabled and not isinstance(cmd["enabled"], bool):
+                return
+            if has_sens and (isinstance(cmd["sensitivity"], bool) or not isinstance(cmd["sensitivity"], int)):
+                return
+            with self.lock:
+                area = next(
+                    (a for a in getattr(self, "motion_areas", []) if a.get("id") == rid),
+                    None,
+                )
+                if area is None:
+                    return
+                calls = []
+                if has_enabled:
+                    calls.append((
+                        "PUT",
+                        "/clip/v2/resource/motion_area_configuration/%s" % rid,
+                        {"enabled": cmd["enabled"]},
+                    ))
+                apply_sens = False
+                if has_sens:
+                    smax = area.get("sensitivity_max", 4)
+                    if not (0 <= cmd["sensitivity"] <= smax):
+                        return
+                    conv_id = area.get("convenience_id", "")
+                    if valid_uuid(conv_id):
+                        calls.append((
+                            "PUT",
+                            "/clip/v2/resource/convenience_area_motion/%s" % conv_id,
+                            {"sensitivity": {"sensitivity": cmd["sensitivity"]}},
+                        ))
+                        apply_sens = True
+                if not calls or len(self.api_queue) + len(calls) > MAX_API_QUEUE:
+                    return
+                self.api_queue.extend(calls)
+                if has_enabled:
+                    area["enabled"] = cmd["enabled"]
+                    annotate_motion_aware_lights(self.rooms, self.motion_areas)
+                if apply_sens:
+                    area["sensitivity"] = cmd["sensitivity"]
+            self.emit()
+            self.wake.set()
+        elif name == "ai_clear":
+            with self.lock:
+                self._ai_seq = getattr(self, "_ai_seq", 0) + 1
+                self.ai_state = {
+                    "running": False,
+                    "last_prompt": "",
+                    "last_reply": "",
+                    "last_actions": [],
+                    "engine": "",
+                    "error": "",
+                }
+            self.emit()
+        elif name == "ai_ask":
+            raw_prompt = cmd.get("prompt")
+            prompt = raw_prompt.strip()[:500] if isinstance(raw_prompt, str) else ""
+            if not prompt:
+                with self.lock:
+                    self.ai_state = {
+                        "running": False,
+                        "last_prompt": "",
+                        "last_reply": "",
+                        "last_actions": [],
+                        "engine": "none",
+                        "error": "Please enter a command.",
+                    }
+                self.emit()
+                return
+            raw_url = cmd.get("ollama_url")
+            ollama_url = raw_url.strip() if isinstance(raw_url, str) and raw_url.strip() else "http://127.0.0.1:11434"
+            raw_model = cmd.get("ollama_model")
+            ollama_model = raw_model.strip()[:120] if isinstance(raw_model, str) else ""
+            with self.lock:
+                if isinstance(getattr(self, "ai_state", None), dict) and self.ai_state.get("running"):
+                    return
+                self._ai_seq = getattr(self, "_ai_seq", 0) + 1
+                seq = self._ai_seq
+                self.ai_state = {
+                    "running": True,
+                    "last_prompt": prompt,
+                    "last_reply": "",
+                    "last_actions": [],
+                    "engine": "",
+                    "error": "",
+                }
+            self.emit()
+
+            def _run_ai():
+                reply = ""
+                actions = []
+                engine = "none"
+                err_text = ""
+                try:
+                    ai_mod = _load_ai_module()
+                    res = ai_mod.execute_ask_ai(
+                        self,
+                        prompt,
+                        ollama_url=ollama_url,
+                        ollama_model=ollama_model,
+                    )
+                    if not isinstance(res, dict):
+                        res = {"ok": False, "reply": "", "actions": [], "engine": "none", "error": "Invalid AI response."}
+                    ok = bool(res.get("ok", False))
+                    reply = self.redact(str(res.get("reply") or "")).strip()[:600]
+                    raw_actions = res.get("actions")
+                    if isinstance(raw_actions, list):
+                        actions = [self.redact(str(a)).strip()[:160] for a in raw_actions if str(a).strip()][:20]
+                    engine = str(res.get("engine") or ("builtin" if ok else "none"))[:32]
+                    raw_err = res.get("error")
+                    if raw_err:
+                        err_text = self.redact(str(raw_err)).strip()[:300]
+                    elif not ok and not reply:
+                        err_text = "Could not process request."
+                except Exception as exc:   # noqa: BLE001
+                    err_text = self.safe(exc, 160)
+                    engine = "none"
+                should_wake = False
+                with self.lock:
+                    if getattr(self, "_ai_seq", 0) != seq:
+                        return
+                    self.ai_state = {
+                        "running": False,
+                        "last_prompt": prompt,
+                        "last_reply": reply,
+                        "last_actions": actions,
+                        "engine": engine,
+                        "error": err_text,
+                    }
+                    if actions and any(a != "status" for a in actions):
+                        self.last_refresh = 0
+                        should_wake = True
+                if should_wake:
+                    self.wake.set()
+                self.emit()
+
+            threading.Thread(target=_run_ai, daemon=True).start()
 
     # -- loops
     def worker(self):

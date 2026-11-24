@@ -3,7 +3,8 @@
 //! Renders a 2D spatial studio over an optional custom floorplan image with
 //! resizable Room/Zone boxes, minimalist architectural vector stamps, live
 //! radial lamp halos, 12 selectable vector lamp icons, typed Bezier rule wires,
-//! collapsible lamp sidebar, and context inspectors (Lamp, Room/Scenes, Stamp, Wire).
+//! collapsible lamp sidebar with per-lamp actions and dialogs, and context inspectors
+//! (Room/Scenes, Stamp, Wire).
 
 use std::collections::{HashMap, HashSet};
 use std::f32::consts::{FRAC_PI_2, PI};
@@ -17,15 +18,16 @@ use cosmic::iced::widget::canvas::{
     Program, Stroke, Style, Text as CanvasText,
 };
 use cosmic::iced::widget::{
-    container as iced_container, image as iced_image, stack as iced_stack, text as iced_text,
+    container as iced_container, image as iced_image, stack as iced_stack, svg as iced_svg,
+    text as iced_text,
 };
 use cosmic::iced::{
     Alignment, Background, Border, Color, ContentFit, Length, Pixels, Point, Radians, Rectangle,
     Size, Vector,
 };
 use cosmic::widget::{
-    button, column, container, divider, flex_row, icon, row, scrollable, slider, space, text,
-    text_input, toggler,
+    button, checkbox, column, container, divider, flex_row, icon, row, scrollable, slider, space,
+    text, text_input, toggler,
 };
 use cosmic::{Element, theme};
 use maprisma_hue_lights::corners;
@@ -34,10 +36,12 @@ use serde_json::{Value, json};
 
 use crate::model::{
     BridgeLightInfo, EntertainmentArea, FLOORPLAN_ARCHETYPES, FLOORPLAN_STAMP_KINDS,
-    FLOORPLAN_TEMPLATES, FloorplanBox, FloorplanDocument, FloorplanStamp,
-    LAMP_ICONS, archetype_glyph, archetype_label, extract_bridge_lights, j_bool, j_list, j_str,
-    lamp_icon_glyph, lamp_icon_label, normalize_lamp_icon, parse_entertainment_areas,
-    room_active_schedule_badge, skin_style, stamp_kind_label, synth_target_lights, template_label,
+    FLOORPLAN_TEMPLATES, FloorplanBox, FloorplanDocument, FloorplanStamp, HueSensor, LAMP_ICONS,
+    MotionArea, archetype_glyph, archetype_label, default_trigger_state, extract_bridge_lights,
+    is_light_or_room_trigger, j_bool, j_list, j_str, lamp_icon_label, lamp_icon_svg,
+    normalize_lamp_icon, normalize_trigger_state, parse_entertainment_areas, parse_motion_areas,
+    parse_sensors, resolve_name, room_active_schedule_badge, skin_style, stamp_kind_label,
+    synth_target_lights, template_label, trigger_state_options, valid_hhmm,
 };
 
 // ------------------------------------------------------------------------- Visual constants
@@ -48,8 +52,14 @@ const WIRE_MIRROR: Color = Color::from_rgb(0.133, 0.827, 0.933); // #22D3EE
 const WIRE_EXCLUSIVE: Color = Color::from_rgb(0.957, 0.247, 0.369); // #F43F5E
 const WIRE_COMPANION: Color = Color::from_rgb(0.961, 0.620, 0.043); // #F59E0B
 const SYNTH_MAGENTA: Color = Color::from_rgb(0.851, 0.275, 0.937); // #D946EF
+const MOTION_ACTIVE_COLOR: Color = Color::from_rgb8(0x10, 0xB9, 0x81); // #10B981
+const MOTION_IDLE_COLOR: Color = Color::from_rgb8(0x06, 0xB6, 0xD4); // #06B6D4
+const CONTACT_OPEN_COLOR: Color = Color::from_rgb8(0xF5, 0x9E, 0x0B); // #F59E0B
+const CONTACT_CLOSED_COLOR: Color = Color::from_rgb8(0x14, 0xB8, 0xA6); // #14B8A6
+const BUTTON_COLOR: Color = Color::from_rgb8(0x63, 0x66, 0xF1); // #6366F1
 
-const LAMP_RADIUS_PX: f32 = 16.0;
+const LAMP_RADIUS_PX: f32 = 18.0;
+const SENSOR_HALF_PX: f32 = 14.0;
 const HANDLE_SIZE_PX: f32 = 8.0;
 const MIN_BOX_DIM: f64 = 60.0;
 
@@ -72,6 +82,7 @@ pub enum WireKind {
 }
 
 impl WireKind {
+    #[allow(dead_code)]
     pub const ALL: [WireKind; 4] = [
         WireKind::Follow,
         WireKind::Mirror,
@@ -79,6 +90,7 @@ impl WireKind {
         WireKind::Companion,
     ];
 
+    #[allow(dead_code)]
     pub fn label(self) -> String {
         match self {
             WireKind::Follow => tr("Follow"),
@@ -97,6 +109,7 @@ impl WireKind {
         }
     }
 
+    #[allow(dead_code)]
     pub fn to_rule_payload(self, trigger_id: &str, trigger_name: &str, target_id: &str, target_name: &str) -> Value {
         let (kind, mirror_off, only_if_off, action) = match self {
             WireKind::Follow => ("follow", false, false, "on"),
@@ -153,9 +166,182 @@ pub fn classify_rule_wire(rule: &Value) -> WireKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
     Lamp(String),
+    Sensor(String),
     Box(String),
     Stamp(String),
-    Wire(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LampDialog {
+    Brightness(String),
+    Rename(String),
+    Icon(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapRuleDialog {
+    pub rule_id: Option<String>,
+    pub name: String,
+    pub enabled: bool,
+    pub kind: String,          // "follow" | "exclusive" | "companion"
+    pub trigger_kind: String,  // "light" | "room" | "motion" | "contact" | "button" | "motion_area"
+    pub trigger_id: String,
+    pub trigger_name: String,
+    pub trigger_state: String, // "on"|"off"|"motion"|"clear"|"open"|"closed"|"press"|"long_press"
+    pub target_kind: String,   // "light" | "room"
+    pub target_id: String,
+    pub target_name: String,
+    pub mirror_off: bool,
+    pub match_bri: bool,
+    pub only_if_off: bool,
+    pub time_start: String,
+    pub time_end: String,
+    pub error: Option<String>,
+}
+
+impl MapRuleDialog {
+    pub fn new_between(
+        from_kind: String,
+        from_id: String,
+        from_name: String,
+        to_id: String,
+        to_name: String,
+    ) -> Self {
+        let trigger_state = default_trigger_state(&from_kind).into();
+        let mirror_off = from_kind != "button";
+        Self {
+            rule_id: None,
+            name: String::new(),
+            enabled: true,
+            kind: "follow".into(),
+            trigger_kind: from_kind,
+            trigger_id: from_id,
+            trigger_name: from_name,
+            trigger_state,
+            target_kind: "light".into(),
+            target_id: to_id,
+            target_name: to_name,
+            mirror_off,
+            match_bri: false,
+            only_if_off: false,
+            time_start: String::new(),
+            time_end: String::new(),
+            error: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn new_between_lamps(
+        from_id: String,
+        from_name: String,
+        to_id: String,
+        to_name: String,
+    ) -> Self {
+        Self::new_between("light".into(), from_id, from_name, to_id, to_name)
+    }
+
+    pub fn from_existing_rule(rule: &Value, stats: &Value) -> Option<Self> {
+        let id = j_str(rule, "id");
+        if id.is_empty() {
+            return None;
+        }
+        let name = j_str(rule, "name").to_string();
+        let enabled = j_bool(rule, "enabled");
+        let kind = match j_str(rule, "kind") {
+            "exclusive" => "exclusive",
+            "companion" => "companion",
+            _ => "follow",
+        }
+        .to_string();
+        let trigger_kind = j_str(rule, "trigger_kind").to_string();
+        let trigger_id = j_str(rule, "trigger_id").to_string();
+        let trigger_state = normalize_trigger_state(&trigger_kind, j_str(rule, "trigger_state")).to_string();
+        let first_target = j_list(rule, "targets").first();
+        let target_kind = first_target.map(|t| j_str(t, "kind")).unwrap_or("").to_string();
+        let target_id = first_target.map(|t| j_str(t, "id")).unwrap_or("").to_string();
+        let trigger_name = resolve_name(stats, &trigger_kind, &trigger_id);
+        let target_name = resolve_name(stats, &target_kind, &target_id);
+        Some(Self {
+            rule_id: Some(id.to_string()),
+            name,
+            enabled,
+            kind,
+            trigger_kind,
+            trigger_id,
+            trigger_name,
+            trigger_state,
+            target_kind,
+            target_id,
+            target_name,
+            mirror_off: j_bool(rule, "mirror_off"),
+            match_bri: j_bool(rule, "match_bri"),
+            only_if_off: j_bool(rule, "only_if_off"),
+            time_start: j_str(rule, "time_start").to_string(),
+            time_end: j_str(rule, "time_end").to_string(),
+            error: None,
+        })
+    }
+
+    pub fn target_action(&self) -> &'static str {
+        if self.kind == "exclusive" { "off" } else { "on" }
+    }
+
+    pub fn to_save_command(&self) -> Result<Value, String> {
+        if self.trigger_id.is_empty()
+            || self.target_id.is_empty()
+            || (self.trigger_kind == self.target_kind && self.trigger_id == self.target_id)
+        {
+            return Err(tr("Choose trigger and target"));
+        }
+        let ts = self.time_start.trim();
+        let te = self.time_end.trim();
+        if (!ts.is_empty() && !valid_hhmm(ts)) || (!te.is_empty() && !valid_hhmm(te)) {
+            return Err(tr("Invalid time (use HH:MM)"));
+        }
+        let supports_bri = is_light_or_room_trigger(&self.trigger_kind);
+        let supports_mirror = self.trigger_kind != "button";
+        let mirror_off = self.mirror_off && self.kind != "exclusive" && supports_mirror;
+        let match_bri = self.match_bri && self.kind != "exclusive" && supports_bri;
+        let trigger_state = normalize_trigger_state(&self.trigger_kind, &self.trigger_state);
+        let name = if self.name.trim().is_empty() {
+            let arrow = if self.kind == "exclusive" {
+                "⊘"
+            } else if self.kind == "follow" && mirror_off {
+                "↔"
+            } else {
+                "→"
+            };
+            let a = self.trigger_name.split(" · ").next().unwrap_or(&self.trigger_name);
+            let b = self.target_name.split(" · ").next().unwrap_or(&self.target_name);
+            format!("{a} {arrow} {b}")
+        } else {
+            self.name.trim().to_string()
+        };
+        let mut rule_obj = json!({
+            "name": name,
+            "enabled": self.enabled,
+            "kind": self.kind,
+            "trigger_kind": self.trigger_kind,
+            "trigger_id": self.trigger_id,
+            "trigger_state": trigger_state,
+            "targets": [{
+                "kind": self.target_kind,
+                "id": self.target_id,
+                "action": self.target_action(),
+                "bri": Value::Null,
+                "scene_id": "",
+            }],
+            "mirror_off": mirror_off,
+            "match_bri": match_bri,
+            "time_start": ts,
+            "time_end": te,
+            "only_if_off": self.only_if_off && self.kind != "exclusive",
+        });
+        if let Some(ref rid) = self.rule_id {
+            rule_obj["id"] = json!(rid);
+        }
+        Ok(json!({ "cmd": "rule_save", "rule": rule_obj }))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,19 +369,23 @@ impl ResizeHandle {
     ];
 
     pub fn world_point(self, b: &FloorplanBox) -> (f64, f64) {
-        let cx = b.x + b.w * 0.5;
-        let cy = b.y + b.h * 0.5;
-        let rx = b.x + b.w;
-        let by = b.y + b.h;
+        self.world_point_rect(b.x, b.y, b.w, b.h)
+    }
+
+    pub fn world_point_rect(self, x: f64, y: f64, w: f64, h: f64) -> (f64, f64) {
+        let cx = x + w * 0.5;
+        let cy = y + h * 0.5;
+        let rx = x + w;
+        let by = y + h;
         match self {
-            ResizeHandle::NW => (b.x, b.y),
-            ResizeHandle::N => (cx, b.y),
-            ResizeHandle::NE => (rx, b.y),
+            ResizeHandle::NW => (x, y),
+            ResizeHandle::N => (cx, y),
+            ResizeHandle::NE => (rx, y),
             ResizeHandle::E => (rx, cy),
             ResizeHandle::SE => (rx, by),
             ResizeHandle::S => (cx, by),
-            ResizeHandle::SW => (b.x, by),
-            ResizeHandle::W => (b.x, cy),
+            ResizeHandle::SW => (x, by),
+            ResizeHandle::W => (x, cy),
         }
     }
 
@@ -215,13 +405,13 @@ impl ResizeHandle {
 pub enum MapMsg {
     ToggleSidebar,
     SearchChanged(String),
+    ToggleAddMenu,
+    ToggleViewMenu,
     ToggleTemplatesMenu,
     ApplyTemplate(String),
     AddBox(String), // "room" | "zone"
-    ToggleStampsMenu,
     AddStamp(String),
     SetMode(CanvasMode),
-    SetWireKind(WireKind),
     ToggleGlows,
     ToggleFurniture,
     ToggleWires,
@@ -244,6 +434,19 @@ pub enum MapMsg {
     ArmPlaceLamp(String),
     FocusLamp(String),
     UnplaceLamp(String),
+    ToggleLampMenu(String),
+    OpenLampDialog(LampDialog),
+    CloseLampDialog,
+    // Sensors & MotionAware
+    PlaceSensor(String),
+    FocusSensor(String),
+    UnplaceSensor(String),
+    ToggleSensorMenu(String),
+    MoveSensor { id: String, x: f64, y: f64, commit: bool },
+    SensorToggle { kind: String, id: String, enabled: bool },
+    SensorStartWire { kind: String, id: String },
+    MotionAreaToggle(String, bool),
+    MotionAreaSensitivity(String, i64),
     // Canvas interactions
     Select(Option<Selection>),
     MoveLamp { id: String, x: f64, y: f64, commit: bool },
@@ -251,8 +454,8 @@ pub enum MapMsg {
     ResizeBox { id: String, x: f64, y: f64, w: f64, h: f64, commit: bool },
     MoveStamp { id: String, x: f64, y: f64, commit: bool },
     PlaceArmedAt { x: f64, y: f64 },
-    CreateWire { from_id: String, to_id: String },
-    // Lamp inspector
+    CreateWire { from_kind: String, from_id: String, to_id: String },
+    // Lamp inspector / dialogs
     LampToggle(String, bool),
     LampBri(String, u8),
     LampBriDone(String),
@@ -279,9 +482,20 @@ pub enum MapMsg {
     // Stamp inspector
     StampRotate(String),
     StampDelete(String),
-    // Wire inspector
-    WireToggle(String, bool),
-    WireDelete(String),
+    // Rule dialog
+    OpenRuleDialog(String),
+    CloseRuleDialog,
+    RuleDialogName(String),
+    RuleDialogEnabled(bool),
+    RuleDialogKind(String),
+    RuleDialogTriggerState(String),
+    RuleDialogMirrorOff(bool),
+    RuleDialogMatchBri(bool),
+    RuleDialogOnlyIfOff(bool),
+    RuleDialogTimeStart(String),
+    RuleDialogTimeEnd(String),
+    RuleDialogSave,
+    RuleDialogDelete(String),
 }
 
 // ------------------------------------------------------------------------- State
@@ -296,14 +510,20 @@ pub struct FloorplanState {
     pub wire_kind: WireKind,
     pub selection: Option<Selection>,
     pub armed_place_lamp: Option<String>,
-    pub pending_wire_from: Option<String>,
-    // Menus / popovers
+    pub pending_wire_from: Option<(String, String)>,
+    // Menus / popovers / dialogs
+    pub add_menu_open: bool,
+    pub view_menu_open: bool,
     pub templates_open: bool,
     pub stamps_open: bool,
     pub bg_open: bool,
     pub ent_menu_open: bool,
     pub archetype_menu_open: bool,
     pub box_ent_menu_open: bool,
+    pub open_lamp_menu: Option<String>,
+    pub open_sensor_menu: Option<String>,
+    pub lamp_dialog: Option<LampDialog>,
+    pub rule_dialog: Option<MapRuleDialog>,
     // Inline text inputs
     pub lamp_rename_draft: String,
     pub box_rename_draft: String,
@@ -312,6 +532,8 @@ pub struct FloorplanState {
     pub bg_opacity_drag: Option<u8>,
     // Monotonic local ID counter for new boxes/stamps
     pub next_id_seq: u32,
+    // Cached background image handle & validated path (avoids per-frame stat/reload)
+    pub bg_handle_cache: Option<(String, iced_image::Handle)>,
 }
 
 impl Default for FloorplanState {
@@ -326,39 +548,125 @@ impl Default for FloorplanState {
             selection: None,
             armed_place_lamp: None,
             pending_wire_from: None,
+            add_menu_open: false,
+            view_menu_open: false,
             templates_open: false,
             stamps_open: false,
             bg_open: false,
             ent_menu_open: false,
             archetype_menu_open: false,
             box_ent_menu_open: false,
+            open_lamp_menu: None,
+            open_sensor_menu: None,
+            lamp_dialog: None,
+            rule_dialog: None,
             lamp_rename_draft: String::new(),
             box_rename_draft: String::new(),
             new_scene_name: String::new(),
             bg_path_draft: String::new(),
             bg_opacity_drag: None,
             next_id_seq: 1,
+            bg_handle_cache: None,
         }
     }
 }
 
 impl FloorplanState {
     pub fn any_menu_open(&self) -> bool {
-        self.templates_open
+        self.add_menu_open
+            || self.view_menu_open
+            || self.templates_open
             || self.stamps_open
             || self.bg_open
             || self.ent_menu_open
             || self.archetype_menu_open
             || self.box_ent_menu_open
+            || self.open_lamp_menu.is_some()
+            || self.open_sensor_menu.is_some()
     }
 
     pub fn close_menus(&mut self) {
+        self.add_menu_open = false;
+        self.view_menu_open = false;
         self.templates_open = false;
         self.stamps_open = false;
         self.bg_open = false;
         self.ent_menu_open = false;
         self.archetype_menu_open = false;
         self.box_ent_menu_open = false;
+        self.open_lamp_menu = None;
+        self.open_sensor_menu = None;
+    }
+
+    pub fn has_dialog_open(&self) -> bool {
+        self.lamp_dialog.is_some() || self.rule_dialog.is_some()
+    }
+
+    pub fn close_dialog(&mut self) {
+        self.lamp_dialog = None;
+        self.rule_dialog = None;
+    }
+
+    pub fn open_lamp_dialog(&mut self, dialog: LampDialog, stats: &Value) {
+        self.open_lamp_menu = None;
+        self.open_sensor_menu = None;
+        self.rule_dialog = None;
+        if let LampDialog::Rename(ref lid) = dialog {
+            let name = extract_bridge_lights(stats)
+                .into_iter()
+                .find(|l| l.id == *lid)
+                .map(|l| l.name)
+                .unwrap_or_default();
+            self.lamp_rename_draft = name;
+        }
+        self.lamp_dialog = Some(dialog);
+    }
+
+    pub fn open_new_rule_dialog(
+        &mut self,
+        from_kind: String,
+        from_id: String,
+        to_id: String,
+        stats: &Value,
+    ) {
+        self.open_lamp_menu = None;
+        self.open_sensor_menu = None;
+        self.lamp_dialog = None;
+        self.pending_wire_from = None;
+        let from_name = resolve_name(stats, &from_kind, &from_id);
+        let to_name = resolve_name(stats, "light", &to_id);
+        self.rule_dialog = Some(MapRuleDialog::new_between(
+            from_kind, from_id, from_name, to_id, to_name,
+        ));
+    }
+
+    pub fn open_existing_rule_dialog(&mut self, rule_id: &str, stats: &Value) {
+        self.open_lamp_menu = None;
+        self.open_sensor_menu = None;
+        self.lamp_dialog = None;
+        if let Some(rule) = j_list(stats, "rules").iter().find(|r| j_str(r, "id") == rule_id) {
+            self.rule_dialog = MapRuleDialog::from_existing_rule(rule, stats);
+        }
+    }
+
+    pub fn refresh_bg_cache(&mut self) {
+        let trimmed = self.doc.background.path.trim();
+        if trimmed.is_empty() {
+            self.bg_handle_cache = None;
+            return;
+        }
+        if self
+            .bg_handle_cache
+            .as_ref()
+            .is_some_and(|(cached_path, _)| cached_path == trimmed)
+        {
+            return;
+        }
+        if Path::new(trimmed).is_file() {
+            self.bg_handle_cache = Some((trimmed.to_string(), iced_image::Handle::from_path(trimmed)));
+        } else {
+            self.bg_handle_cache = None;
+        }
     }
 
     pub fn sync_from_snapshot(&mut self, incoming: FloorplanDocument) {
@@ -367,6 +675,7 @@ impl FloorplanState {
             if self.bg_opacity_drag.is_none() && self.bg_path_draft.is_empty() {
                 self.bg_path_draft = self.doc.background.path.clone();
             }
+            self.refresh_bg_cache();
         }
     }
 
@@ -771,7 +1080,31 @@ fn contrast_ink(c: Color) -> Color {
     }
 }
 
+/// Computes the clamped floating hover tooltip pill position and size for a lamp label.
+/// Centers horizontally above the lamp, flipping below if it would clip near the top edge,
+/// and clamps horizontally within `[4.0, (bounds.width - pill_w - 4.0).max(4.0)]`.
+pub fn tooltip_rect(center: Point, bounds: Size, label: &str) -> (Point, Size) {
+    let pill_w = (label.chars().count() as f32 * 6.8 + 18.0).clamp(44.0, 260.0);
+    let pill_h = 24.0f32;
+    let max_x = (bounds.width - pill_w - 4.0).max(4.0);
+    let pill_x = (center.x - pill_w * 0.5).clamp(4.0, max_x);
+    let above_y = center.y - LAMP_RADIUS_PX - 8.0 - pill_h;
+    let pill_y = if above_y < 4.0 {
+        (center.y + LAMP_RADIUS_PX + 8.0).min((bounds.height - pill_h - 4.0).max(4.0))
+    } else {
+        above_y
+    };
+    (Point::new(pill_x, pill_y), Size::new(pill_w, pill_h))
+}
+
 // ------------------------------------------------------------------------- Canvas Program
+
+#[derive(Debug, Clone)]
+enum WireEndpointRef {
+    Lamp(String),
+    Sensor(String),
+    Box(String),
+}
 
 #[derive(Debug, Clone)]
 struct WireRenderItem {
@@ -779,26 +1112,38 @@ struct WireRenderItem {
     kind: WireKind,
     enabled: bool,
     from: (f64, f64),
+    from_ref: WireEndpointRef,
     to: (f64, f64),
+    to_ref: WireEndpointRef,
 }
 
 #[derive(Debug, Clone)]
 enum DragOp {
-    Lamp { id: String, grab_dx: f64, grab_dy: f64 },
-    BoxMove { id: String, grab_dx: f64, grab_dy: f64 },
-    BoxResize { id: String, handle: ResizeHandle, orig: FloorplanBox },
-    Stamp { id: String, grab_dx: f64, grab_dy: f64 },
-    Wire { from_id: String, cursor: Point },
+    Lamp { id: String, grab_dx: f64, grab_dy: f64, preview: Option<(f64, f64)> },
+    Sensor { id: String, grab_dx: f64, grab_dy: f64, preview: Option<(f64, f64)> },
+    BoxMove { id: String, grab_dx: f64, grab_dy: f64, preview: Option<(f64, f64)> },
+    BoxResize { id: String, handle: ResizeHandle, orig: FloorplanBox, preview: Option<(f64, f64, f64, f64)> },
+    Stamp { id: String, grab_dx: f64, grab_dy: f64, preview: Option<(f64, f64)> },
+    Wire { from_kind: String, from_id: String, cursor: Point },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HoverTarget {
+    Lamp(String),
+    Sensor(String),
 }
 
 #[derive(Default)]
 pub struct CanvasInteraction {
     drag: Option<DragOp>,
+    hovered: Option<HoverTarget>,
 }
 
 struct FloorplanCanvasProgram<'a> {
     doc: &'a FloorplanDocument,
     lights: HashMap<String, BridgeLightInfo>,
+    sensors: HashMap<String, HueSensor>,
+    motion_areas: Vec<MotionArea>,
     wires: Vec<WireRenderItem>,
     schedule_badges: HashMap<String, String>,
     synth_running: bool,
@@ -807,8 +1152,9 @@ struct FloorplanCanvasProgram<'a> {
     wire_kind: WireKind,
     selection: Option<Selection>,
     armed_place_lamp: Option<String>,
-    pending_wire_from: Option<String>,
+    pending_wire_from: Option<(String, String)>,
     has_bg_image: bool,
+    dialog_open: bool,
 }
 
 impl<'a> FloorplanCanvasProgram<'a> {
@@ -816,6 +1162,9 @@ impl<'a> FloorplanCanvasProgram<'a> {
         let lights_vec = extract_bridge_lights(stats);
         let lights: HashMap<String, BridgeLightInfo> =
             lights_vec.into_iter().map(|l| (l.id.clone(), l)).collect();
+        let sensors: HashMap<String, HueSensor> =
+            parse_sensors(stats).into_iter().map(|s| (s.id.clone(), s)).collect();
+        let motion_areas = parse_motion_areas(stats);
 
         // Schedule badges per box.id
         let mut schedule_badges = HashMap::new();
@@ -827,17 +1176,33 @@ impl<'a> FloorplanCanvasProgram<'a> {
             }
         }
 
-        // Resolve endpoint world coords for rules (placed lamp or box center)
-        let endpoint_pos = |kind: &str, id: &str| -> Option<(f64, f64)> {
+        // Resolve endpoint world coords for rules (placed lamp, sensor, or box center)
+        let endpoint_pos = |kind: &str, id: &str| -> Option<((f64, f64), WireEndpointRef)> {
             if kind == "light" {
-                state.doc.lamps.get(id).map(|l| (l.x, l.y))
+                state
+                    .doc
+                    .lamps
+                    .get(id)
+                    .map(|l| ((l.x, l.y), WireEndpointRef::Lamp(id.to_string())))
+            } else if matches!(kind, "motion" | "contact" | "button") {
+                state
+                    .doc
+                    .sensors
+                    .get(id)
+                    .map(|s| ((s.x, s.y), WireEndpointRef::Sensor(id.to_string())))
             } else if matches!(kind, "room" | "zone") {
                 state
                     .doc
                     .boxes
                     .iter()
                     .find(|b| b.hue_id.as_deref() == Some(id))
-                    .map(|b| (b.x + b.w * 0.5, b.y + b.h * 0.5))
+                    .map(|b| ((b.x + b.w * 0.5, b.y + b.h * 0.5), WireEndpointRef::Box(b.id.clone())))
+            } else if kind == "motion_area" {
+                motion_areas
+                    .iter()
+                    .find(|a| a.id == id)
+                    .and_then(|a| state.doc.boxes.iter().find(|b| b.hue_id.as_deref() == Some(a.room_id.as_str())))
+                    .map(|b| ((b.x + b.w * 0.5, b.y + b.h * 0.5), WireEndpointRef::Box(b.id.clone())))
             } else {
                 None
             }
@@ -849,19 +1214,23 @@ impl<'a> FloorplanCanvasProgram<'a> {
             if rid.is_empty() {
                 continue;
             }
-            let Some(from) = endpoint_pos(j_str(rule, "trigger_kind"), j_str(rule, "trigger_id")) else {
+            let Some((from, from_ref)) =
+                endpoint_pos(j_str(rule, "trigger_kind"), j_str(rule, "trigger_id"))
+            else {
                 continue;
             };
             let wkind = classify_rule_wire(rule);
             let enabled = j_bool(rule, "enabled");
             for t in j_list(rule, "targets") {
-                if let Some(to) = endpoint_pos(j_str(t, "kind"), j_str(t, "id")) {
+                if let Some((to, to_ref)) = endpoint_pos(j_str(t, "kind"), j_str(t, "id")) {
                     wires.push(WireRenderItem {
                         rule_id: rid.to_string(),
                         kind: wkind,
                         enabled,
                         from,
+                        from_ref: from_ref.clone(),
                         to,
+                        to_ref,
                     });
                 }
             }
@@ -879,12 +1248,13 @@ impl<'a> FloorplanCanvasProgram<'a> {
             HashSet::new()
         };
 
-        let has_bg_image =
-            !state.doc.background.path.is_empty() && Path::new(&state.doc.background.path).is_file();
+        let has_bg_image = state.bg_handle_cache.is_some();
 
         Self {
             doc: &state.doc,
             lights,
+            sensors,
+            motion_areas,
             wires,
             schedule_badges,
             synth_running,
@@ -895,6 +1265,67 @@ impl<'a> FloorplanCanvasProgram<'a> {
             armed_place_lamp: state.armed_place_lamp.clone(),
             pending_wire_from: state.pending_wire_from.clone(),
             has_bg_image,
+            dialog_open: state.has_dialog_open(),
+        }
+    }
+
+    fn effective_lamp_pos(&self, lid: &str, fallback: (f64, f64), drag: Option<&DragOp>) -> (f64, f64) {
+        if let Some(DragOp::Lamp { id, preview: Some(p), .. }) = drag
+            && id == lid
+        {
+            return *p;
+        }
+        fallback
+    }
+
+    fn effective_sensor_pos(&self, sid: &str, fallback: (f64, f64), drag: Option<&DragOp>) -> (f64, f64) {
+        if let Some(DragOp::Sensor { id, preview: Some(p), .. }) = drag
+            && id == sid
+        {
+            return *p;
+        }
+        fallback
+    }
+
+    fn effective_box_rect(&self, b: &FloorplanBox, drag: Option<&DragOp>) -> (f64, f64, f64, f64) {
+        match drag {
+            Some(DragOp::BoxMove { id, preview: Some((px, py)), .. }) if id == &b.id => (*px, *py, b.w, b.h),
+            Some(DragOp::BoxResize { id, preview: Some(rect), .. }) if id == &b.id => *rect,
+            _ => (b.x, b.y, b.w, b.h),
+        }
+    }
+
+    fn effective_stamp_pos(&self, st: &FloorplanStamp, drag: Option<&DragOp>) -> (f64, f64) {
+        if let Some(DragOp::Stamp { id, preview: Some(p), .. }) = drag
+            && id == &st.id
+        {
+            return *p;
+        }
+        (st.x, st.y)
+    }
+
+    fn effective_wire_endpoint(
+        &self,
+        fallback: (f64, f64),
+        eref: &WireEndpointRef,
+        drag: Option<&DragOp>,
+    ) -> (f64, f64) {
+        match eref {
+            WireEndpointRef::Lamp(lid) => self.effective_lamp_pos(lid, fallback, drag),
+            WireEndpointRef::Sensor(sid) => self.effective_sensor_pos(sid, fallback, drag),
+            WireEndpointRef::Box(bid) => match drag {
+                Some(DragOp::BoxMove { id, preview: Some((px, py)), .. }) if id == bid => {
+                    if let Some(b) = self.doc.boxes.iter().find(|b| b.id == *bid) {
+                        (*px + b.w * 0.5, *py + b.h * 0.5)
+                    } else {
+                        fallback
+                    }
+                }
+                Some(DragOp::BoxResize { id, preview: Some((px, py, pw, ph)), .. }) if id == bid => {
+                    (*px + *pw * 0.5, *py + *ph * 0.5)
+                }
+                _ => fallback,
+            },
         }
     }
 
@@ -909,6 +1340,29 @@ impl<'a> FloorplanCanvasProgram<'a> {
             }
         }
         best.map(|(_, id)| id)
+    }
+
+    fn hit_sensor(&self, pt: Point, tf: CanvasTransform) -> Option<String> {
+        let hit_r = SENSOR_HALF_PX + 5.0;
+        let mut best: Option<(f32, String)> = None;
+        for (sid, pos) in &self.doc.sensors {
+            let sp = tf.to_screen(pos.x, pos.y);
+            if (pt.x - sp.x).abs() <= hit_r && (pt.y - sp.y).abs() <= hit_r {
+                let d = ((pt.x - sp.x).powi(2) + (pt.y - sp.y).powi(2)).sqrt();
+                if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                    best = Some((d, sid.clone()));
+                }
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    fn wire_source_screen_point(&self, kind: &str, id: &str, tf: CanvasTransform) -> Option<Point> {
+        if kind == "light" {
+            self.doc.lamps.get(id).map(|p| tf.to_screen(p.x, p.y))
+        } else {
+            self.doc.sensors.get(id).map(|p| tf.to_screen(p.x, p.y))
+        }
     }
 
     fn hit_selected_box_handle(&self, pt: Point, tf: CanvasTransform) -> Option<(FloorplanBox, ResizeHandle)> {
@@ -938,7 +1392,7 @@ impl<'a> FloorplanCanvasProgram<'a> {
     }
 
     fn hit_wire(&self, pt: Point, tf: CanvasTransform) -> Option<String> {
-        if !self.doc.show_wires {
+        if !(self.doc.show_wires || self.mode == CanvasMode::Wire) {
             return None;
         }
         let mut best: Option<(f32, String)> = None;
@@ -979,9 +1433,37 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<Action<MapMsg>> {
+        if self.dialog_open {
+            if state.hovered.take().is_some() {
+                return Some(Action::request_redraw());
+            }
+            return None;
+        }
         let tf = CanvasTransform::fit(bounds.size(), self.doc.canvas.width, self.doc.canvas.height);
 
         match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                let pos = cursor.position_in(bounds)?;
+                if let Some(lid) = self.hit_lamp(pos, tf) {
+                    let is_on = self.lights.get(&lid).is_some_and(|i| i.on);
+                    return Some(Action::publish(MapMsg::LampToggle(lid, !is_on)).and_capture());
+                }
+                if let Some(sid) = self.hit_sensor(pos, tf)
+                    && let Some(sensor) = self.sensors.get(&sid)
+                    && matches!(sensor.kind.as_str(), "motion" | "contact")
+                {
+                    return Some(
+                        Action::publish(MapMsg::SensorToggle {
+                            kind: sensor.kind.clone(),
+                            id: sid,
+                            enabled: !sensor.enabled,
+                        })
+                        .and_capture(),
+                    );
+                }
+                None
+            }
+
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let pos = cursor.position_in(bounds)?;
 
@@ -995,55 +1477,93 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                     return Some(Action::publish(MapMsg::PlaceArmedAt { x, y }).and_capture());
                 }
 
-                // Wire mode: drag or 2-click between lamps
+                // Wire mode: drag or 2-click from any placed lamp OR sensor to any placed lamp
                 if self.mode == CanvasMode::Wire {
                     if let Some(lid) = self.hit_lamp(pos, tf) {
-                        if let Some(ref from_id) = self.pending_wire_from
-                            && from_id != &lid
+                        if let Some((ref fk, ref fid)) = self.pending_wire_from
+                            && !(fk == "light" && fid == &lid)
                         {
                             return Some(
                                 Action::publish(MapMsg::CreateWire {
-                                    from_id: from_id.clone(),
+                                    from_kind: fk.clone(),
+                                    from_id: fid.clone(),
                                     to_id: lid,
                                 })
                                 .and_capture(),
                             );
                         }
-                        state.drag = Some(DragOp::Wire { from_id: lid, cursor: pos });
+                        state.hovered = None;
+                        state.drag = Some(DragOp::Wire {
+                            from_kind: "light".into(),
+                            from_id: lid,
+                            cursor: pos,
+                        });
+                        return Some(Action::request_redraw().and_capture());
+                    }
+                    if let Some(sid) = self.hit_sensor(pos, tf) {
+                        let skind = self
+                            .sensors
+                            .get(&sid)
+                            .map(|s| s.kind.clone())
+                            .unwrap_or_else(|| "motion".into());
+                        state.hovered = None;
+                        state.drag = Some(DragOp::Wire {
+                            from_kind: skind,
+                            from_id: sid,
+                            cursor: pos,
+                        });
                         return Some(Action::request_redraw().and_capture());
                     }
                     if let Some(rid) = self.hit_wire(pos, tf) {
-                        return Some(Action::publish(MapMsg::Select(Some(Selection::Wire(rid)))).and_capture());
+                        return Some(Action::publish(MapMsg::OpenRuleDialog(rid)).and_capture());
                     }
                     return Some(Action::publish(MapMsg::Select(None)).and_capture());
                 }
 
-                // Select/Move mode: priority = resize handle > lamp > wire > stamp > box
+                // Select/Move mode: priority = resize handle > lamp > sensor > wire > stamp > box
                 if let Some((orig, handle)) = self.hit_selected_box_handle(pos, tf) {
-                    state.drag = Some(DragOp::BoxResize { id: orig.id.clone(), handle, orig });
+                    state.hovered = None;
+                    state.drag = Some(DragOp::BoxResize { id: orig.id.clone(), handle, orig, preview: None });
                     return Some(Action::capture());
                 }
                 if let Some(lid) = self.hit_lamp(pos, tf) {
                     if let Some(lpos) = self.doc.lamps.get(&lid) {
                         let (wx, wy) = tf.to_world(pos);
+                        state.hovered = None;
                         state.drag = Some(DragOp::Lamp {
                             id: lid.clone(),
                             grab_dx: lpos.x - wx,
                             grab_dy: lpos.y - wy,
+                            preview: None,
                         });
                     }
                     return Some(Action::publish(MapMsg::Select(Some(Selection::Lamp(lid)))).and_capture());
                 }
+                if let Some(sid) = self.hit_sensor(pos, tf) {
+                    if let Some(spos) = self.doc.sensors.get(&sid) {
+                        let (wx, wy) = tf.to_world(pos);
+                        state.hovered = None;
+                        state.drag = Some(DragOp::Sensor {
+                            id: sid.clone(),
+                            grab_dx: spos.x - wx,
+                            grab_dy: spos.y - wy,
+                            preview: None,
+                        });
+                    }
+                    return Some(Action::publish(MapMsg::Select(Some(Selection::Sensor(sid)))).and_capture());
+                }
                 if let Some(rid) = self.hit_wire(pos, tf) {
-                    return Some(Action::publish(MapMsg::Select(Some(Selection::Wire(rid)))).and_capture());
+                    return Some(Action::publish(MapMsg::OpenRuleDialog(rid)).and_capture());
                 }
                 if let Some(sid) = self.hit_stamp(pos, tf) {
                     if let Some(st) = self.doc.stamps.iter().find(|s| s.id == sid) {
                         let (wx, wy) = tf.to_world(pos);
+                        state.hovered = None;
                         state.drag = Some(DragOp::Stamp {
                             id: sid.clone(),
                             grab_dx: st.x - wx,
                             grab_dy: st.y - wy,
+                            preview: None,
                         });
                     }
                     return Some(Action::publish(MapMsg::Select(Some(Selection::Stamp(sid)))).and_capture());
@@ -1051,10 +1571,12 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                 if let Some(bid) = self.hit_box(pos, tf) {
                     if let Some(b) = self.doc.boxes.iter().find(|b| b.id == bid) {
                         let (wx, wy) = tf.to_world(pos);
+                        state.hovered = None;
                         state.drag = Some(DragOp::BoxMove {
                             id: bid.clone(),
                             grab_dx: b.x - wx,
                             grab_dy: b.y - wy,
+                            preview: None,
                         });
                     }
                     return Some(Action::publish(MapMsg::Select(Some(Selection::Box(bid)))).and_capture());
@@ -1062,7 +1584,26 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                 Some(Action::publish(MapMsg::Select(None)).and_capture())
             }
 
+            Event::Mouse(mouse::Event::CursorLeft) => {
+                if state.hovered.take().is_some() {
+                    return Some(Action::request_redraw());
+                }
+                None
+            }
+
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                if state.drag.is_none() {
+                    let new_hover = cursor.position_in(bounds).and_then(|pos| {
+                        self.hit_lamp(pos, tf)
+                            .map(HoverTarget::Lamp)
+                            .or_else(|| self.hit_sensor(pos, tf).map(HoverTarget::Sensor))
+                    });
+                    if new_hover != state.hovered {
+                        state.hovered = new_hover;
+                        return Some(Action::request_redraw());
+                    }
+                    return None;
+                }
                 let drag = state.drag.as_mut()?;
                 let pos = cursor.position_from(bounds.position())?;
                 let (wx, wy) = tf.to_world(pos);
@@ -1071,12 +1612,19 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                 let max_w = self.doc.canvas.width;
                 let max_h = self.doc.canvas.height;
                 match drag {
-                    DragOp::Lamp { id, grab_dx, grab_dy } => {
+                    DragOp::Lamp { grab_dx, grab_dy, preview, .. }
+                    | DragOp::Sensor { grab_dx, grab_dy, preview, .. } => {
                         let x = snap_coord(wx + *grab_dx, grid, snap).clamp(12.0, max_w - 12.0);
                         let y = snap_coord(wy + *grab_dy, grid, snap).clamp(12.0, max_h - 12.0);
-                        Some(Action::publish(MapMsg::MoveLamp { id: id.clone(), x, y, commit: false }).and_capture())
+                        let next = Some((x, y));
+                        if *preview != next {
+                            *preview = next;
+                            Some(Action::request_redraw().and_capture())
+                        } else {
+                            Some(Action::capture())
+                        }
                     }
-                    DragOp::BoxMove { id, grab_dx, grab_dy } => {
+                    DragOp::BoxMove { id, grab_dx, grab_dy, preview } => {
                         let (bw, bh) = self
                             .doc
                             .boxes
@@ -1086,26 +1634,34 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                             .unwrap_or((120.0, 120.0));
                         let x = snap_coord(wx + *grab_dx, grid, snap).clamp(0.0, (max_w - bw).max(0.0));
                         let y = snap_coord(wy + *grab_dy, grid, snap).clamp(0.0, (max_h - bh).max(0.0));
-                        Some(Action::publish(MapMsg::MoveBox { id: id.clone(), x, y, commit: false }).and_capture())
+                        let next = Some((x, y));
+                        if *preview != next {
+                            *preview = next;
+                            Some(Action::request_redraw().and_capture())
+                        } else {
+                            Some(Action::capture())
+                        }
                     }
-                    DragOp::BoxResize { id, handle, orig } => {
-                        let (x, y, w, h) = apply_resize(orig, *handle, wx, wy, grid, snap, max_w, max_h);
-                        Some(
-                            Action::publish(MapMsg::ResizeBox {
-                                id: id.clone(),
-                                x,
-                                y,
-                                w,
-                                h,
-                                commit: false,
-                            })
-                            .and_capture(),
-                        )
+                    DragOp::BoxResize { handle, orig, preview, .. } => {
+                        let rect = apply_resize(orig, *handle, wx, wy, grid, snap, max_w, max_h);
+                        let next = Some(rect);
+                        if *preview != next {
+                            *preview = next;
+                            Some(Action::request_redraw().and_capture())
+                        } else {
+                            Some(Action::capture())
+                        }
                     }
-                    DragOp::Stamp { id, grab_dx, grab_dy } => {
+                    DragOp::Stamp { grab_dx, grab_dy, preview, .. } => {
                         let x = snap_coord(wx + *grab_dx, grid, snap).clamp(0.0, max_w - 16.0);
                         let y = snap_coord(wy + *grab_dy, grid, snap).clamp(0.0, max_h - 16.0);
-                        Some(Action::publish(MapMsg::MoveStamp { id: id.clone(), x, y, commit: false }).and_capture())
+                        let next = Some((x, y));
+                        if *preview != next {
+                            *preview = next;
+                            Some(Action::request_redraw().and_capture())
+                        } else {
+                            Some(Action::capture())
+                        }
                     }
                     DragOp::Wire { cursor: c, .. } => {
                         *c = pos;
@@ -1116,19 +1672,45 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
 
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 let drag = state.drag.take()?;
-                let pos = cursor.position_from(bounds.position()).unwrap_or(Point::ORIGIN);
-                let (wx, wy) = tf.to_world(pos);
+                let maybe_pos = cursor.position_from(bounds.position());
                 let grid = self.doc.canvas.grid;
                 let snap = self.doc.canvas.snap;
                 let max_w = self.doc.canvas.width;
                 let max_h = self.doc.canvas.height;
                 match drag {
-                    DragOp::Lamp { id, grab_dx, grab_dy } => {
-                        let x = snap_coord(wx + grab_dx, grid, snap).clamp(12.0, max_w - 12.0);
-                        let y = snap_coord(wy + grab_dy, grid, snap).clamp(12.0, max_h - 12.0);
+                    DragOp::Lamp { id, grab_dx, grab_dy, preview } => {
+                        let (x, y) = if let Some(pos) = maybe_pos {
+                            let (wx, wy) = tf.to_world(pos);
+                            (
+                                snap_coord(wx + grab_dx, grid, snap).clamp(12.0, max_w - 12.0),
+                                snap_coord(wy + grab_dy, grid, snap).clamp(12.0, max_h - 12.0),
+                            )
+                        } else if let Some(p) = preview {
+                            p
+                        } else if let Some(lpos) = self.doc.lamps.get(&id) {
+                            (lpos.x, lpos.y)
+                        } else {
+                            return Some(Action::request_redraw().and_capture());
+                        };
                         Some(Action::publish(MapMsg::MoveLamp { id, x, y, commit: true }).and_capture())
                     }
-                    DragOp::BoxMove { id, grab_dx, grab_dy } => {
+                    DragOp::Sensor { id, grab_dx, grab_dy, preview } => {
+                        let (x, y) = if let Some(pos) = maybe_pos {
+                            let (wx, wy) = tf.to_world(pos);
+                            (
+                                snap_coord(wx + grab_dx, grid, snap).clamp(12.0, max_w - 12.0),
+                                snap_coord(wy + grab_dy, grid, snap).clamp(12.0, max_h - 12.0),
+                            )
+                        } else if let Some(p) = preview {
+                            p
+                        } else if let Some(spos) = self.doc.sensors.get(&id) {
+                            (spos.x, spos.y)
+                        } else {
+                            return Some(Action::request_redraw().and_capture());
+                        };
+                        Some(Action::publish(MapMsg::MoveSensor { id, x, y, commit: true }).and_capture())
+                    }
+                    DragOp::BoxMove { id, grab_dx, grab_dy, preview } => {
                         let (bw, bh) = self
                             .doc
                             .boxes
@@ -1136,29 +1718,74 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                             .find(|b| b.id == id)
                             .map(|b| (b.w, b.h))
                             .unwrap_or((120.0, 120.0));
-                        let x = snap_coord(wx + grab_dx, grid, snap).clamp(0.0, (max_w - bw).max(0.0));
-                        let y = snap_coord(wy + grab_dy, grid, snap).clamp(0.0, (max_h - bh).max(0.0));
+                        let (x, y) = if let Some(pos) = maybe_pos {
+                            let (wx, wy) = tf.to_world(pos);
+                            (
+                                snap_coord(wx + grab_dx, grid, snap).clamp(0.0, (max_w - bw).max(0.0)),
+                                snap_coord(wy + grab_dy, grid, snap).clamp(0.0, (max_h - bh).max(0.0)),
+                            )
+                        } else if let Some(p) = preview {
+                            p
+                        } else if let Some(b) = self.doc.boxes.iter().find(|b| b.id == id) {
+                            (b.x, b.y)
+                        } else {
+                            return Some(Action::request_redraw().and_capture());
+                        };
                         Some(Action::publish(MapMsg::MoveBox { id, x, y, commit: true }).and_capture())
                     }
-                    DragOp::BoxResize { id, handle, orig } => {
-                        let (x, y, w, h) = apply_resize(&orig, handle, wx, wy, grid, snap, max_w, max_h);
+                    DragOp::BoxResize { id, handle, orig, preview } => {
+                        let (x, y, w, h) = if let Some(pos) = maybe_pos {
+                            let (wx, wy) = tf.to_world(pos);
+                            apply_resize(&orig, handle, wx, wy, grid, snap, max_w, max_h)
+                        } else if let Some(rect) = preview {
+                            rect
+                        } else {
+                            (orig.x, orig.y, orig.w, orig.h)
+                        };
                         Some(Action::publish(MapMsg::ResizeBox { id, x, y, w, h, commit: true }).and_capture())
                     }
-                    DragOp::Stamp { id, grab_dx, grab_dy } => {
-                        let x = snap_coord(wx + grab_dx, grid, snap).clamp(0.0, max_w - 16.0);
-                        let y = snap_coord(wy + grab_dy, grid, snap).clamp(0.0, max_h - 16.0);
+                    DragOp::Stamp { id, grab_dx, grab_dy, preview } => {
+                        let (x, y) = if let Some(pos) = maybe_pos {
+                            let (wx, wy) = tf.to_world(pos);
+                            (
+                                snap_coord(wx + grab_dx, grid, snap).clamp(0.0, max_w - 16.0),
+                                snap_coord(wy + grab_dy, grid, snap).clamp(0.0, max_h - 16.0),
+                            )
+                        } else if let Some(p) = preview {
+                            p
+                        } else if let Some(st) = self.doc.stamps.iter().find(|s| s.id == id) {
+                            (st.x, st.y)
+                        } else {
+                            return Some(Action::request_redraw().and_capture());
+                        };
                         Some(Action::publish(MapMsg::MoveStamp { id, x, y, commit: true }).and_capture())
                     }
-                    DragOp::Wire { from_id, .. } => {
-                        if let Some(to_id) = self.hit_lamp(pos, tf)
-                            && to_id != from_id
+                    DragOp::Wire { from_kind, from_id, .. } => {
+                        if let Some(pos) = maybe_pos
+                            && let Some(to_id) = self.hit_lamp(pos, tf)
+                            && !(from_kind == "light" && to_id == from_id)
                         {
                             return Some(
-                                Action::publish(MapMsg::CreateWire { from_id, to_id }).and_capture(),
+                                Action::publish(MapMsg::CreateWire {
+                                    from_kind,
+                                    from_id,
+                                    to_id,
+                                })
+                                .and_capture(),
                             );
                         }
-                        // Clicked single lamp in wire mode -> select it as pending source
-                        Some(Action::publish(MapMsg::LampStartWire(from_id)).and_capture())
+                        // Clicked single lamp/sensor in wire mode -> select it as pending source
+                        if from_kind == "light" {
+                            Some(Action::publish(MapMsg::LampStartWire(from_id)).and_capture())
+                        } else {
+                            Some(
+                                Action::publish(MapMsg::SensorStartWire {
+                                    kind: from_kind,
+                                    id: from_id,
+                                })
+                                .and_capture(),
+                            )
+                        }
                     }
                 }
             }
@@ -1178,8 +1805,9 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
         let tf = CanvasTransform::fit(bounds.size(), self.doc.canvas.width, self.doc.canvas.height);
         let on_bg = Color::from(theme.cosmic().on_bg_color());
         let accent: Color = theme.cosmic().accent_color().into();
+        let drag = state.drag.as_ref();
 
-        // 1. Subtle architectural canvas surface & dot grid
+        // 1. Subtle architectural canvas surface & batched dot grid
         if !self.has_bg_image {
             let world_tl = tf.to_screen(0.0, 0.0);
             let world_sz = Size::new(
@@ -1189,32 +1817,40 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
             frame.fill_rectangle(world_tl, world_sz, with_alpha(on_bg, 0.03));
 
             let step = (self.doc.canvas.grid.max(20) as f64) * 2.0;
-            let mut gx = step;
-            while gx < self.doc.canvas.width {
-                let mut gy = step;
-                while gy < self.doc.canvas.height {
-                    let p = tf.to_screen(gx, gy);
-                    frame.fill_rectangle(Point::new(p.x - 0.8, p.y - 0.8), Size::new(1.6, 1.6), with_alpha(on_bg, 0.14));
-                    gy += step;
+            let dots = CanvasPath::new(|b| {
+                let mut gx = step;
+                while gx < self.doc.canvas.width {
+                    let mut gy = step;
+                    while gy < self.doc.canvas.height {
+                        let p = tf.to_screen(gx, gy);
+                        b.rectangle(Point::new(p.x - 0.8, p.y - 0.8), Size::new(1.6, 1.6));
+                        gy += step;
+                    }
+                    gx += step;
                 }
-                gx += step;
-            }
+            });
+            frame.fill(&dots, with_alpha(on_bg, 0.14));
         }
 
         // 2. Room & Zone boxes
         for b in &self.doc.boxes {
-            let tl = tf.to_screen(b.x, b.y);
-            let sz = Size::new((b.w as f32) * tf.scale, (b.h as f32) * tf.scale);
+            let (bx, by, bw, bh) = self.effective_box_rect(b, drag);
+            let tl = tf.to_screen(bx, by);
+            let sz = Size::new((bw as f32) * tf.scale, (bh as f32) * tf.scale);
             let is_zone = b.kind == "zone";
             let selected = matches!(&self.selection, Some(Selection::Box(id)) if id == &b.id);
 
-            // Ambient room tint from active lights inside box
+            // Ambient room tint from active lights inside box (uses live drag preview coords)
             let mut r_sum = 0.0f32;
             let mut g_sum = 0.0f32;
             let mut b_sum = 0.0f32;
             let mut lit_count = 0u32;
             for (lid, lpos) in &self.doc.lamps {
-                if point_in_box(lpos.x, lpos.y, b)
+                let (lx, ly) = self.effective_lamp_pos(lid, (lpos.x, lpos.y), drag);
+                if lx >= bx
+                    && lx <= bx + bw
+                    && ly >= by
+                    && ly <= by + bh
                     && let Some(info) = self.lights.get(lid)
                     && info.on
                 {
@@ -1241,8 +1877,29 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
             let rect_path = CanvasPath::rounded_rectangle(tl, sz, 6.0.into());
             frame.fill(&rect_path, fill_color);
 
+            let room_motion_area = b.hue_id.as_deref().and_then(|hid| {
+                self.motion_areas.iter().find(|a| a.room_id == hid)
+            });
+            let motion_active = room_motion_area.is_some_and(|a| a.enabled && a.motion);
+            if motion_active {
+                // Subtle emerald outer presence ring when MotionAware detects motion in this room
+                let ring_path = CanvasPath::rounded_rectangle(
+                    Point::new(tl.x - 2.0, tl.y - 2.0),
+                    Size::new(sz.width + 4.0, sz.height + 4.0),
+                    8.0.into(),
+                );
+                frame.stroke(
+                    &ring_path,
+                    Stroke::default()
+                        .with_color(with_alpha(MOTION_ACTIVE_COLOR, 0.45))
+                        .with_width(2.5),
+                );
+            }
+
             let border_color = if selected {
                 accent
+            } else if motion_active {
+                MOTION_ACTIVE_COLOR
             } else if is_zone {
                 with_alpha(accent, 0.55)
             } else {
@@ -1258,17 +1915,24 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
             } else {
                 Stroke::default()
                     .with_color(border_color)
-                    .with_width(if selected { 2.4 } else { 1.5 })
+                    .with_width(if selected || motion_active { 2.4 } else { 1.5 })
             };
             frame.stroke(&rect_path, stroke);
 
-            // Header label (archetype glyph + name + indicators + active schedule badge)
+            // Header label (archetype glyph + name + indicators + MotionAware + active schedule badge)
             let mut label = format!("{} {}", archetype_glyph(&b.archetype), b.name);
             if b.hue_id.is_none() {
                 label.push_str(" •");
             }
             if b.entertainment_area_id.is_some() {
                 label.push_str(" ♪");
+            }
+            if let Some(area) = room_motion_area {
+                if area.enabled && area.motion {
+                    label.push_str(" ◉");
+                } else if area.enabled {
+                    label.push_str(" ◎");
+                }
             }
             if let Some(badge) = self.schedule_badges.get(&b.id) {
                 label.push_str(&format!("  {badge}"));
@@ -1281,10 +1945,10 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                 ..Default::default()
             });
 
-            // 8 resize handles on selected box
+            // 8 resize handles on selected box (track live drag/resize preview)
             if selected {
                 for h in ResizeHandle::ALL {
-                    let (hx, hy) = h.world_point(b);
+                    let (hx, hy) = h.world_point_rect(bx, by, bw, bh);
                     let hp = tf.to_screen(hx, hy);
                     let hrect = CanvasPath::rectangle(
                         Point::new(hp.x - HANDLE_SIZE_PX * 0.5, hp.y - HANDLE_SIZE_PX * 0.5),
@@ -1299,64 +1963,69 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
         // 3. Minimalist architectural furniture stamps
         if self.doc.show_furniture {
             for st in &self.doc.stamps {
+                let (sx, sy) = self.effective_stamp_pos(st, drag);
                 let selected = matches!(&self.selection, Some(Selection::Stamp(id)) if id == &st.id);
-                draw_stamp(&mut frame, st, tf, on_bg, accent, selected);
+                draw_stamp(&mut frame, st, sx, sy, tf, on_bg, accent, selected);
             }
         }
 
-        // 4. Live radial color/brightness halos around placed lamps
+        // 4. Live radial color/brightness halos around placed lamps (3-step tessellation)
         if self.doc.show_glows {
             for (lid, lpos) in &self.doc.lamps {
                 let Some(info) = self.lights.get(lid) else { continue };
                 if !info.on {
                     continue;
                 }
-                let center = tf.to_screen(lpos.x, lpos.y);
+                let (lx, ly) = self.effective_lamp_pos(lid, (lpos.x, lpos.y), drag);
+                let center = tf.to_screen(lx, ly);
                 let c = parse_hex_color(&info.color);
                 let bri_norm = (info.bri / 100.0).clamp(0.12, 1.0) as f32;
                 let max_r = (LAMP_RADIUS_PX + 18.0 + 42.0 * bri_norm) * (tf.scale.clamp(0.55, 1.4));
-                for step_i in (1..=6).rev() {
-                    let frac = step_i as f32 / 6.0;
+                for step_i in (1..=3).rev() {
+                    let frac = step_i as f32 / 3.0;
                     let r = max_r * frac;
-                    let alpha = (1.0 - frac * 0.78) * 0.14 * bri_norm;
+                    let alpha = (1.0 - frac * 0.72) * 0.22 * bri_norm;
                     frame.fill(&CanvasPath::circle(center, r), with_alpha(c, alpha));
                 }
             }
         }
 
         // 5. Typed Bezier dependency wires
-        if self.doc.show_wires {
+        if self.doc.show_wires || self.mode == CanvasMode::Wire {
             for w in &self.wires {
-                let a = tf.to_screen(w.from.0, w.from.1);
-                let b = tf.to_screen(w.to.0, w.to.1);
-                let selected = matches!(&self.selection, Some(Selection::Wire(id)) if id == &w.rule_id);
-                draw_wire(&mut frame, a, b, w.kind, w.enabled, selected);
+                let from_w = self.effective_wire_endpoint(w.from, &w.from_ref, drag);
+                let to_w = self.effective_wire_endpoint(w.to, &w.to_ref, drag);
+                let a = tf.to_screen(from_w.0, from_w.1);
+                let b = tf.to_screen(to_w.0, to_w.1);
+                draw_wire(&mut frame, a, b, w.kind, w.enabled, false);
             }
         }
 
         // Live preview wire while dragging in Wire mode
-        if let Some(DragOp::Wire { from_id, cursor: cur }) = &state.drag
-            && let Some(lpos) = self.doc.lamps.get(from_id)
+        if let Some(DragOp::Wire { from_kind, from_id, cursor: cur }) = drag
+            && let Some(a) = self.wire_source_screen_point(from_kind, from_id, tf)
         {
-            let a = tf.to_screen(lpos.x, lpos.y);
             draw_wire(&mut frame, a, *cur, self.wire_kind, true, true);
         } else if self.mode == CanvasMode::Wire
-            && let Some(ref from_id) = self.pending_wire_from
-            && let Some(lpos) = self.doc.lamps.get(from_id)
+            && let Some((ref fk, ref fid)) = self.pending_wire_from
+            && let Some(a) = self.wire_source_screen_point(fk, fid, tf)
             && let Some(cur) = cursor.position_in(bounds)
         {
-            let a = tf.to_screen(lpos.x, lpos.y);
             draw_wire(&mut frame, a, cur, self.wire_kind, true, false);
         }
 
-        // 6. Placed lamp nodes with selectable vector icons
+        // 6. Placed lamp nodes with selectable vector icons (+ Bridge Pro MotionAware badge)
         for (lid, lpos) in &self.doc.lamps {
-            let center = tf.to_screen(lpos.x, lpos.y);
+            let (lx, ly) = self.effective_lamp_pos(lid, (lpos.x, lpos.y), drag);
+            let center = tf.to_screen(lx, ly);
             let info = self.lights.get(lid);
             let is_on = info.is_some_and(|i| i.on);
             let reachable = info.is_none_or(|i| i.reachable);
             let selected = matches!(&self.selection, Some(Selection::Lamp(id)) if id == lid);
-            let is_wire_src = self.pending_wire_from.as_deref() == Some(lid.as_str());
+            let is_wire_src = matches!(
+                &self.pending_wire_from,
+                Some((fk, fid)) if fk == "light" && fid == lid
+            );
             let is_synth = self.synth_running && self.synth_lights.contains(lid);
 
             // Synth neon magenta active overlay ring
@@ -1397,24 +2066,175 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                     .with_width(if is_on { 1.8 } else { 1.3 }),
             );
 
-            // Crisp vector lamp icon inside the node
-            let ink = if is_on { contrast_ink(fill) } else { with_alpha(on_bg, 0.85) };
-            draw_lamp_icon(&mut frame, center, LAMP_RADIUS_PX * 0.56, &lpos.icon, ink);
+            // Crisp vector lamp icon inside the node (matches lamp_icon_svg 1:1)
+            let ink = if is_on { contrast_ink(fill) } else { with_alpha(on_bg, 0.90) };
+            draw_lamp_icon(&mut frame, center, LAMP_RADIUS_PX * 0.64, &lpos.icon, ink);
 
-            // Compact name + brightness caption below node
-            if let Some(info) = info {
-                let caption = if info.on {
-                    format!("{} · {}%", info.name, info.bri.round() as i32)
-                } else {
-                    info.name.clone()
-                };
+            // Bridge Pro MotionAware radar badge at top-right corner of lamp circle
+            if info.is_some_and(|i| i.motion_aware) {
+                let active = info.is_some_and(|i| i.motion_active);
+                let badge_center = Point::new(
+                    center.x + LAMP_RADIUS_PX * 0.72,
+                    center.y - LAMP_RADIUS_PX * 0.72,
+                );
+                let badge_r = 5.5f32;
+                if active {
+                    frame.stroke(
+                        &CanvasPath::circle(badge_center, badge_r + 2.8),
+                        Stroke::default()
+                            .with_color(with_alpha(MOTION_ACTIVE_COLOR, 0.55))
+                            .with_width(1.6),
+                    );
+                }
+                let badge_col = if active { MOTION_ACTIVE_COLOR } else { MOTION_IDLE_COLOR };
+                let badge_path = CanvasPath::circle(badge_center, badge_r);
+                frame.fill(&badge_path, badge_col);
+                frame.stroke(
+                    &badge_path,
+                    Stroke::default().with_color(Color::WHITE).with_width(1.1),
+                );
+                frame.fill(&CanvasPath::circle(badge_center, 1.4), Color::WHITE);
+                let wave = CanvasPath::new(|b| {
+                    b.arc(canvas::path::Arc {
+                        center: badge_center,
+                        radius: 3.2,
+                        start_angle: Radians(-0.75),
+                        end_angle: Radians(0.75),
+                    });
+                });
+                frame.stroke(
+                    &wave,
+                    Stroke::default()
+                        .with_color(Color::WHITE)
+                        .with_width(1.1)
+                        .with_line_cap(LineCap::Round),
+                );
+            }
+        }
+
+        // 6b. Placed physical Hue sensors & switches (28x28 rounded-square nodes)
+        for (sid, spos) in &self.doc.sensors {
+            let (sx, sy) = self.effective_sensor_pos(sid, (spos.x, spos.y), drag);
+            let center = tf.to_screen(sx, sy);
+            let sensor = self.sensors.get(sid);
+            let kind = sensor.map(|s| s.kind.as_str()).unwrap_or("motion");
+            let enabled = sensor.is_none_or(|s| s.enabled);
+            let is_active = match kind {
+                "motion" => enabled && sensor.is_some_and(|s| s.motion),
+                "contact" => enabled && sensor.is_some_and(|s| s.open),
+                _ => false,
+            };
+            let selected = matches!(&self.selection, Some(Selection::Sensor(id)) if id == sid);
+            let is_wire_src = matches!(
+                &self.pending_wire_from,
+                Some((fk, fid)) if fk != "light" && fid == sid
+            );
+
+            // Soft live glow for active motion or open contact
+            if is_active {
+                let glow_col = if kind == "contact" { CONTACT_OPEN_COLOR } else { MOTION_ACTIVE_COLOR };
+                for (dr, alpha) in [(9.0f32, 0.16f32), (5.0f32, 0.28f32)] {
+                    let gtl = Point::new(center.x - SENSOR_HALF_PX - dr, center.y - SENSOR_HALF_PX - dr);
+                    let gsz = Size::new((SENSOR_HALF_PX + dr) * 2.0, (SENSOR_HALF_PX + dr) * 2.0);
+                    frame.fill(
+                        &CanvasPath::rounded_rectangle(gtl, gsz, (7.0 + dr * 0.4).into()),
+                        with_alpha(glow_col, alpha),
+                    );
+                }
+            }
+
+            if selected || is_wire_src {
+                let ring_col = if is_wire_src { self.wire_kind.color() } else { accent };
+                let r_pad = 3.5f32;
+                let rtl = Point::new(center.x - SENSOR_HALF_PX - r_pad, center.y - SENSOR_HALF_PX - r_pad);
+                let rsz = Size::new((SENSOR_HALF_PX + r_pad) * 2.0, (SENSOR_HALF_PX + r_pad) * 2.0);
+                frame.stroke(
+                    &CanvasPath::rounded_rectangle(rtl, rsz, 9.0.into()),
+                    Stroke::default().with_color(ring_col).with_width(2.2),
+                );
+            }
+
+            let (fill, border_col, ink) = match kind {
+                "motion" => {
+                    if !enabled {
+                        (with_alpha(on_bg, 0.14), with_alpha(on_bg, 0.40), with_alpha(on_bg, 0.65))
+                    } else if is_active {
+                        (MOTION_ACTIVE_COLOR, Color::WHITE, Color::WHITE)
+                    } else {
+                        (Color::from_rgb8(0x16, 0x4E, 0x63), with_alpha(MOTION_IDLE_COLOR, 0.90), Color::WHITE)
+                    }
+                }
+                "contact" => {
+                    if !enabled {
+                        (with_alpha(on_bg, 0.14), with_alpha(on_bg, 0.40), with_alpha(on_bg, 0.65))
+                    } else if is_active {
+                        (CONTACT_OPEN_COLOR, Color::WHITE, contrast_ink(CONTACT_OPEN_COLOR))
+                    } else {
+                        (CONTACT_CLOSED_COLOR, Color::WHITE, Color::WHITE)
+                    }
+                }
+                _ => (BUTTON_COLOR, Color::WHITE, Color::WHITE),
+            };
+
+            let tl = Point::new(center.x - SENSOR_HALF_PX, center.y - SENSOR_HALF_PX);
+            let sz = Size::new(SENSOR_HALF_PX * 2.0, SENSOR_HALF_PX * 2.0);
+            let sq = CanvasPath::rounded_rectangle(tl, sz, 7.0.into());
+            frame.fill(&sq, fill);
+            frame.stroke(
+                &sq,
+                Stroke::default()
+                    .with_color(border_col)
+                    .with_width(if is_active || kind == "button" { 1.6 } else { 1.3 }),
+            );
+            draw_sensor_icon(&mut frame, center, 8.5, kind, ink, is_active);
+        }
+
+        // 7. Hover tooltip pill (lamp or sensor name only, floats on top of everything)
+        if state.drag.is_none()
+            && let Some(ref target) = state.hovered
+        {
+            let tooltip_info: Option<(Point, &str)> = match target {
+                HoverTarget::Lamp(hid) => self
+                    .doc
+                    .lamps
+                    .get(hid)
+                    .and_then(|lpos| {
+                        self.lights
+                            .get(hid)
+                            .map(|i| i.name.as_str())
+                            .filter(|n| !n.is_empty())
+                            .map(|n| (tf.to_screen(lpos.x, lpos.y), n))
+                    }),
+                HoverTarget::Sensor(sid) => self
+                    .doc
+                    .sensors
+                    .get(sid)
+                    .and_then(|spos| {
+                        self.sensors
+                            .get(sid)
+                            .map(|s| s.name.as_str())
+                            .filter(|n| !n.is_empty())
+                            .map(|n| (tf.to_screen(spos.x, spos.y), n))
+                    }),
+            };
+            if let Some((center, name)) = tooltip_info {
+                let (pill_pos, pill_sz) = tooltip_rect(center, bounds.size(), name);
+                let pill_path = CanvasPath::rounded_rectangle(pill_pos, pill_sz, 6.0.into());
+                let bg_fill = with_alpha(Color::from(theme.cosmic().bg_color()), 0.94);
+                frame.fill(&pill_path, bg_fill);
+                frame.stroke(
+                    &pill_path,
+                    Stroke::default()
+                        .with_color(with_alpha(accent, 0.55))
+                        .with_width(1.2),
+                );
                 frame.fill_text(CanvasText {
-                    content: caption,
-                    position: Point::new(center.x, center.y + LAMP_RADIUS_PX + 4.0),
-                    color: with_alpha(on_bg, if is_on { 0.92 } else { 0.62 }),
-                    size: Pixels(10.5),
+                    content: name.to_string(),
+                    position: Point::new(pill_pos.x + pill_sz.width * 0.5, pill_pos.y + pill_sz.height * 0.5),
+                    color: with_alpha(on_bg, 1.0),
+                    size: Pixels(12.0),
                     align_x: alignment::Horizontal::Center.into(),
-                    align_y: alignment::Vertical::Top,
+                    align_y: alignment::Vertical::Center,
                     ..Default::default()
                 });
             }
@@ -1429,6 +2249,9 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
+        if self.dialog_open {
+            return mouse::Interaction::default();
+        }
         if let Some(drag) = &state.drag {
             return match drag {
                 DragOp::BoxResize { handle, .. } => handle.cursor(),
@@ -1439,14 +2262,26 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
         let Some(pos) = cursor.position_in(bounds) else {
             return mouse::Interaction::default();
         };
-        if self.armed_place_lamp.is_some() || self.mode == CanvasMode::Wire {
+        let tf = CanvasTransform::fit(bounds.size(), self.doc.canvas.width, self.doc.canvas.height);
+        if self.armed_place_lamp.is_some() {
             return mouse::Interaction::Crosshair;
         }
-        let tf = CanvasTransform::fit(bounds.size(), self.doc.canvas.width, self.doc.canvas.height);
+        if self.mode == CanvasMode::Wire {
+            if self.hit_lamp(pos, tf).is_some() || self.hit_sensor(pos, tf).is_some() {
+                return mouse::Interaction::Crosshair;
+            }
+            if self.hit_wire(pos, tf).is_some() {
+                return mouse::Interaction::Pointer;
+            }
+            return mouse::Interaction::Crosshair;
+        }
         if let Some((_, handle)) = self.hit_selected_box_handle(pos, tf) {
             return handle.cursor();
         }
-        if self.hit_lamp(pos, tf).is_some() || self.hit_stamp(pos, tf).is_some() {
+        if self.hit_lamp(pos, tf).is_some()
+            || self.hit_sensor(pos, tf).is_some()
+            || self.hit_stamp(pos, tf).is_some()
+        {
             return mouse::Interaction::Grab;
         }
         if self.hit_wire(pos, tf).is_some() {
@@ -1554,13 +2389,15 @@ fn draw_arrowhead(frame: &mut Frame, tip: Point, dir: Vector, color: Color, size
 fn draw_stamp(
     frame: &mut Frame,
     st: &FloorplanStamp,
+    sx: f64,
+    sy: f64,
     tf: CanvasTransform,
     on_bg: Color,
     accent: Color,
     selected: bool,
 ) {
-    let cx = tf.offset_x + ((st.x + st.w * 0.5) as f32) * tf.scale;
-    let cy = tf.offset_y + ((st.y + st.h * 0.5) as f32) * tf.scale;
+    let cx = tf.offset_x + ((sx + st.w * 0.5) as f32) * tf.scale;
+    let cy = tf.offset_y + ((sy + st.h * 0.5) as f32) * tf.scale;
     let w = (st.w as f32) * tf.scale;
     let h = (st.h as f32) * tf.scale;
     let hw = w * 0.5;
@@ -1704,161 +2541,270 @@ fn draw_stamp(
     });
 }
 
-/// Draws a crisp geometric vector glyph inside a lamp node for all 12 allowlisted `LAMP_ICONS`.
+/// Draws a crisp, bold vector silhouette inside a lamp node matching `lamp_icon_svg` 1:1.
 fn draw_lamp_icon(frame: &mut Frame, c: Point, r: f32, icon_key: &str, ink: Color) {
     let s = Stroke::default()
         .with_color(ink)
-        .with_width(1.6)
+        .with_width(1.85)
         .with_line_cap(LineCap::Round)
         .with_line_join(LineJoin::Round);
 
     match normalize_lamp_icon(icon_key) {
         "bulb" => {
-            frame.stroke(&CanvasPath::circle(Point::new(c.x, c.y - r * 0.18), r * 0.56), s);
+            // Solid lightbulb globe + base bars
+            frame.fill(&CanvasPath::circle(Point::new(c.x, c.y - r * 0.22), r * 0.56), ink);
+            frame.fill(
+                &CanvasPath::rectangle(Point::new(c.x - r * 0.28, c.y + r * 0.24), Size::new(r * 0.56, r * 0.26)),
+                ink,
+            );
             frame.stroke(
-                &CanvasPath::line(Point::new(c.x - r * 0.28, c.y + r * 0.62), Point::new(c.x + r * 0.28, c.y + r * 0.62)),
+                &CanvasPath::line(Point::new(c.x - r * 0.28, c.y + r * 0.68), Point::new(c.x + r * 0.28, c.y + r * 0.68)),
                 s,
             );
             frame.stroke(
-                &CanvasPath::line(Point::new(c.x - r * 0.18, c.y + r * 0.88), Point::new(c.x + r * 0.18, c.y + r * 0.88)),
-                s,
+                &CanvasPath::line(Point::new(c.x - r * 0.18, c.y + r * 0.92), Point::new(c.x + r * 0.18, c.y + r * 0.92)),
+                s.with_width(1.6),
             );
         }
         "spot" => {
-            // Downward spotlight cone
-            let p = CanvasPath::new(|b| {
-                b.move_to(Point::new(c.x - r * 0.35, c.y - r * 0.7));
-                b.line_to(Point::new(c.x + r * 0.35, c.y - r * 0.7));
-                b.line_to(Point::new(c.x + r * 0.75, c.y + r * 0.35));
-                b.line_to(Point::new(c.x - r * 0.75, c.y + r * 0.35));
+            // Solid downward spotlight housing + 3 light beam rays
+            let housing = CanvasPath::new(|b| {
+                b.move_to(Point::new(c.x - r * 0.38, c.y - r * 0.80));
+                b.line_to(Point::new(c.x + r * 0.38, c.y - r * 0.80));
+                b.line_to(Point::new(c.x + r * 0.76, c.y + r * 0.12));
+                b.line_to(Point::new(c.x - r * 0.76, c.y + r * 0.12));
                 b.close();
             });
-            frame.stroke(&p, s);
-            frame.stroke(&CanvasPath::line(Point::new(c.x, c.y + r * 0.55), Point::new(c.x, c.y + r * 0.88)), s);
+            frame.fill(&housing, ink);
+            frame.stroke(&CanvasPath::line(Point::new(c.x, c.y + r * 0.36), Point::new(c.x, c.y + r * 0.86)), s);
+            frame.stroke(
+                &CanvasPath::line(Point::new(c.x - r * 0.38, c.y + r * 0.34), Point::new(c.x - r * 0.60, c.y + r * 0.80)),
+                s.with_width(1.55),
+            );
+            frame.stroke(
+                &CanvasPath::line(Point::new(c.x + r * 0.38, c.y + r * 0.34), Point::new(c.x + r * 0.60, c.y + r * 0.80)),
+                s.with_width(1.55),
+            );
         }
         "strip" => {
-            // Horizontal LED strip bar with 3 dots
+            // Horizontal LED strip bar with 3 bold LED dots
             let bar = CanvasPath::rounded_rectangle(
-                Point::new(c.x - r * 0.85, c.y - r * 0.28),
-                Size::new(r * 1.7, r * 0.56),
-                2.5.into(),
+                Point::new(c.x - r * 0.88, c.y - r * 0.34),
+                Size::new(r * 1.76, r * 0.68),
+                3.0.into(),
             );
             frame.stroke(&bar, s);
-            for dx in [-0.45, 0.0, 0.45] {
-                frame.fill(&CanvasPath::circle(Point::new(c.x + r * dx, c.y), 1.4), ink);
+            for dx in [-0.46, 0.0, 0.46] {
+                frame.fill(&CanvasPath::circle(Point::new(c.x + r * dx, c.y), 1.8), ink);
             }
         }
         "floor" => {
-            // Tall floor lamp: trapezoid shade + stem + base
+            // Tall floor lamp: filled shade + tall stem + wide base
             let shade = CanvasPath::new(|b| {
-                b.move_to(Point::new(c.x - r * 0.42, c.y - r * 0.82));
-                b.line_to(Point::new(c.x + r * 0.42, c.y - r * 0.82));
-                b.line_to(Point::new(c.x + r * 0.65, c.y - r * 0.12));
-                b.line_to(Point::new(c.x - r * 0.65, c.y - r * 0.12));
+                b.move_to(Point::new(c.x - r * 0.38, c.y - r * 0.86));
+                b.line_to(Point::new(c.x + r * 0.38, c.y - r * 0.86));
+                b.line_to(Point::new(c.x + r * 0.66, c.y - r * 0.16));
+                b.line_to(Point::new(c.x - r * 0.66, c.y - r * 0.16));
                 b.close();
             });
-            frame.stroke(&shade, s);
-            frame.stroke(&CanvasPath::line(Point::new(c.x, c.y - r * 0.12), Point::new(c.x, c.y + r * 0.84)), s);
-            frame.stroke(&CanvasPath::line(Point::new(c.x - r * 0.45, c.y + r * 0.84), Point::new(c.x + r * 0.45, c.y + r * 0.84)), s);
+            frame.fill(&shade, ink);
+            frame.stroke(&CanvasPath::line(Point::new(c.x, c.y - r * 0.16), Point::new(c.x, c.y + r * 0.86)), s);
+            frame.stroke(&CanvasPath::line(Point::new(c.x - r * 0.50, c.y + r * 0.86), Point::new(c.x + r * 0.50, c.y + r * 0.86)), s);
         }
         "table" => {
-            // Wide cozy dome shade + short base
+            // Wide filled cozy shade + short thick stem + base
             let shade = CanvasPath::new(|b| {
-                b.move_to(Point::new(c.x - r * 0.52, c.y - r * 0.65));
-                b.line_to(Point::new(c.x + r * 0.52, c.y - r * 0.65));
-                b.line_to(Point::new(c.x + r * 0.78, c.y + r * 0.10));
-                b.line_to(Point::new(c.x - r * 0.78, c.y + r * 0.10));
+                b.move_to(Point::new(c.x - r * 0.50, c.y - r * 0.68));
+                b.line_to(Point::new(c.x + r * 0.50, c.y - r * 0.68));
+                b.line_to(Point::new(c.x + r * 0.82, c.y + r * 0.14));
+                b.line_to(Point::new(c.x - r * 0.82, c.y + r * 0.14));
                 b.close();
             });
-            frame.stroke(&shade, s);
-            frame.stroke(&CanvasPath::line(Point::new(c.x, c.y + r * 0.10), Point::new(c.x, c.y + r * 0.72)), s);
-            frame.stroke(&CanvasPath::line(Point::new(c.x - r * 0.5, c.y + r * 0.72), Point::new(c.x + r * 0.5, c.y + r * 0.72)), s);
+            frame.fill(&shade, ink);
+            frame.stroke(&CanvasPath::line(Point::new(c.x, c.y + r * 0.14), Point::new(c.x, c.y + r * 0.76)), s.with_width(2.2));
+            frame.stroke(&CanvasPath::line(Point::new(c.x - r * 0.52, c.y + r * 0.76), Point::new(c.x + r * 0.52, c.y + r * 0.76)), s);
         }
         "pendant" => {
-            // Hanging cord + dome
-            frame.stroke(&CanvasPath::line(Point::new(c.x, c.y - r * 0.90), Point::new(c.x, c.y - r * 0.25)), s);
+            // Hanging cord + filled dome + glowing bulb drop
+            frame.stroke(&CanvasPath::line(Point::new(c.x, c.y - r * 0.90), Point::new(c.x, c.y - r * 0.28)), s);
             let dome = CanvasPath::new(|b| {
                 b.arc(canvas::path::Arc {
-                    center: Point::new(c.x, c.y + r * 0.35),
-                    radius: r * 0.65,
+                    center: Point::new(c.x, c.y + r * 0.36),
+                    radius: r * 0.68,
                     start_angle: Radians(PI),
                     end_angle: Radians(2.0 * PI),
                 });
                 b.close();
             });
-            frame.stroke(&dome, s);
-            frame.fill(&CanvasPath::circle(Point::new(c.x, c.y + r * 0.52), 1.6), ink);
+            frame.fill(&dome, ink);
+            frame.fill(&CanvasPath::circle(Point::new(c.x, c.y + r * 0.58), 2.1), ink);
         }
         "ceiling" => {
-            // Flush ceiling mount dome + rays
-            frame.stroke(&CanvasPath::line(Point::new(c.x - r * 0.75, c.y - r * 0.45), Point::new(c.x + r * 0.75, c.y - r * 0.45)), s);
+            // Flush ceiling bar + filled semi-dome + 3 downward rays
+            frame.stroke(&CanvasPath::line(Point::new(c.x - r * 0.80, c.y - r * 0.56), Point::new(c.x + r * 0.80, c.y - r * 0.56)), s.with_width(2.0));
             let dome = CanvasPath::new(|b| {
                 b.arc(canvas::path::Arc {
-                    center: Point::new(c.x, c.y - r * 0.45),
-                    radius: r * 0.58,
+                    center: Point::new(c.x, c.y - r * 0.44),
+                    radius: r * 0.56,
                     start_angle: Radians(0.0),
                     end_angle: Radians(PI),
                 });
-            });
-            frame.stroke(&dome, s);
-            frame.stroke(&CanvasPath::line(Point::new(c.x, c.y + r * 0.38), Point::new(c.x, c.y + r * 0.72)), s);
-        }
-        "wall" => {
-            // Wall bracket on left + sconce glow right
-            frame.stroke(&CanvasPath::line(Point::new(c.x - r * 0.62, c.y - r * 0.72), Point::new(c.x - r * 0.62, c.y + r * 0.72)), s);
-            let cup = CanvasPath::new(|b| {
-                b.move_to(Point::new(c.x - r * 0.58, c.y - r * 0.20));
-                b.line_to(Point::new(c.x + r * 0.45, c.y - r * 0.58));
-                b.line_to(Point::new(c.x + r * 0.45, c.y + r * 0.58));
-                b.line_to(Point::new(c.x - r * 0.58, c.y + r * 0.20));
                 b.close();
             });
-            frame.stroke(&cup, s);
+            frame.fill(&dome, ink);
+            frame.stroke(&CanvasPath::line(Point::new(c.x, c.y + r * 0.38), Point::new(c.x, c.y + r * 0.82)), s);
+            frame.stroke(
+                &CanvasPath::line(Point::new(c.x - r * 0.42, c.y + r * 0.32), Point::new(c.x - r * 0.62, c.y + r * 0.68)),
+                s.with_width(1.5),
+            );
+            frame.stroke(
+                &CanvasPath::line(Point::new(c.x + r * 0.42, c.y + r * 0.32), Point::new(c.x + r * 0.62, c.y + r * 0.68)),
+                s.with_width(1.5),
+            );
+        }
+        "wall" => {
+            // Wall plate on left + filled sconce cup + forward ray
+            frame.stroke(&CanvasPath::line(Point::new(c.x - r * 0.66, c.y - r * 0.74), Point::new(c.x - r * 0.66, c.y + r * 0.74)), s.with_width(2.2));
+            let cup = CanvasPath::new(|b| {
+                b.move_to(Point::new(c.x - r * 0.52, c.y - r * 0.22));
+                b.line_to(Point::new(c.x + r * 0.48, c.y - r * 0.62));
+                b.line_to(Point::new(c.x + r * 0.48, c.y + r * 0.62));
+                b.line_to(Point::new(c.x - r * 0.52, c.y + r * 0.22));
+                b.close();
+            });
+            frame.fill(&cup, ink);
+            frame.stroke(&CanvasPath::line(Point::new(c.x + r * 0.66, c.y), Point::new(c.x + r * 0.88, c.y)), s);
         }
         "bar" => {
-            // Vertical Play light bar
+            // Solid vertical Play light bar
             let bar = CanvasPath::rounded_rectangle(
-                Point::new(c.x - r * 0.26, c.y - r * 0.84),
-                Size::new(r * 0.52, r * 1.68),
-                2.5.into(),
+                Point::new(c.x - r * 0.32, c.y - r * 0.84),
+                Size::new(r * 0.64, r * 1.68),
+                3.0.into(),
             );
-            frame.fill(&bar, with_alpha(ink, 0.28));
-            frame.stroke(&bar, s);
+            frame.fill(&bar, ink);
         }
         "desk" => {
-            // Articulated desk arm + angled lamp head + base
+            // Articulated desk arm + solid angled lamp head + base
             let arm = CanvasPath::new(|b| {
-                b.move_to(Point::new(c.x - r * 0.45, c.y + r * 0.75));
-                b.line_to(Point::new(c.x - r * 0.15, c.y - r * 0.05));
-                b.line_to(Point::new(c.x + r * 0.42, c.y - r * 0.65));
+                b.move_to(Point::new(c.x - r * 0.40, c.y + r * 0.72));
+                b.line_to(Point::new(c.x - r * 0.14, c.y - r * 0.06));
+                b.line_to(Point::new(c.x + r * 0.36, c.y - r * 0.56));
             });
             frame.stroke(&arm, s);
-            frame.stroke(&CanvasPath::line(Point::new(c.x + r * 0.15, c.y - r * 0.80), Point::new(c.x + r * 0.72, c.y - r * 0.35)), s.with_width(2.2));
-            frame.stroke(&CanvasPath::line(Point::new(c.x - r * 0.72, c.y + r * 0.75), Point::new(c.x + r * 0.25, c.y + r * 0.75)), s);
+            let head = CanvasPath::new(|b| {
+                b.move_to(Point::new(c.x + r * 0.20, c.y - r * 0.82));
+                b.line_to(Point::new(c.x + r * 0.80, c.y - r * 0.36));
+                b.line_to(Point::new(c.x + r * 0.50, c.y - r * 0.04));
+                b.line_to(Point::new(c.x + r * 0.06, c.y - r * 0.38));
+                b.close();
+            });
+            frame.fill(&head, ink);
+            frame.stroke(&CanvasPath::line(Point::new(c.x - r * 0.74, c.y + r * 0.74), Point::new(c.x + r * 0.24, c.y + r * 0.74)), s.with_width(2.2));
         }
         "outdoor" => {
-            // Lantern / sun post
-            frame.stroke(&CanvasPath::circle(c, r * 0.42), s);
+            // Solid sun center + 8 crisp rays
+            frame.fill(&CanvasPath::circle(c, r * 0.42), ink);
             for i in 0..8 {
                 let ang = (i as f32) * (PI / 4.0);
                 let p1 = Point::new(c.x + ang.cos() * r * 0.62, c.y + ang.sin() * r * 0.62);
-                let p2 = Point::new(c.x + ang.cos() * r * 0.88, c.y + ang.sin() * r * 0.88);
-                frame.stroke(&CanvasPath::line(p1, p2), s.with_width(1.3));
+                let p2 = Point::new(c.x + ang.cos() * r * 0.90, c.y + ang.sin() * r * 0.90);
+                frame.stroke(&CanvasPath::line(p1, p2), s.with_width(1.65));
             }
         }
         "candle" => {
-            // Flame teardrop + candle stick
+            // Solid flame teardrop + candle body
             let flame = CanvasPath::new(|b| {
-                b.move_to(Point::new(c.x, c.y - r * 0.85));
-                b.quadratic_curve_to(Point::new(c.x + r * 0.55, c.y - r * 0.15), Point::new(c.x, c.y + r * 0.08));
-                b.quadratic_curve_to(Point::new(c.x - r * 0.55, c.y - r * 0.15), Point::new(c.x, c.y - r * 0.85));
+                b.move_to(Point::new(c.x, c.y - r * 0.88));
+                b.quadratic_curve_to(Point::new(c.x + r * 0.52, c.y - r * 0.14), Point::new(c.x, c.y + r * 0.12));
+                b.quadratic_curve_to(Point::new(c.x - r * 0.52, c.y - r * 0.14), Point::new(c.x, c.y - r * 0.88));
             });
-            frame.stroke(&flame, s);
-            let stick = CanvasPath::rectangle(Point::new(c.x - r * 0.24, c.y + r * 0.18), Size::new(r * 0.48, r * 0.68));
-            frame.stroke(&stick, s);
+            frame.fill(&flame, ink);
+            let stick = CanvasPath::rounded_rectangle(
+                Point::new(c.x - r * 0.32, c.y + r * 0.24),
+                Size::new(r * 0.64, r * 0.64),
+                1.5.into(),
+            );
+            frame.fill(&stick, ink);
         }
         _ => {
-            frame.stroke(&CanvasPath::circle(c, r * 0.55), s);
+            frame.fill(&CanvasPath::circle(c, r * 0.55), ink);
+        }
+    }
+}
+
+/// Draws a crisp vector icon inside a placed sensor node (motion radar, door contact, or 2-button switch).
+fn draw_sensor_icon(frame: &mut Frame, c: Point, r: f32, kind: &str, ink: Color, active: bool) {
+    let s = Stroke::default()
+        .with_color(ink)
+        .with_width(1.7)
+        .with_line_cap(LineCap::Round)
+        .with_line_join(LineJoin::Round);
+
+    match kind {
+        "motion" => {
+            // Center beacon dot + two symmetrical radar wave arcs
+            frame.fill(&CanvasPath::circle(c, r * 0.24), ink);
+            for (rad_mul, span) in [(0.56f32, 0.85f32), (0.90f32, 0.95f32)] {
+                let right_arc = CanvasPath::new(|b| {
+                    b.arc(canvas::path::Arc {
+                        center: c,
+                        radius: r * rad_mul,
+                        start_angle: Radians(-span),
+                        end_angle: Radians(span),
+                    });
+                });
+                let left_arc = CanvasPath::new(|b| {
+                    b.arc(canvas::path::Arc {
+                        center: c,
+                        radius: r * rad_mul,
+                        start_angle: Radians(PI - span),
+                        end_angle: Radians(PI + span),
+                    });
+                });
+                frame.stroke(&right_arc, s.with_width(1.5));
+                frame.stroke(&left_arc, s.with_width(1.5));
+            }
+        }
+        "contact" => {
+            // Two magnetic contact halves: snug together when closed, parted when open
+            let gap = if active { r * 0.34 } else { r * 0.10 };
+            let bar_w = r * 0.36;
+            let bar_h = r * 1.24;
+            let left = CanvasPath::rounded_rectangle(
+                Point::new(c.x - gap - bar_w, c.y - bar_h * 0.5),
+                Size::new(bar_w, bar_h),
+                1.5.into(),
+            );
+            let right = CanvasPath::rounded_rectangle(
+                Point::new(c.x + gap, c.y - bar_h * 0.5),
+                Size::new(bar_w, bar_h),
+                1.5.into(),
+            );
+            frame.fill(&left, ink);
+            frame.fill(&right, ink);
+            if active {
+                // Tiny alert bolt/gap marks between parted halves
+                frame.stroke(
+                    &CanvasPath::line(Point::new(c.x, c.y - r * 0.24), Point::new(c.x, c.y + r * 0.24)),
+                    s.with_width(1.4),
+                );
+            }
+        }
+        _ => {
+            // 2-button Hue dimmer/switch plate
+            let plate = CanvasPath::rounded_rectangle(
+                Point::new(c.x - r * 0.62, c.y - r * 0.86),
+                Size::new(r * 1.24, r * 1.72),
+                2.5.into(),
+            );
+            frame.stroke(&plate, s.with_width(1.5));
+            frame.stroke(
+                &CanvasPath::line(Point::new(c.x - r * 0.48, c.y), Point::new(c.x + r * 0.48, c.y)),
+                s.with_width(1.2),
+            );
+            frame.fill(&CanvasPath::circle(Point::new(c.x, c.y - r * 0.40), r * 0.18), ink);
+            frame.fill(&CanvasPath::circle(Point::new(c.x, c.y + r * 0.40), r * 0.18), ink);
         }
     }
 }
@@ -1879,7 +2825,7 @@ fn studio_card(skin: &str) -> theme::Container<'static> {
     theme::Container::custom(move |theme: &cosmic::Theme| {
         let base = Color::from(theme.cosmic().on_bg_color());
         let (bg, border, width) = match skin_st {
-            Some(st) => (with_alpha(st.bg_tint, 0.12), with_alpha(st.border_tint, 0.34), st.border_width),
+            Some(st) => (with_alpha(st.bg_tint, 0.26), with_alpha(st.border_tint, 0.50), st.border_width),
             None => (with_alpha(base, 0.045), with_alpha(base, 0.12), 1.0),
         };
         iced_container::Style {
@@ -1888,6 +2834,59 @@ fn studio_card(skin: &str) -> theme::Container<'static> {
             ..Default::default()
         }
     })
+}
+
+fn dialog_card(skin: &str) -> theme::Container<'static> {
+    let skin_st = skin_style(skin);
+    theme::Container::custom(move |theme: &cosmic::Theme| {
+        let bg = Color::from(theme.cosmic().bg_color());
+        let accent: Color = theme.cosmic().accent_color().into();
+        let (border, width) = match skin_st {
+            Some(st) => (with_alpha(st.border_tint, 0.78), st.border_width.max(1.25)),
+            None => (with_alpha(accent, 0.55), 1.25),
+        };
+        iced_container::Style {
+            background: Some(Background::Color(Color { a: 1.0, ..bg })),
+            border: Border { radius: corners::now().radius.into(), width, color: border },
+            ..Default::default()
+        }
+    })
+}
+
+fn lamp_icon_handle(icon_key: &str) -> icon::Handle {
+    let mut handle = icon::from_svg_bytes(lamp_icon_svg(icon_key));
+    handle.symbolic = true;
+    handle
+}
+
+fn lamp_icon_badge<'a>(hex: &str, on: bool, icon_key: &str, size: f32) -> Element<'a, MapMsg> {
+    let c = parse_hex_color(hex);
+    let glyph_px = (size * 0.58).round().clamp(11.0, 22.0) as u16;
+    let svg_icon = icon::icon(lamp_icon_handle(icon_key))
+        .size(glyph_px)
+        .class(theme::Svg::custom(move |theme: &cosmic::Theme| iced_svg::Style {
+            color: Some(if on {
+                contrast_ink(c)
+            } else {
+                with_alpha(Color::from(theme.cosmic().on_bg_color()), 0.85)
+            }),
+        }));
+    container(svg_icon)
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .class(theme::Container::custom(move |theme: &cosmic::Theme| {
+            let base = Color::from(theme.cosmic().on_bg_color());
+            let fill = if on { c } else { with_alpha(base, 0.16) };
+            let border_col = if on { Color::WHITE } else { with_alpha(base, 0.38) };
+            iced_container::Style {
+                background: Some(Background::Color(fill)),
+                border: Border { radius: (size * 0.5).into(), width: 1.2, color: border_col },
+                ..Default::default()
+            }
+        }))
+        .into()
 }
 
 fn color_dot<'a>(hex: &str, on: bool, size: f32) -> Element<'a, MapMsg> {
@@ -1907,21 +2906,123 @@ fn color_dot<'a>(hex: &str, on: bool, size: f32) -> Element<'a, MapMsg> {
         .into()
 }
 
+fn sensor_dot<'a>(sensor: &HueSensor, size: f32) -> Element<'a, MapMsg> {
+    let fill = match sensor.kind.as_str() {
+        "motion" => {
+            if !sensor.enabled {
+                Color::from_rgb8(0x64, 0x74, 0x8B)
+            } else if sensor.motion {
+                MOTION_ACTIVE_COLOR
+            } else {
+                MOTION_IDLE_COLOR
+            }
+        }
+        "contact" => {
+            if !sensor.enabled {
+                Color::from_rgb8(0x64, 0x74, 0x8B)
+            } else if sensor.open {
+                CONTACT_OPEN_COLOR
+            } else {
+                CONTACT_CLOSED_COLOR
+            }
+        }
+        _ => BUTTON_COLOR,
+    };
+    container(space::horizontal())
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .class(theme::Container::custom(move |theme: &cosmic::Theme| {
+            let base = Color::from(theme.cosmic().on_bg_color());
+            iced_container::Style {
+                background: Some(Background::Color(fill)),
+                border: Border { radius: 3.0.into(), width: 1.0, color: with_alpha(base, 0.35) },
+                ..Default::default()
+            }
+        }))
+        .into()
+}
+
+fn sensor_meta_line(sensor: &HueSensor) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    match sensor.kind.as_str() {
+        "motion" => {
+            if !sensor.enabled {
+                parts.push(tr("Disable"));
+            } else if sensor.motion {
+                parts.push(tr("Motion"));
+            } else {
+                parts.push(tr("No motion"));
+            }
+            if let Some(t) = sensor.temperature {
+                parts.push(format!("{t:.1}°C"));
+            }
+            if let Some(lux) = sensor.lux {
+                parts.push(format!("{:.0} lx", lux));
+            }
+        }
+        "contact" => {
+            if !sensor.enabled {
+                parts.push(tr("Disable"));
+            } else if sensor.open {
+                parts.push(tr("Open"));
+            } else {
+                parts.push(tr("Closed"));
+            }
+        }
+        _ => {
+            parts.push(tr("Switch"));
+        }
+    }
+    if let Some(bat) = sensor.battery {
+        parts.push(format!("{bat}%"));
+    }
+    parts.join(" · ")
+}
+
 pub fn view_map_tab<'a>(
     state: &'a FloorplanState,
     stats: &'a Value,
     skin: &'a str,
     window_mode: bool,
     window_width: f32,
+    pending_sync: usize,
 ) -> Element<'a, MapMsg> {
     let lights = extract_bridge_lights(stats);
+    let sensors = parse_sensors(stats);
+    let motion_areas = parse_motion_areas(stats);
     let ent_areas = parse_entertainment_areas(stats);
-    let pending = compute_pending_sync_count(&state.doc, stats);
+    let pending = pending_sync;
     let wide = window_mode && window_width >= 760.0;
+    let program = FloorplanCanvasProgram::from_state(state, stats);
+    let wire_count = program.wires.len();
 
     let mut root = column![].spacing(8);
 
-    // ----------------------------------------------------------------- Toolbar Row 1
+    // ----------------------------------------------------------------- Simplified 1-Row Top Toolbar
+    let map_tab_btn = if state.mode == CanvasMode::Select {
+        button::suggested(tr("Map"))
+    } else {
+        button::standard(tr("Map"))
+    }
+    .on_press(MapMsg::SetMode(CanvasMode::Select));
+
+    let rules_tab_label = if wire_count > 0 {
+        format!("{} ({wire_count})", tr("Rules"))
+    } else {
+        tr("Rules")
+    };
+    let rules_tab_btn = if state.mode == CanvasMode::Wire {
+        button::suggested(rules_tab_label)
+    } else {
+        button::standard(rules_tab_label)
+    }
+    .on_press(MapMsg::SetMode(CanvasMode::Wire));
+
+    let mode_switcher: Element<MapMsg> = row![map_tab_btn, rules_tab_btn]
+        .spacing(2)
+        .align_y(Alignment::Center)
+        .into();
+
     let sidebar_btn = if state.sidebar_open {
         button::suggested(tr("Lamps"))
     } else {
@@ -1929,120 +3030,89 @@ pub fn view_map_tab<'a>(
     }
     .on_press(MapMsg::ToggleSidebar);
 
-    let tpl_btn = button::standard(format!("{} ▾", template_label(&state.doc.template_id)))
+    let toolbar: Vec<Element<MapMsg>> = if state.mode == CanvasMode::Wire {
+        vec![mode_switcher, sidebar_btn.into()]
+    } else {
+        let add_label = format!("{} ▾", tr("+ Add"));
+        let add_btn = if state.add_menu_open {
+            button::suggested(add_label)
+        } else {
+            button::standard(add_label)
+        }
+        .on_press(MapMsg::ToggleAddMenu);
+
+        let tpl_label = format!("{} ▾", template_label(&state.doc.template_id));
+        let tpl_btn = if state.templates_open {
+            button::suggested(tpl_label)
+        } else {
+            button::standard(tpl_label)
+        }
         .on_press(MapMsg::ToggleTemplatesMenu);
 
-    let add_room_btn = button::standard(tr("+ Room")).on_press(MapMsg::AddBox("room".into()));
-    let add_zone_btn = button::standard(tr("+ Zone")).on_press(MapMsg::AddBox("zone".into()));
-    let stamp_btn = button::standard(format!("{} ▾", tr("+ Stamp"))).on_press(MapMsg::ToggleStampsMenu);
-    let bg_btn = if !state.doc.background.path.is_empty() || state.bg_open {
-        button::suggested(tr("Background"))
-    } else {
-        button::standard(tr("Background"))
-    }
-    .on_press(MapMsg::ToggleBgMenu);
-
-    let sync_label = if pending > 0 {
-        trf("Sync All ({0})", &[pending.to_string()])
-    } else {
-        tr("Sync All to Bridge")
-    };
-    let sync_btn = if pending > 0 {
-        button::suggested(sync_label)
-    } else {
-        button::standard(sync_label)
-    }
-    .on_press(MapMsg::SyncAll);
-
-    let mut bar1: Vec<Element<MapMsg>> = vec![
-        sidebar_btn.into(),
-        tpl_btn.into(),
-        add_room_btn.into(),
-        add_zone_btn.into(),
-        stamp_btn.into(),
-        bg_btn.into(),
-        sync_btn.into(),
-    ];
-    if !ent_areas.is_empty() {
-        let ent_lbl = state
-            .doc
-            .entertainment_id
-            .as_deref()
-            .and_then(|id| ent_areas.iter().find(|a| a.id == id).map(|a| a.name.clone()))
-            .unwrap_or_else(|| tr("Entertainment"));
-        bar1.push(
-            button::standard(format!("♪ {ent_lbl} ▾"))
-                .on_press(MapMsg::ToggleEntMenu)
-                .into(),
-        );
-    }
-
-    // ----------------------------------------------------------------- Toolbar Row 2 (Modes & Layers)
-    let select_btn = if state.mode == CanvasMode::Select {
-        button::suggested(tr("Select / Move"))
-    } else {
-        button::standard(tr("Select / Move"))
-    }
-    .on_press(MapMsg::SetMode(CanvasMode::Select));
-
-    let wire_btn = if state.mode == CanvasMode::Wire {
-        button::suggested(tr("Wire"))
-    } else {
-        button::standard(tr("Wire"))
-    }
-    .on_press(MapMsg::SetMode(CanvasMode::Wire));
-
-    let mut bar2: Vec<Element<MapMsg>> = vec![select_btn.into(), wire_btn.into()];
-    if state.mode == CanvasMode::Wire {
-        for wk in WireKind::ALL {
-            let b = if state.wire_kind == wk {
-                button::suggested(wk.label())
-            } else {
-                button::standard(wk.label())
-            };
-            bar2.push(b.on_press(MapMsg::SetWireKind(wk)).into());
+        let view_label = format!("{} ▾", tr("View"));
+        let view_btn = if state.view_menu_open || state.bg_open || state.ent_menu_open {
+            button::suggested(view_label)
+        } else {
+            button::standard(view_label)
         }
-    }
-    bar2.push(
-        (if state.doc.show_glows { button::suggested(tr("Glows")) } else { button::standard(tr("Glows")) })
-            .on_press(MapMsg::ToggleGlows)
-            .into(),
-    );
-    bar2.push(
-        (if state.doc.show_furniture { button::suggested(tr("Furniture")) } else { button::standard(tr("Furniture")) })
-            .on_press(MapMsg::ToggleFurniture)
-            .into(),
-    );
-    bar2.push(
-        (if state.doc.show_wires { button::suggested(tr("Wires")) } else { button::standard(tr("Wires")) })
-            .on_press(MapMsg::ToggleWires)
-            .into(),
-    );
-    bar2.push(
-        row![
-            dim_caption(tr("Auto-sync")),
-            toggler(state.doc.auto_sync).on_toggle(MapMsg::ToggleAutoSync),
+        .on_press(MapMsg::ToggleViewMenu);
+
+        let sync_label = if pending > 0 {
+            trf("Sync All ({0})", &[pending.to_string()])
+        } else {
+            tr("Sync All")
+        };
+        let sync_btn = if pending > 0 {
+            button::suggested(sync_label)
+        } else {
+            button::standard(sync_label)
+        }
+        .on_press(MapMsg::SyncAll);
+
+        vec![
+            mode_switcher,
+            sidebar_btn.into(),
+            add_btn.into(),
+            tpl_btn.into(),
+            view_btn.into(),
+            sync_btn.into(),
         ]
-        .spacing(6)
-        .align_y(Alignment::Center)
-        .into(),
-    );
+    };
 
     root = root.push(
-        container(
-            column![
-                flex_row(bar1).row_spacing(6).column_spacing(6),
-                flex_row(bar2).row_spacing(6).column_spacing(6),
-            ]
-            .spacing(6),
-        )
-        .padding(8)
-        .width(Length::Fill)
-        .class(studio_card(skin)),
+        container(flex_row(toolbar).row_spacing(6).column_spacing(6))
+            .padding(8)
+            .width(Length::Fill)
+            .class(studio_card(skin)),
     );
 
-    // ----------------------------------------------------------------- Dropdown Popovers
-    if state.templates_open {
+    // ----------------------------------------------------------------- Dropdown Popovers (Map sub-tab)
+    if state.mode == CanvasMode::Select && state.add_menu_open {
+        let box_row = row![
+            button::standard(tr("+ Room")).on_press(MapMsg::AddBox("room".into())),
+            button::standard(tr("+ Zone")).on_press(MapMsg::AddBox("zone".into())),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        let stamp_btns: Vec<Element<MapMsg>> = FLOORPLAN_STAMP_KINDS
+            .iter()
+            .map(|sk| {
+                button::standard(stamp_kind_label(sk))
+                    .on_press(MapMsg::AddStamp((*sk).to_string()))
+                    .into()
+            })
+            .collect();
+        let opts = column![
+            box_row,
+            divider::horizontal::light(),
+            dim_caption(tr("Add architectural stamp")),
+            flex_row(stamp_btns).row_spacing(6).column_spacing(6),
+        ]
+        .spacing(6);
+        root = root.push(container(opts).padding(8).width(Length::Fill).class(studio_card(skin)));
+    }
+
+    if state.mode == CanvasMode::Select && state.templates_open {
         let mut opts = column![dim_caption(tr("Choose Floorplan Prototype"))].spacing(4);
         let btns: Vec<Element<MapMsg>> = FLOORPLAN_TEMPLATES
             .iter()
@@ -2061,7 +3131,7 @@ pub fn view_map_tab<'a>(
         root = root.push(container(opts).padding(8).width(Length::Fill).class(studio_card(skin)));
     }
 
-    if state.stamps_open {
+    if state.mode == CanvasMode::Select && state.stamps_open && !state.add_menu_open {
         let mut opts = column![dim_caption(tr("Add architectural stamp"))].spacing(4);
         let btns: Vec<Element<MapMsg>> = FLOORPLAN_STAMP_KINDS
             .iter()
@@ -2075,7 +3145,55 @@ pub fn view_map_tab<'a>(
         root = root.push(container(opts).padding(8).width(Length::Fill).class(studio_card(skin)));
     }
 
-    if state.ent_menu_open && !ent_areas.is_empty() {
+    if state.mode == CanvasMode::Select && state.view_menu_open {
+        let mut layer_btns: Vec<Element<MapMsg>> = vec![
+            (if state.doc.show_glows { button::suggested(tr("Glows")) } else { button::standard(tr("Glows")) })
+                .on_press(MapMsg::ToggleGlows)
+                .into(),
+            (if state.doc.show_furniture { button::suggested(tr("Furniture")) } else { button::standard(tr("Furniture")) })
+                .on_press(MapMsg::ToggleFurniture)
+                .into(),
+            (if state.doc.show_wires { button::suggested(tr("Wires")) } else { button::standard(tr("Wires")) })
+                .on_press(MapMsg::ToggleWires)
+                .into(),
+            (if !state.doc.background.path.is_empty() || state.bg_open {
+                button::suggested(tr("Background"))
+            } else {
+                button::standard(tr("Background"))
+            })
+            .on_press(MapMsg::ToggleBgMenu)
+            .into(),
+        ];
+        if !ent_areas.is_empty() {
+            let ent_lbl = state
+                .doc
+                .entertainment_id
+                .as_deref()
+                .and_then(|id| ent_areas.iter().find(|a| a.id == id).map(|a| a.name.clone()))
+                .unwrap_or_else(|| tr("Entertainment"));
+            let ent_text = format!("♪ {ent_lbl} ▾");
+            let ent_btn = if state.ent_menu_open || state.doc.entertainment_id.is_some() {
+                button::suggested(ent_text)
+            } else {
+                button::standard(ent_text)
+            };
+            layer_btns.push(ent_btn.on_press(MapMsg::ToggleEntMenu).into());
+        }
+        let view_panel = column![
+            flex_row(layer_btns).row_spacing(6).column_spacing(6),
+            row![
+                dim_caption(tr("Auto-sync")),
+                space::horizontal(),
+                toggler(state.doc.auto_sync).on_toggle(MapMsg::ToggleAutoSync),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(8);
+        root = root.push(container(view_panel).padding(8).width(Length::Fill).class(studio_card(skin)));
+    }
+
+    if state.mode == CanvasMode::Select && state.ent_menu_open && !ent_areas.is_empty() {
         let mut opts = column![dim_caption(tr("Entertainment area"))].spacing(2);
         let none_lbl = if state.doc.entertainment_id.is_none() {
             format!("✓ {}", tr("None"))
@@ -2093,7 +3211,7 @@ pub fn view_map_tab<'a>(
         root = root.push(container(opts).padding(8).width(Length::Fill).class(studio_card(skin)));
     }
 
-    if state.bg_open {
+    if state.mode == CanvasMode::Select && state.bg_open {
         let op_pct = state
             .bg_opacity_drag
             .unwrap_or_else(|| (state.doc.background.opacity * 100.0).round().clamp(5.0, 100.0) as u8);
@@ -2136,7 +3254,7 @@ pub fn view_map_tab<'a>(
         root = root.push(container(bg_panel).padding(10).width(Length::Fill).class(studio_card(skin)));
     }
 
-    // Active mode hint banner (armed click-to-place or wire drawing)
+    // Active mode hint banner (armed click-to-place or Rules sub-tab)
     if let Some(ref armed_id) = state.armed_place_lamp {
         let lname = lights
             .iter()
@@ -2157,29 +3275,36 @@ pub fn view_map_tab<'a>(
             .class(studio_card(skin)),
         );
     } else if state.mode == CanvasMode::Wire {
-        let hint = if let Some(ref fid) = state.pending_wire_from {
-            let lname = lights.iter().find(|l| l.id == *fid).map(|l| l.name.as_str()).unwrap_or("");
-            trf("Click a target lamp to wire from {0}", &[lname.to_string()])
+        let hint_row: Element<MapMsg> = if let Some((ref fk, ref fid)) = state.pending_wire_from {
+            let src_name = resolve_name(stats, fk, fid);
+            row![
+                dim_caption(trf("Click a target lamp to wire from {0}", &[src_name])),
+                space::horizontal(),
+                button::text(tr("Cancel")).on_press(MapMsg::Select(None)),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into()
         } else {
-            tr("Drag from one lamp to another to create a dependency wire.")
+            dim_caption(tr(
+                "Drag from one lamp to another to create a rule, or click a line to edit or delete.",
+            ))
         };
         root = root.push(
-            container(dim_caption(hint))
-                .padding([4, 8])
+            container(hint_row)
+                .padding([6, 8])
                 .width(Length::Fill)
                 .class(studio_card(skin)),
         );
     }
 
     // ----------------------------------------------------------------- Canvas + Optional Background Layer
-    let canvas_height = if window_mode { 440.0 } else { 300.0 };
-    let program = FloorplanCanvasProgram::from_state(state, stats);
+    let canvas_height = if window_mode { 520.0 } else { 340.0 };
     let canvas_widget = cosmic::widget::canvas(program)
         .width(Length::Fill)
         .height(Length::Fixed(canvas_height));
 
-    let bg_path = state.doc.background.path.trim();
-    let layered_canvas: Element<MapMsg> = if !bg_path.is_empty() && Path::new(bg_path).is_file() {
+    let layered_canvas: Element<MapMsg> = if let Some((_, ref bg_handle)) = state.bg_handle_cache {
         let fit = if state.doc.background.fit == "cover" {
             ContentFit::Cover
         } else {
@@ -2190,7 +3315,7 @@ pub fn view_map_tab<'a>(
             .map(|p| (p as f32) / 100.0)
             .unwrap_or(state.doc.background.opacity as f32)
             .clamp(0.05, 1.0);
-        let bg_img = iced_image(iced_image::Handle::from_path(bg_path))
+        let bg_img = iced_image(bg_handle.clone())
             .width(Length::Fill)
             .height(Length::Fixed(canvas_height))
             .content_fit(fit)
@@ -2237,47 +3362,79 @@ pub fn view_map_tab<'a>(
             list_col = list_col.push(dim_caption(tr("All lamps placed")));
         } else {
             for l in unplaced {
+                let menu_open = state.open_lamp_menu.as_deref() == Some(l.id.as_str());
                 let meta = if l.room_name.is_empty() {
                     format!("{}%", l.bri.round() as i32)
                 } else {
                     format!("{} · {}%", l.room_name, l.bri.round() as i32)
                 };
-                list_col = list_col.push(
-                    row![
-                        color_dot(&l.color, l.on, 10.0),
-                        column![text::caption(l.name.clone()), dim_caption(meta)]
-                            .spacing(1)
-                            .width(Length::Fill),
-                        button::standard(tr("Place")).on_press(MapMsg::PlaceLamp(l.id.clone())),
-                        button::text("⌖").on_press(MapMsg::ArmPlaceLamp(l.id.clone())),
-                    ]
-                    .spacing(4)
-                    .align_y(Alignment::Center),
-                );
+                let main_row = row![
+                    color_dot(&l.color, l.on, 10.0),
+                    column![text::caption(l.name.clone()), dim_caption(meta)]
+                        .spacing(1)
+                        .width(Length::Fill),
+                    button::standard(tr("Place")).on_press(MapMsg::PlaceLamp(l.id.clone())),
+                    button::custom(text::caption("⋯"))
+                        .padding([3, 7])
+                        .class(if menu_open { theme::Button::Suggested } else { theme::Button::MenuItem })
+                        .on_press(MapMsg::ToggleLampMenu(l.id.clone())),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center);
+
+                if menu_open {
+                    let toggle_lbl = if l.on { tr("Turn off") } else { tr("Turn on") };
+                    let submenu = container(
+                        container(
+                            column![
+                                menu_button(text::caption(tr("Place")))
+                                    .on_press(MapMsg::PlaceLamp(l.id.clone())),
+                                menu_button(text::caption(format!("⌖ {}", tr("Place"))))
+                                    .on_press(MapMsg::ArmPlaceLamp(l.id.clone())),
+                                menu_button(text::caption(toggle_lbl))
+                                    .on_press(MapMsg::LampToggle(l.id.clone(), !l.on)),
+                                menu_button(text::caption(format!("{}…", tr("Brightness"))))
+                                    .on_press(MapMsg::OpenLampDialog(LampDialog::Brightness(l.id.clone()))),
+                                menu_button(text::caption(format!("{}…", tr("Rename"))))
+                                    .on_press(MapMsg::OpenLampDialog(LampDialog::Rename(l.id.clone()))),
+                            ]
+                            .spacing(2),
+                        )
+                        .padding(4)
+                        .width(Length::Fill)
+                        .class(studio_card(skin)),
+                    )
+                    .padding([2, 0, 2, 12])
+                    .width(Length::Fill);
+                    list_col = list_col.push(column![main_row, submenu].spacing(2));
+                } else {
+                    list_col = list_col.push(main_row);
+                }
             }
         }
 
         list_col = list_col.push(divider::horizontal::light());
         list_col = list_col.push(dim_caption(trf("Placed ({0})", &[placed.len().to_string()])));
         for l in placed {
-            let ic = state
+            let icon_key = state
                 .doc
                 .lamps
                 .get(&l.id)
-                .map(|p| lamp_icon_glyph(&p.icon))
-                .unwrap_or("◉");
+                .map(|p| normalize_lamp_icon(&p.icon))
+                .unwrap_or("bulb");
             let selected = matches!(&state.selection, Some(Selection::Lamp(id)) if id == &l.id);
+            let menu_open = state.open_lamp_menu.as_deref() == Some(l.id.as_str());
             let meta = if l.room_name.is_empty() {
-                format!("{ic} {}%", l.bri.round() as i32)
+                format!("{}%", l.bri.round() as i32)
             } else {
-                format!("{ic} {} · {}%", l.room_name, l.bri.round() as i32)
+                format!("{} · {}%", l.room_name, l.bri.round() as i32)
             };
             let focus_btn = button::custom(
                 row![
-                    color_dot(&l.color, l.on, 10.0),
+                    lamp_icon_badge(&l.color, l.on, icon_key, 24.0),
                     column![text::caption(l.name.clone()), dim_caption(meta)].spacing(1),
                 ]
-                .spacing(6)
+                .spacing(8)
                 .align_y(Alignment::Center),
             )
             .width(Length::Fill)
@@ -2285,14 +3442,140 @@ pub fn view_map_tab<'a>(
             .class(if selected { theme::Button::Suggested } else { theme::Button::MenuItem })
             .on_press(MapMsg::FocusLamp(l.id.clone()));
 
-            list_col = list_col.push(
-                row![
-                    focus_btn,
-                    button::text("×").on_press(MapMsg::UnplaceLamp(l.id.clone())),
-                ]
+            let menu_btn = button::custom(text::caption("⋯"))
+                .padding([3, 7])
+                .class(if menu_open { theme::Button::Suggested } else { theme::Button::MenuItem })
+                .on_press(MapMsg::ToggleLampMenu(l.id.clone()));
+
+            let main_row = row![focus_btn, menu_btn]
                 .spacing(2)
-                .align_y(Alignment::Center),
-            );
+                .align_y(Alignment::Center);
+
+            if menu_open {
+                let toggle_lbl = if l.on { tr("Turn off") } else { tr("Turn on") };
+                let submenu = container(
+                    container(
+                        column![
+                            menu_button(text::caption(toggle_lbl))
+                                .on_press(MapMsg::LampToggle(l.id.clone(), !l.on)),
+                            menu_button(text::caption(format!("{}…", tr("Brightness"))))
+                                .on_press(MapMsg::OpenLampDialog(LampDialog::Brightness(l.id.clone()))),
+                            menu_button(text::caption(format!("{}…", tr("Rename"))))
+                                .on_press(MapMsg::OpenLampDialog(LampDialog::Rename(l.id.clone()))),
+                            menu_button(text::caption(format!("{}…", tr("Lamp icon"))))
+                                .on_press(MapMsg::OpenLampDialog(LampDialog::Icon(l.id.clone()))),
+                            menu_button(text::caption(tr("Wire from here")))
+                                .on_press(MapMsg::LampStartWire(l.id.clone())),
+                            menu_button(text::caption(tr("Unplace")))
+                                .on_press(MapMsg::UnplaceLamp(l.id.clone())),
+                        ]
+                        .spacing(2),
+                    )
+                    .padding(4)
+                    .width(Length::Fill)
+                    .class(studio_card(skin)),
+                )
+                .padding([2, 0, 2, 12])
+                .width(Length::Fill);
+                list_col = list_col.push(column![main_row, submenu].spacing(2));
+            } else {
+                list_col = list_col.push(main_row);
+            }
+        }
+
+        // Physical Hue Sensors & Switches section (only shown when sensors exist)
+        if !sensors.is_empty() {
+            let mut unplaced_sensors = Vec::new();
+            let mut placed_sensors = Vec::new();
+            for s in &sensors {
+                if !q.is_empty() && !s.name.to_lowercase().contains(&q) {
+                    continue;
+                }
+                if state.doc.sensors.contains_key(&s.id) {
+                    placed_sensors.push(s);
+                } else {
+                    unplaced_sensors.push(s);
+                }
+            }
+            if !unplaced_sensors.is_empty() || !placed_sensors.is_empty() {
+                list_col = list_col.push(divider::horizontal::default());
+                list_col = list_col.push(dim_caption(tr("Sensors")));
+                for s in unplaced_sensors {
+                    let meta = sensor_meta_line(s);
+                    let row_el = row![
+                        sensor_dot(s, 11.0),
+                        column![text::caption(s.name.clone()), dim_caption(meta)]
+                            .spacing(1)
+                            .width(Length::Fill),
+                        button::standard(tr("Place")).on_press(MapMsg::PlaceSensor(s.id.clone())),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
+                    list_col = list_col.push(row_el);
+                }
+                for s in placed_sensors {
+                    let selected = matches!(&state.selection, Some(Selection::Sensor(id)) if id == &s.id);
+                    let menu_open = state.open_sensor_menu.as_deref() == Some(s.id.as_str());
+                    let meta = sensor_meta_line(s);
+                    let focus_btn = button::custom(
+                        row![
+                            sensor_dot(s, 14.0),
+                            column![text::caption(s.name.clone()), dim_caption(meta)].spacing(1),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .padding([3, 4])
+                    .class(if selected { theme::Button::Suggested } else { theme::Button::MenuItem })
+                    .on_press(MapMsg::FocusSensor(s.id.clone()));
+
+                    let menu_btn = button::custom(text::caption("⋯"))
+                        .padding([3, 7])
+                        .class(if menu_open { theme::Button::Suggested } else { theme::Button::MenuItem })
+                        .on_press(MapMsg::ToggleSensorMenu(s.id.clone()));
+
+                    let main_row = row![focus_btn, menu_btn]
+                        .spacing(2)
+                        .align_y(Alignment::Center);
+
+                    if menu_open {
+                        let mut items = column![].spacing(2);
+                        if matches!(s.kind.as_str(), "motion" | "contact") {
+                            let lbl = if s.enabled { tr("Disable") } else { tr("Enable") };
+                            items = items.push(
+                                menu_button(text::caption(lbl)).on_press(MapMsg::SensorToggle {
+                                    kind: s.kind.clone(),
+                                    id: s.id.clone(),
+                                    enabled: !s.enabled,
+                                }),
+                            );
+                        }
+                        items = items
+                            .push(menu_button(text::caption(tr("Wire from here"))).on_press(
+                                MapMsg::SensorStartWire {
+                                    kind: s.kind.clone(),
+                                    id: s.id.clone(),
+                                },
+                            ))
+                            .push(
+                                menu_button(text::caption(tr("Unplace")))
+                                    .on_press(MapMsg::UnplaceSensor(s.id.clone())),
+                            );
+                        let submenu = container(
+                            container(items)
+                                .padding(4)
+                                .width(Length::Fill)
+                                .class(studio_card(skin)),
+                        )
+                        .padding([2, 0, 2, 12])
+                        .width(Length::Fill);
+                        list_col = list_col.push(column![main_row, submenu].spacing(2));
+                    } else {
+                        list_col = list_col.push(main_row);
+                    }
+                }
+            }
         }
 
         let sc = scrollable(container(list_col).padding([0, 6, 0, 0]))
@@ -2319,54 +3602,246 @@ pub fn view_map_tab<'a>(
     }
 
     // ----------------------------------------------------------------- Context Inspector Panel
-    if let Some(inspector) = view_inspector(state, stats, &lights, &ent_areas, skin) {
+    if let Some(inspector) = view_inspector(state, stats, &ent_areas, &motion_areas, skin) {
         root = root.push(inspector);
     }
 
-    if window_mode {
+    let base_view: Element<'a, MapMsg> = if window_mode {
         root.into()
     } else {
         container(scrollable(container(root).padding([0, 10, 0, 0])).height(Length::Shrink))
             .max_height(560.0)
             .into()
+    };
+
+    let modal_overlay = view_rule_dialog(state, &lights, skin)
+        .or_else(|| view_lamp_dialog(state, &lights, skin));
+    if let Some(dialog_overlay) = modal_overlay {
+        iced_stack![base_view, dialog_overlay]
+            .width(Length::Fill)
+            .into()
+    } else {
+        base_view
     }
 }
 
-fn view_inspector<'a>(
+fn view_rule_dialog<'a>(
     state: &'a FloorplanState,
-    stats: &'a Value,
     lights: &[BridgeLightInfo],
-    ent_areas: &[EntertainmentArea],
     skin: &'a str,
 ) -> Option<Element<'a, MapMsg>> {
-    let sel = state.selection.as_ref()?;
-    let inner: Element<MapMsg> = match sel {
-        Selection::Lamp(lid) => {
+    let d = state.rule_dialog.as_ref()?;
+    let title = if d.rule_id.is_some() { tr("Edit rule") } else { tr("+ New rule") };
+
+    let mut header = row![text::heading(title), space::horizontal()]
+        .spacing(8)
+        .align_y(Alignment::Center);
+    if d.rule_id.is_some() {
+        header = header.push(toggler(d.enabled).on_toggle(MapMsg::RuleDialogEnabled));
+    }
+    header = header.push(button::text("×").on_press(MapMsg::CloseRuleDialog));
+
+    let (from_col, from_on) = if d.trigger_kind == "light"
+        && let Some(info) = lights.iter().find(|l| l.id == d.trigger_id)
+    {
+        (info.color.as_str(), info.on)
+    } else {
+        match d.trigger_kind.as_str() {
+            "motion" | "motion_area" => ("#10b981", true),
+            "contact" => ("#f59e0b", true),
+            "button" => ("#6366f1", true),
+            _ => ("#ffd27a", true),
+        }
+    };
+    let (to_col, to_on) = if d.target_kind == "light"
+        && let Some(info) = lights.iter().find(|l| l.id == d.target_id)
+    {
+        (info.color.as_str(), info.on)
+    } else {
+        ("#ffd27a", true)
+    };
+    let supports_bri = is_light_or_room_trigger(&d.trigger_kind);
+    let supports_mirror = d.trigger_kind != "button";
+    let arrow = if d.kind == "exclusive" {
+        "⊘"
+    } else if d.kind == "follow" && d.mirror_off && supports_mirror {
+        "↔"
+    } else {
+        "→"
+    };
+
+    let link_banner = container(
+        row![
+            color_dot(from_col, from_on, 10.0),
+            text::body(d.trigger_name.as_str()),
+            dim_caption(arrow),
+            color_dot(to_col, to_on, 10.0),
+            text::body(d.target_name.as_str()),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+    .padding([8, 10])
+    .width(Length::Fill)
+    .class(studio_card(skin));
+
+    let type_pills: Vec<Element<'a, MapMsg>> = [
+        ("follow", tr("Follow / Mirror")),
+        ("exclusive", tr("Exclusive (turn other off)")),
+        ("companion", tr("Companion")),
+    ]
+    .into_iter()
+    .map(|(k, label)| {
+        let b = if d.kind == k { button::suggested(label) } else { button::standard(label) };
+        b.on_press(MapMsg::RuleDialogKind(k.into())).into()
+    })
+    .collect();
+
+    let when_pills: Vec<Element<'a, MapMsg>> = trigger_state_options(&d.trigger_kind)
+        .into_iter()
+        .map(|(k, label)| {
+            let b = if d.trigger_state == k { button::suggested(label) } else { button::standard(label) };
+            b.on_press(MapMsg::RuleDialogTriggerState(k.into())).into()
+        })
+        .collect();
+
+    let mut content = column![
+        header,
+        link_banner,
+        column![
+            dim_caption(tr("Rule type")),
+            flex_row(type_pills).row_spacing(6).column_spacing(6),
+        ]
+        .spacing(4),
+        row![
+            dim_caption(tr("When")),
+            space::horizontal(),
+            flex_row(when_pills).row_spacing(6).column_spacing(6),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(10);
+
+    if d.kind != "exclusive" {
+        if supports_mirror {
+            content = content.push(
+                checkbox(d.mirror_off)
+                    .label(tr("Also turn off together"))
+                    .on_toggle(MapMsg::RuleDialogMirrorOff),
+            );
+        }
+        if supports_bri {
+            content = content.push(
+                checkbox(d.match_bri)
+                    .label(tr("Match brightness"))
+                    .on_toggle(MapMsg::RuleDialogMatchBri),
+            );
+        }
+        content = content.push(
+            checkbox(d.only_if_off)
+                .label(tr("Only if target is off"))
+                .on_toggle(MapMsg::RuleDialogOnlyIfOff),
+        );
+    }
+
+    content = content
+        .push(
+            row![
+                dim_caption(tr("Active between")),
+                space::horizontal(),
+                text_input(tr("Optional HH:MM"), &d.time_start)
+                    .on_input(MapMsg::RuleDialogTimeStart)
+                    .width(Length::Fixed(96.0)),
+                dim_caption("–"),
+                text_input(tr("Optional HH:MM"), &d.time_end)
+                    .on_input(MapMsg::RuleDialogTimeEnd)
+                    .width(Length::Fixed(96.0)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .push(
+            text_input(tr("Name (optional)"), &d.name)
+                .on_input(MapMsg::RuleDialogName)
+                .on_submit(|_| MapMsg::RuleDialogSave)
+                .width(Length::Fill),
+        );
+
+    if let Some(ref err) = d.error {
+        content = content.push(
+            text::caption(err.as_str()).class(theme::Text::Custom(|theme: &cosmic::Theme| {
+                iced_text::Style {
+                    color: Some(theme.cosmic().destructive_color().into()),
+                    ..Default::default()
+                }
+            })),
+        );
+    }
+
+    let mut footer = row![].spacing(8).align_y(Alignment::Center);
+    if let Some(ref rid) = d.rule_id {
+        footer = footer.push(
+            button::custom(
+                row![
+                    icon::from_name("user-trash-symbolic").size(16).symbolic(true),
+                    text::body(tr("Delete")),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding([6, 12])
+            .class(theme::Button::Destructive)
+            .on_press(MapMsg::RuleDialogDelete(rid.clone())),
+        );
+    }
+    footer = footer
+        .push(space::horizontal())
+        .push(button::standard(tr("Cancel")).on_press(MapMsg::CloseRuleDialog))
+        .push(button::suggested(tr("Save")).on_press(MapMsg::RuleDialogSave));
+
+    content = content.push(footer);
+
+    let card = container(content)
+        .padding(16)
+        .max_width(440.0)
+        .width(Length::Fill)
+        .class(dialog_card(skin));
+
+    let scrim = container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .padding(16)
+        .class(theme::Container::custom(|_| iced_container::Style {
+            background: Some(Background::Color(with_alpha(Color::BLACK, 0.52))),
+            ..Default::default()
+        }));
+
+    Some(scrim.into())
+}
+
+fn view_lamp_dialog<'a>(
+    state: &'a FloorplanState,
+    lights: &[BridgeLightInfo],
+    skin: &'a str,
+) -> Option<Element<'a, MapMsg>> {
+    let dialog = state.lamp_dialog.as_ref()?;
+    let content: Element<'a, MapMsg> = match dialog {
+        LampDialog::Brightness(lid) => {
             let info = lights.iter().find(|l| l.id == *lid)?;
-            let lpos = state.doc.lamps.get(lid)?;
-            let current_icon = normalize_lamp_icon(&lpos.icon);
             let bri = info.bri.round().clamp(1.0, 100.0) as u8;
             let lid_toggle = lid.clone();
             let lid_bri = lid.clone();
             let lid_bri_done = lid.clone();
-            let lid_rename = lid.clone();
-
-            let icon_buttons: Vec<Element<MapMsg>> = LAMP_ICONS
-                .iter()
-                .map(|ic| {
-                    let active = current_icon == *ic;
-                    let lbl = format!("{} {}", lamp_icon_glyph(ic), lamp_icon_label(ic));
-                    let b = if active { button::suggested(lbl) } else { button::standard(lbl) };
-                    b.on_press(MapMsg::LampSetIcon(lid.clone(), (*ic).to_string())).into()
-                })
-                .collect();
-
             column![
                 row![
                     color_dot(&info.color, info.on, 14.0),
                     text::heading(info.name.clone()),
                     space::horizontal(),
                     toggler(info.on).on_toggle(move |v| MapMsg::LampToggle(lid_toggle.clone(), v)),
+                    button::text("×").on_press(MapMsg::CloseLampDialog),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -2381,30 +3856,120 @@ fn view_inspector<'a>(
                 .spacing(8)
                 .align_y(Alignment::Center),
                 row![
-                    text_input(tr("Lamp name"), &state.lamp_rename_draft)
-                        .on_input(MapMsg::LampRenameInput)
-                        .on_submit(move |_| MapMsg::LampRenameSave(lid_rename.clone()))
-                        .width(Length::Fill),
-                    button::suggested(tr("Rename")).on_press(MapMsg::LampRenameSave(lid.clone())),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center),
-                column![
-                    dim_caption(tr("Lamp icon")),
-                    flex_row(icon_buttons).row_spacing(4).column_spacing(4),
-                ]
-                .spacing(4),
-                row![
-                    button::standard(tr("Wire from here")).on_press(MapMsg::LampStartWire(lid.clone())),
                     space::horizontal(),
-                    button::destructive(tr("Unplace")).on_press(MapMsg::UnplaceLamp(lid.clone())),
+                    button::suggested(tr("Done")).on_press(MapMsg::CloseLampDialog),
+                ]
+                .align_y(Alignment::Center),
+            ]
+            .spacing(12)
+            .into()
+        }
+        LampDialog::Rename(lid) => {
+            let info = lights.iter().find(|l| l.id == *lid)?;
+            let lid_submit = lid.clone();
+            let can_save = !state.lamp_rename_draft.trim().is_empty();
+            column![
+                row![
+                    color_dot(&info.color, info.on, 14.0),
+                    text::heading(tr("Rename")),
+                    space::horizontal(),
+                    button::text("×").on_press(MapMsg::CloseLampDialog),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                dim_caption(info.name.clone()),
+                text_input(tr("Lamp name"), &state.lamp_rename_draft)
+                    .on_input(MapMsg::LampRenameInput)
+                    .on_submit(move |_| MapMsg::LampRenameSave(lid_submit.clone()))
+                    .width(Length::Fill),
+                row![
+                    space::horizontal(),
+                    button::standard(tr("Cancel")).on_press(MapMsg::CloseLampDialog),
+                    button::suggested(tr("Rename"))
+                        .on_press_maybe(can_save.then_some(MapMsg::LampRenameSave(lid.clone()))),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
             ]
-            .spacing(8)
+            .spacing(10)
             .into()
         }
+        LampDialog::Icon(lid) => {
+            let info = lights.iter().find(|l| l.id == *lid)?;
+            let current_icon = state
+                .doc
+                .lamps
+                .get(lid)
+                .map(|p| normalize_lamp_icon(&p.icon))
+                .unwrap_or("bulb");
+            let icon_buttons: Vec<Element<'a, MapMsg>> = LAMP_ICONS
+                .iter()
+                .map(|ic| {
+                    let active = current_icon == *ic;
+                    let inner = row![
+                        icon::icon(lamp_icon_handle(ic)).size(16),
+                        text::caption(lamp_icon_label(ic)),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
+                    button::custom(inner)
+                        .padding([6, 10])
+                        .class(if active { theme::Button::Suggested } else { theme::Button::Standard })
+                        .on_press(MapMsg::LampSetIcon(lid.clone(), (*ic).to_string()))
+                        .into()
+                })
+                .collect();
+            column![
+                row![
+                    lamp_icon_badge(&info.color, info.on, current_icon, 28.0),
+                    text::heading(format!("{} — {}", info.name, tr("Lamp icon"))),
+                    space::horizontal(),
+                    button::text("×").on_press(MapMsg::CloseLampDialog),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                flex_row(icon_buttons).row_spacing(6).column_spacing(6),
+                row![
+                    space::horizontal(),
+                    button::suggested(tr("Done")).on_press(MapMsg::CloseLampDialog),
+                ]
+                .align_y(Alignment::Center),
+            ]
+            .spacing(12)
+            .into()
+        }
+    };
+
+    let card = container(content)
+        .padding(16)
+        .max_width(420.0)
+        .width(Length::Fill)
+        .class(dialog_card(skin));
+
+    let scrim = container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .padding(16)
+        .class(theme::Container::custom(|_| iced_container::Style {
+            background: Some(Background::Color(with_alpha(Color::BLACK, 0.52))),
+            ..Default::default()
+        }));
+
+    Some(scrim.into())
+}
+
+fn view_inspector<'a>(
+    state: &'a FloorplanState,
+    stats: &'a Value,
+    ent_areas: &[EntertainmentArea],
+    motion_areas: &[MotionArea],
+    skin: &'a str,
+) -> Option<Element<'a, MapMsg>> {
+    let sel = state.selection.as_ref()?;
+    let inner: Element<MapMsg> = match sel {
+        Selection::Lamp(_) | Selection::Sensor(_) => return None,
 
         Selection::Box(bid) => {
             let b = state.doc.boxes.iter().find(|b| b.id == *bid)?;
@@ -2503,6 +4068,56 @@ fn view_inspector<'a>(
                 }
             }
 
+            // Bridge Pro MotionAware™ controls (only when this room has a MotionAware area)
+            if let Some(area) = b
+                .hue_id
+                .as_deref()
+                .and_then(|hid| motion_areas.iter().find(|a| a.room_id == hid))
+            {
+                let area_id_toggle = area.id.clone();
+                let status_el: Element<MapMsg> = if area.enabled && area.motion {
+                    text::caption(tr("Motion detected"))
+                        .class(theme::Text::Custom(|_| iced_text::Style {
+                            color: Some(MOTION_ACTIVE_COLOR),
+                            ..Default::default()
+                        }))
+                        .into()
+                } else {
+                    dim_caption(tr("No motion"))
+                };
+                let mut ma_row = row![
+                    text::caption(format!("◉ {}", tr("MotionAware"))),
+                    status_el,
+                    space::horizontal(),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center);
+
+                if let Some(sens) = area.sensitivity {
+                    let max_s = area.sensitivity_max.unwrap_or(4).max(1);
+                    let aid_dec = area.id.clone();
+                    let aid_inc = area.id.clone();
+                    ma_row = ma_row
+                        .push(dim_caption(tr("Sensitivity")))
+                        .push(
+                            button::standard("−")
+                                .on_press_maybe((sens > 0).then_some(MapMsg::MotionAreaSensitivity(aid_dec, sens - 1))),
+                        )
+                        .push(text::caption(format!("{sens}/{max_s}")))
+                        .push(
+                            button::standard("+")
+                                .on_press_maybe((sens < max_s).then_some(MapMsg::MotionAreaSensitivity(aid_inc, sens + 1))),
+                        );
+                }
+
+                ma_row = ma_row.push(
+                    toggler(area.enabled)
+                        .on_toggle(move |on| MapMsg::MotionAreaToggle(area_id_toggle.clone(), on)),
+                );
+                col = col.push(divider::horizontal::light());
+                col = col.push(ma_row);
+            }
+
             // Scenes & Scene Scheduling section (when linked to a Bridge room/zone)
             if let Some(room_val) = hue_room {
                 let rid = j_str(room_val, "id").to_string();
@@ -2581,24 +4196,6 @@ fn view_inspector<'a>(
                 space::horizontal(),
                 button::standard(tr("Rotate 90°")).on_press(MapMsg::StampRotate(sid.clone())),
                 button::destructive(tr("Delete")).on_press(MapMsg::StampDelete(sid.clone())),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .into()
-        }
-
-        Selection::Wire(rid) => {
-            let rule = j_list(stats, "rules").iter().find(|r| j_str(r, "id") == rid.as_str())?;
-            let wkind = classify_rule_wire(rule);
-            let enabled = j_bool(rule, "enabled");
-            let rname = j_str(rule, "name");
-            let title = if rname.is_empty() { wkind.label() } else { rname.to_string() };
-            let rid_toggle = rid.clone();
-            row![
-                text::body(format!("{title} · {}", wkind.label())),
-                space::horizontal(),
-                toggler(enabled).on_toggle(move |v| MapMsg::WireToggle(rid_toggle.clone(), v)),
-                button::destructive(tr("Delete")).on_press(MapMsg::WireDelete(rid.clone())),
             ]
             .spacing(8)
             .align_y(Alignment::Center)
@@ -2711,6 +4308,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            sensors: std::collections::BTreeMap::new(),
         };
 
         // Initially in sync -> 0 pending
@@ -2734,5 +4332,298 @@ mod tests {
         assert_eq!(y, 100.0);
         assert!(w >= MIN_BOX_DIM);
         assert!(h >= MIN_BOX_DIM);
+    }
+
+    #[test]
+    fn tooltip_rect_positions_flips_and_clamps() {
+        let bounds = Size::new(600.0, 400.0);
+
+        // Normal center: floats centered above the lamp
+        let (pos, sz) = tooltip_rect(Point::new(300.0, 200.0), bounds, "Desk Lamp");
+        assert_eq!(sz.height, 24.0);
+        let expected_w = (9.0 * 6.8 + 18.0_f32).clamp(44.0, 260.0);
+        assert!((sz.width - expected_w).abs() < 0.01);
+        assert!((pos.x - (300.0 - sz.width * 0.5)).abs() < 0.01);
+        assert!((pos.y - (200.0 - LAMP_RADIUS_PX - 8.0 - 24.0)).abs() < 0.01);
+
+        // Near top edge: flips below the lamp
+        let (top_pos, _) = tooltip_rect(Point::new(300.0, 24.0), bounds, "Desk Lamp");
+        assert!((top_pos.y - (24.0 + LAMP_RADIUS_PX + 8.0)).abs() < 0.01);
+
+        // Near left edge: clamps to x = 4.0
+        let (left_pos, _) = tooltip_rect(Point::new(10.0, 200.0), bounds, "Living Room Ceiling");
+        assert_eq!(left_pos.x, 4.0);
+
+        // Near right edge: clamps to bounds.width - width - 4.0
+        let (right_pos, right_sz) = tooltip_rect(Point::new(595.0, 200.0), bounds, "Living Room Ceiling");
+        assert!((right_pos.x + right_sz.width - (bounds.width - 4.0)).abs() < 0.01);
+
+        // Label width clamping (very short -> 44.0, very long -> 260.0)
+        let (_, short_sz) = tooltip_rect(Point::new(300.0, 200.0), bounds, "A");
+        assert_eq!(short_sz.width, 44.0);
+        let long_name = "Very Long Smart Lamp Name That Exceeds Maximum Pill Width Easily";
+        let (_, long_sz) = tooltip_rect(Point::new(300.0, 200.0), bounds, long_name);
+        assert_eq!(long_sz.width, 260.0);
+    }
+
+    #[test]
+    fn lamp_dialog_and_menu_state_helpers() {
+        let stats = json!({
+            "rooms": [
+                {
+                    "id": "r1",
+                    "kind": "room",
+                    "name": "Living Room",
+                    "lights": [
+                        {"id": "l1", "device_id": "d1", "name": "Arc Floor", "on": true, "bri": 75.0, "color": "#ffaa44"}
+                    ]
+                }
+            ]
+        });
+
+        let mut state = FloorplanState::default();
+        assert!(!state.any_menu_open());
+        assert!(!state.has_dialog_open());
+
+        // Add menu, view menu, and lamp submenu all report via any_menu_open() and clear via close_menus()
+        state.add_menu_open = true;
+        assert!(state.any_menu_open());
+        state.close_menus();
+        assert!(!state.add_menu_open);
+        assert!(!state.any_menu_open());
+
+        state.view_menu_open = true;
+        assert!(state.any_menu_open());
+        state.close_menus();
+        assert!(!state.view_menu_open);
+        assert!(!state.any_menu_open());
+
+        state.open_lamp_menu = Some("l1".into());
+        assert!(state.any_menu_open());
+        state.close_menus();
+        assert!(state.open_lamp_menu.is_none());
+        assert!(!state.any_menu_open());
+
+        // Opening Rename dialog closes open_lamp_menu, seeds lamp_rename_draft, and sets has_dialog_open()
+        state.open_lamp_menu = Some("l1".into());
+        state.open_lamp_dialog(LampDialog::Rename("l1".into()), &stats);
+        assert!(state.open_lamp_menu.is_none());
+        assert!(state.has_dialog_open());
+        assert_eq!(state.lamp_dialog, Some(LampDialog::Rename("l1".into())));
+        assert_eq!(state.lamp_rename_draft, "Arc Floor");
+
+        // Closing dialog clears lamp_dialog
+        state.close_dialog();
+        assert!(!state.has_dialog_open());
+        assert!(state.lamp_dialog.is_none());
+    }
+
+    #[test]
+    fn map_rule_dialog_new_existing_and_save_command() {
+        let stats = json!({
+            "rooms": [
+                {
+                    "id": "r1",
+                    "kind": "room",
+                    "name": "Living Room",
+                    "lights": [
+                        {"id": "l1", "device_id": "d1", "name": "Arc Floor", "on": true, "bri": 80.0, "color": "#ffaa44"},
+                        {"id": "l2", "device_id": "d2", "name": "Desk Strip", "on": false, "bri": 50.0, "color": "#38bdf8"}
+                    ]
+                }
+            ],
+            "rules": [
+                {
+                    "id": "rule-42",
+                    "name": "Evening Sync",
+                    "enabled": false,
+                    "kind": "companion",
+                    "trigger_kind": "light",
+                    "trigger_id": "l1",
+                    "trigger_state": "off",
+                    "targets": [{"kind": "light", "id": "l2", "action": "on"}],
+                    "mirror_off": false,
+                    "match_bri": true,
+                    "only_if_off": true,
+                    "time_start": "18:00",
+                    "time_end": "23:30"
+                }
+            ]
+        });
+
+        // 1. New rule between lamps omits "id" and auto-names with ↔ for follow+mirror_off
+        let mut dlg = MapRuleDialog::new_between_lamps(
+            "l1".into(),
+            "Arc Floor · Living Room".into(),
+            "l2".into(),
+            "Desk Strip · Living Room".into(),
+        );
+        assert!(dlg.rule_id.is_none());
+        assert!(dlg.enabled);
+        assert_eq!(dlg.kind, "follow");
+        assert!(dlg.mirror_off);
+        assert_eq!(dlg.target_action(), "on");
+
+        let cmd = dlg.to_save_command().expect("valid new rule command");
+        assert_eq!(cmd["cmd"], "rule_save");
+        assert!(cmd["rule"].get("id").is_none());
+        assert_eq!(cmd["rule"]["name"], "Arc Floor ↔ Desk Strip");
+        assert_eq!(cmd["rule"]["enabled"], true);
+        assert_eq!(cmd["rule"]["mirror_off"], true);
+        assert_eq!(cmd["rule"]["targets"][0]["action"], "on");
+
+        // Exclusive rule uses ⊘, action="off", and forces mirror_off/match_bri/only_if_off to false
+        dlg.kind = "exclusive".into();
+        dlg.match_bri = true;
+        dlg.only_if_off = true;
+        assert_eq!(dlg.target_action(), "off");
+        let excl_cmd = dlg.to_save_command().expect("valid exclusive rule");
+        assert_eq!(excl_cmd["rule"]["name"], "Arc Floor ⊘ Desk Strip");
+        assert_eq!(excl_cmd["rule"]["targets"][0]["action"], "off");
+        assert_eq!(excl_cmd["rule"]["mirror_off"], false);
+        assert_eq!(excl_cmd["rule"]["match_bri"], false);
+        assert_eq!(excl_cmd["rule"]["only_if_off"], false);
+
+        // Invalid HH:MM returns Err
+        dlg.time_start = "25:99".into();
+        assert!(dlg.to_save_command().is_err());
+        dlg.time_start.clear();
+
+        // Same trigger and target returns Err
+        let same_dlg = MapRuleDialog::new_between_lamps("l1".into(), "A".into(), "l1".into(), "A".into());
+        assert!(same_dlg.to_save_command().is_err());
+
+        // 2. Existing rule preserves id and fields for in-place update
+        let existing = MapRuleDialog::from_existing_rule(&stats["rules"][0], &stats).expect("parsed rule");
+        assert_eq!(existing.rule_id.as_deref(), Some("rule-42"));
+        assert_eq!(existing.name, "Evening Sync");
+        assert!(!existing.enabled);
+        assert_eq!(existing.kind, "companion");
+        assert_eq!(existing.trigger_state, "off");
+        assert_eq!(existing.trigger_name, "Arc Floor");
+        assert_eq!(existing.target_name, "Desk Strip");
+        assert!(existing.match_bri);
+        assert!(existing.only_if_off);
+        assert_eq!(existing.time_start, "18:00");
+        assert_eq!(existing.time_end, "23:30");
+
+        let upd = existing.to_save_command().expect("valid existing rule update");
+        assert_eq!(upd["rule"]["id"], "rule-42");
+        assert_eq!(upd["rule"]["name"], "Evening Sync");
+        assert_eq!(upd["rule"]["enabled"], false);
+        assert_eq!(upd["rule"]["time_start"], "18:00");
+        assert_eq!(upd["rule"]["time_end"], "23:30");
+
+        // Missing id returns None
+        assert!(MapRuleDialog::from_existing_rule(&json!({"name": "No ID"}), &stats).is_none());
+
+        // 3. FloorplanState dialog lifecycle helpers
+        let mut state = FloorplanState::default();
+        state.open_lamp_menu = Some("l1".into());
+        state.lamp_dialog = Some(LampDialog::Brightness("l1".into()));
+        state.pending_wire_from = Some(("light".into(), "l1".into()));
+        state.open_new_rule_dialog("light".into(), "l1".into(), "l2".into(), &stats);
+        assert!(state.open_lamp_menu.is_none());
+        assert!(state.lamp_dialog.is_none());
+        assert!(state.pending_wire_from.is_none());
+        assert!(state.has_dialog_open());
+        let rd = state.rule_dialog.as_ref().expect("rule_dialog open");
+        assert!(rd.rule_id.is_none());
+        assert_eq!(rd.trigger_name, "Arc Floor");
+        assert_eq!(rd.target_name, "Desk Strip");
+
+        state.close_dialog();
+        assert!(!state.has_dialog_open());
+        assert!(state.rule_dialog.is_none());
+
+        state.open_existing_rule_dialog("rule-42", &stats);
+        assert!(state.has_dialog_open());
+        assert_eq!(
+            state.rule_dialog.as_ref().and_then(|d| d.rule_id.as_deref()),
+            Some("rule-42")
+        );
+        state.close_dialog();
+        assert!(!state.has_dialog_open());
+    }
+
+    #[test]
+    fn map_rule_dialog_handles_motion_contact_and_button_triggers() {
+        let stats = json!({
+            "rooms": [{
+                "id": "r1",
+                "kind": "room",
+                "name": "Hallway",
+                "lights": [{"id": "l1", "device_id": "d1", "name": "Hall Ceiling", "on": false, "bri": 80.0, "color": "#ffd27a"}]
+            }],
+            "sensors": [
+                {"id": "s-mot", "kind": "motion", "name": "Hall Motion", "room_id": "r1", "enabled": true, "motion": false},
+                {"id": "s-con", "kind": "contact", "name": "Front Door", "room_id": "r1", "enabled": true, "open": false},
+                {"id": "s-btn", "kind": "button", "name": "Wall Switch", "room_id": "r1", "enabled": true}
+            ]
+        });
+
+        // Motion sensor trigger defaults to trigger_state="motion", mirror_off=true, match_bri forced false
+        let mut mot = MapRuleDialog::new_between(
+            "motion".into(),
+            "s-mot".into(),
+            "Hall Motion".into(),
+            "l1".into(),
+            "Hall Ceiling".into(),
+        );
+        assert_eq!(mot.trigger_state, "motion");
+        assert!(mot.mirror_off);
+        mot.match_bri = true;
+        let mcmd = mot.to_save_command().expect("motion rule command");
+        assert_eq!(mcmd["rule"]["trigger_kind"], "motion");
+        assert_eq!(mcmd["rule"]["trigger_state"], "motion");
+        assert_eq!(mcmd["rule"]["mirror_off"], true);
+        assert_eq!(mcmd["rule"]["match_bri"], false);
+
+        // Contact sensor trigger defaults to trigger_state="open", supports "closed"
+        let mut con = MapRuleDialog::new_between(
+            "contact".into(),
+            "s-con".into(),
+            "Front Door".into(),
+            "l1".into(),
+            "Hall Ceiling".into(),
+        );
+        assert_eq!(con.trigger_state, "open");
+        con.trigger_state = "closed".into();
+        let ccmd = con.to_save_command().expect("contact rule command");
+        assert_eq!(ccmd["rule"]["trigger_state"], "closed");
+        assert_eq!(ccmd["rule"]["match_bri"], false);
+
+        // Button trigger defaults to trigger_state="press", mirror_off forced false
+        let mut btn = MapRuleDialog::new_between(
+            "button".into(),
+            "s-btn".into(),
+            "Wall Switch".into(),
+            "l1".into(),
+            "Hall Ceiling".into(),
+        );
+        assert_eq!(btn.trigger_state, "press");
+        assert!(!btn.mirror_off);
+        btn.trigger_state = "long_press".into();
+        btn.mirror_off = true;
+        let bcmd = btn.to_save_command().expect("button rule command");
+        assert_eq!(bcmd["rule"]["trigger_state"], "long_press");
+        assert_eq!(bcmd["rule"]["mirror_off"], false);
+        assert_eq!(bcmd["rule"]["match_bri"], false);
+
+        // Existing motion rule parses sensor name & "clear" trigger state cleanly
+        let existing_json = json!({
+            "id": "r-mot-1",
+            "name": "Hallway Motion",
+            "enabled": true,
+            "kind": "follow",
+            "trigger_kind": "motion",
+            "trigger_id": "s-mot",
+            "trigger_state": "clear",
+            "targets": [{"kind": "light", "id": "l1", "action": "on"}],
+            "mirror_off": true
+        });
+        let parsed = MapRuleDialog::from_existing_rule(&existing_json, &stats).expect("existing motion rule");
+        assert_eq!(parsed.trigger_name, "Hall Motion");
+        assert_eq!(parsed.trigger_state, "clear");
     }
 }

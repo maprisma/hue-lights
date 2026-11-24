@@ -71,6 +71,13 @@ Terminal=false
 OnlyShowIn=KDE;Hyprland;
 EOF
 install -Dm644 scripts/hue-lights.py "$data/maprisma-hue-lights/scripts/hue-lights.py"
+if [[ -f scripts/hue-ai.py ]]; then
+    install -Dm644 scripts/hue-ai.py "$data/maprisma-hue-lights/scripts/hue-ai.py"
+fi
+if [[ -f scripts/hue-mcp.py ]]; then
+    install -Dm755 scripts/hue-mcp.py "$data/maprisma-hue-lights/scripts/hue-mcp.py"
+    ln -sf "$data/maprisma-hue-lights/scripts/hue-mcp.py" "$bin/maprisma-hue-mcp"
+fi
 install -Dm644 "data/icons/$id-symbolic.svg" "$data/icons/hicolor/scalable/apps/$id-symbolic.svg"
 # The KDE/Hyprland tray's bulb while every light is off.
 install -Dm644 data/icons/hue-bulb-off-symbolic.svg "$data/icons/hicolor/scalable/apps/$id-off-symbolic.svg"
