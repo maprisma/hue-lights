@@ -1,9 +1,9 @@
 [package]
 name = "maprisma-hue-lights"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
-description = "COSMIC panel applet for Philips Hue: rooms, zones, lights and scenes"
+description = "Philips Hue desktop & panel app for COSMIC, KDE and Hyprland: rooms, color, Light Themes, schedules, linked-light rules and Audio Light Synthesizer"
 
 [[bin]]
 name = "maprisma-hue-lights-tray"
