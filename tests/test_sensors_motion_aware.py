@@ -800,6 +800,30 @@ class CommandsAndFloorplanTests(unittest.TestCase):
         }
         self.assertIsNone(hue.validate_floorplan(dict(fp, sensors=too_many)))
 
+    def test_motion_area_candidates_count_and_eligible_rooms(self):
+        # Default pro fixture has 3 candidates across 2 rooms (2 in Living Room, 1 in Office)
+        h = FakeHue(build_pro_resources(model_id="BSB003"))
+        h.refresh()
+        snap = h.snapshot()
+        self.assertEqual(snap["bridge"]["motion_area_candidates"], 3)
+        self.assertEqual(snap["bridge"]["motion_area_candidate_rooms"], [])
+
+        # Room with 3+ candidate devices is reported as eligible
+        res = build_pro_resources(model_id="BSB003")
+        for r in res:
+            if r.get("id") == ROOM1:
+                r["children"].append({"rid": D3, "rtype": "device"})
+        h2 = FakeHue(res)
+        h2.refresh()
+        snap2 = h2.snapshot()
+        self.assertEqual(snap2["bridge"]["motion_area_candidates"], 3)
+        self.assertEqual(snap2["bridge"]["motion_area_candidate_rooms"], [ROOM1])
+
+        # Unpair clears candidate count and rooms
+        h2.handle({"cmd": "unpair"})
+        self.assertEqual(h2.motion_area_candidates, 0)
+        self.assertEqual(h2.motion_area_candidate_rooms, [])
+
 
 if __name__ == "__main__":
     unittest.main()

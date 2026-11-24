@@ -39,8 +39,9 @@ use crate::model::{
     FLOORPLAN_TEMPLATES, FloorplanBox, FloorplanDocument, FloorplanStamp, HueSensor, LAMP_ICONS,
     MotionArea, archetype_glyph, archetype_label, default_trigger_state, extract_bridge_lights,
     is_light_or_room_trigger, j_bool, j_list, j_str, lamp_icon_label, lamp_icon_svg,
-    normalize_lamp_icon, normalize_trigger_state, parse_entertainment_areas, parse_motion_areas,
-    parse_sensors, resolve_name, room_active_schedule_badge, skin_style, stamp_kind_label,
+    motion_aware_eligible_rooms, normalize_lamp_icon, normalize_trigger_state,
+    parse_entertainment_areas, parse_motion_areas, parse_sensors, resolve_name,
+    room_active_schedule_badge, should_show_motion_aware_hint, skin_style, stamp_kind_label,
     synth_target_lights, template_label, trigger_state_options, valid_hhmm,
 };
 
@@ -447,6 +448,7 @@ pub enum MapMsg {
     SensorStartWire { kind: String, id: String },
     MotionAreaToggle(String, bool),
     MotionAreaSensitivity(String, i64),
+    DismissMotionHint,
     // Canvas interactions
     Select(Option<Selection>),
     MoveLamp { id: String, x: f64, y: f64, commit: bool },
@@ -2986,6 +2988,7 @@ pub fn view_map_tab<'a>(
     window_mode: bool,
     window_width: f32,
     pending_sync: usize,
+    motion_hint_dismissed: bool,
 ) -> Element<'a, MapMsg> {
     let lights = extract_bridge_lights(stats);
     let sensors = parse_sensors(stats);
@@ -3357,6 +3360,58 @@ pub fn view_map_tab<'a>(
         ]
         .spacing(6);
 
+        if should_show_motion_aware_hint(stats, motion_hint_dismissed) {
+            let eligible = motion_aware_eligible_rooms(stats);
+            let mut hint_col = column![
+                row![
+                    container(space::horizontal())
+                        .width(Length::Fixed(8.0))
+                        .height(Length::Fixed(8.0))
+                        .class(theme::Container::custom(|_| iced_container::Style {
+                            background: Some(Background::Color(MOTION_ACTIVE_COLOR)),
+                            border: Border { radius: 4.0.into(), ..Default::default() },
+                            ..Default::default()
+                        })),
+                    text::caption(tr("Bridge Pro MotionAware™ Ready")),
+                    space::horizontal(),
+                    button::custom(text::caption("×"))
+                        .padding([1, 5])
+                        .class(theme::Button::MenuItem)
+                        .on_press(MapMsg::DismissMotionHint),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                dim_caption(tr("1. Open the Philips Hue mobile app → Settings → MotionAware")),
+                dim_caption(tr("2. Pick 3+ lights in a room and run the 30-second calibration once")),
+                dim_caption(tr("3. Return here — live radar badges, sensitivity & visual rules appear automatically!")),
+            ]
+            .spacing(4);
+            if !eligible.is_empty() {
+                hint_col = hint_col.push(
+                    text::caption(trf("Ready rooms (3+ lights): {0}", &[eligible.join(", ")])).class(
+                        theme::Text::Custom(|_| iced_text::Style {
+                            color: Some(MOTION_ACTIVE_COLOR),
+                            ..Default::default()
+                        }),
+                    ),
+                );
+            }
+            list_col = list_col.push(
+                container(hint_col)
+                    .padding(8)
+                    .width(Length::Fill)
+                    .class(theme::Container::custom(|_| iced_container::Style {
+                        background: Some(Background::Color(with_alpha(MOTION_ACTIVE_COLOR, 0.10))),
+                        border: Border {
+                            radius: corners::now().small.into(),
+                            width: 1.0,
+                            color: with_alpha(MOTION_ACTIVE_COLOR, 0.45),
+                        },
+                        ..Default::default()
+                    })),
+            );
+        }
+
         list_col = list_col.push(dim_caption(trf("Unplaced ({0})", &[unplaced.len().to_string()])));
         if unplaced.is_empty() {
             list_col = list_col.push(dim_caption(tr("All lamps placed")));
@@ -3614,9 +3669,7 @@ pub fn view_map_tab<'a>(
             .into()
     };
 
-    let modal_overlay = view_rule_dialog(state, &lights, skin)
-        .or_else(|| view_lamp_dialog(state, &lights, skin));
-    if let Some(dialog_overlay) = modal_overlay {
+    if let Some(dialog_overlay) = view_rule_dialog(state, &lights, skin) {
         iced_stack![base_view, dialog_overlay]
             .width(Length::Fill)
             .into()
@@ -3822,16 +3875,29 @@ fn view_rule_dialog<'a>(
     Some(scrim.into())
 }
 
+/// Renders the shared centered lamp modal dialog (Brightness, Rename, or 12-icon Lamp Icon picker)
+/// so it works identically whether triggered from the Lights tab or the Map sidebar.
+pub fn view_lamp_dialog_overlay<'a>(
+    state: &'a FloorplanState,
+    stats: &'a Value,
+    skin: &'a str,
+    dragging_bri: Option<u8>,
+) -> Option<Element<'a, MapMsg>> {
+    let lights = extract_bridge_lights(stats);
+    view_lamp_dialog(state, &lights, skin, dragging_bri)
+}
+
 fn view_lamp_dialog<'a>(
     state: &'a FloorplanState,
     lights: &[BridgeLightInfo],
     skin: &'a str,
+    dragging_bri: Option<u8>,
 ) -> Option<Element<'a, MapMsg>> {
     let dialog = state.lamp_dialog.as_ref()?;
     let content: Element<'a, MapMsg> = match dialog {
         LampDialog::Brightness(lid) => {
             let info = lights.iter().find(|l| l.id == *lid)?;
-            let bri = info.bri.round().clamp(1.0, 100.0) as u8;
+            let bri = dragging_bri.unwrap_or_else(|| info.bri.round().clamp(1.0, 100.0) as u8);
             let lid_toggle = lid.clone();
             let lid_bri = lid.clone();
             let lid_bri_done = lid.clone();

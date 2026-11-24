@@ -15,7 +15,8 @@ mod help;
 mod model;
 mod window_size;
 use floorplan::{
-    CanvasMode, FloorplanState, LampDialog, MapMsg, Selection, compute_pending_sync_count, view_map_tab,
+    CanvasMode, FloorplanState, LampDialog, MapMsg, Selection, compute_pending_sync_count,
+    view_lamp_dialog_overlay, view_map_tab,
 };
 use model::{
     ASK_AI_KEY, COLOR_PRESETS, CONFIRM_ALL_ON_KEY, DAYS_ORDER, EXCLUDE_ALL_ON_KEY, FAVORITES_KEY, FONT_SCALES,
@@ -28,12 +29,13 @@ use model::{
     cmd_floorplan_template, cmd_light_rename, cmd_motion_area_update, cmd_room_delete, cmd_room_update,
     cmd_scene_create, cmd_sensor_toggle, day_short_toggle, default_trigger_state, effect_label, extract_bridge_lights,
     favorites_to_value, font_scale_factor, font_scale_label, format_unix_ts, has_active_schedule, is_favorite,
-    is_light_or_room_trigger, normalize_font_scale, normalize_lamp_icon, normalize_panel_icon, normalize_schedule_mode,
-    normalize_skin, panel_icon_glyph, panel_icon_label, panel_icon_svg, parse_favorites, parse_floorplan,
-    parse_motion_areas, parse_sensors, parse_string_set, resolve_name, room_matches_filter, schedule_action_summary,
-    schedule_mode_label, schedule_trigger_summary, skin_label, skin_style, sorted_exclude_list, string_set_to_value,
-    synth_band_label, synth_mode_label, synth_palette_label, synth_palette_swatch, synth_source_label,
-    synth_target_lights, toggle_favorite, trigger_state_label, trigger_state_options,
+    is_light_or_room_trigger, lamp_icon_svg, motion_aware_eligible_rooms, normalize_font_scale, normalize_lamp_icon,
+    normalize_panel_icon, normalize_schedule_mode, normalize_skin, panel_icon_glyph, panel_icon_label, panel_icon_svg,
+    parse_favorites, parse_floorplan, parse_motion_areas, parse_sensors, parse_string_set, resolve_name,
+    room_matches_filter, schedule_action_summary, schedule_mode_label, schedule_trigger_summary,
+    should_show_motion_aware_hint, skin_label, skin_style, sorted_exclude_list, string_set_to_value, synth_band_label,
+    synth_mode_label, synth_palette_label, synth_palette_swatch, synth_source_label, synth_target_lights,
+    toggle_favorite, trigger_state_label, trigger_state_options,
 };
 use std::collections::{HashMap, HashSet};
 use maprisma_hue_lights::{TITLE, WINDOW_BUS, script_path};
@@ -47,7 +49,7 @@ use cosmic::applet::{menu_button, padded_control};
 use cosmic::iced::futures::channel::mpsc;
 use cosmic::iced::futures::{SinkExt, StreamExt};
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::destroy_popup;
-use cosmic::iced::widget::{container as iced_container, svg as iced_svg, text as iced_text};
+use cosmic::iced::widget::{container as iced_container, stack as iced_stack, svg as iced_svg, text as iced_text};
 use cosmic::iced::{Alignment, Background, Border, Color, Length, Rectangle, Subscription, stream, window};
 use cosmic::widget::rectangle_tracker::{RectangleTracker, RectangleUpdate, rectangle_tracker_subscription};
 use cosmic::widget::{
@@ -140,13 +142,15 @@ fn window_start_size() -> window_size::Size {
 enum EscStep {
     /// Skip the screenshot's note (or close its error).
     Note,
+    /// Step back from a Help detail guide to the Help overview.
+    HelpOverview,
     /// Drop the "Unpair?" or "Turn all lights on?" confirmation.
     Confirm,
-    /// Close an open Language / Corners list or inline target picker.
+    /// Close an open Language / Corners list, light `⋯` submenu, or inline target picker.
     Menus,
-    /// Close an open inline schedule/rule builder or light color drawer.
+    /// Close an open inline schedule/rule builder, light color drawer, or centered modal dialog.
     Drawer,
-    /// Leave the settings page.
+    /// Leave the settings, help, or Ask AI page.
     Back,
     /// Close the window (`--window`) or the popup.
     Close,
@@ -154,14 +158,25 @@ enum EscStep {
 }
 
 /// `shown`: Esc came from the window or the open popup (not the panel button); `note`: the
-/// screenshot card shows; `confirm`: "Really unpair?" or "Turn all lights on?" shows;
-/// `menus`: a Language / Corners / target picker list is open; `drawer`: an inline builder or
-/// light color drawer is open; `settings`: the settings page shows.
-fn esc_step(shown: bool, note: bool, confirm: bool, menus: bool, drawer: bool, settings: bool) -> EscStep {
+/// screenshot card shows; `help_detail`: a single Help feature guide is open; `confirm`:
+/// "Really unpair?" or "Turn all lights on?" shows; `menus`: a Language / Corners / light `⋯`
+/// submenu / target picker list is open; `drawer`: an inline builder, modal dialog, or light
+/// color drawer is open; `settings`: the settings, help overview, or Ask AI page shows.
+fn esc_step(
+    shown: bool,
+    note: bool,
+    help_detail: bool,
+    confirm: bool,
+    menus: bool,
+    drawer: bool,
+    settings: bool,
+) -> EscStep {
     if !shown {
         EscStep::Nothing
     } else if note {
         EscStep::Note
+    } else if help_detail {
+        EscStep::HelpOverview
     } else if confirm {
         EscStep::Confirm
     } else if menus {
@@ -503,6 +518,47 @@ fn bulb(on: bool) -> icon::Handle {
     handle
 }
 
+fn lamp_icon_handle(icon_key: &str) -> icon::Handle {
+    let mut handle = icon::from_svg_bytes(lamp_icon_svg(icon_key));
+    handle.symbolic = true;
+    handle
+}
+
+fn lamp_icon_badge<'a>(icon_key: &str, tint: Option<Color>, reachable: bool, size: f32) -> Element<'a, Message> {
+    let glyph_px = (size * 0.58).round().clamp(11.0, 22.0) as u16;
+    let svg_icon = icon::icon(lamp_icon_handle(icon_key))
+        .size(glyph_px)
+        .class(theme::Svg::custom(move |theme: &cosmic::Theme| iced_svg::Style {
+            color: Some(match tint {
+                Some(c) => with_alpha(on_tint(c), if reachable { 1.0 } else { 0.5 }),
+                None => with_alpha(Color::from(theme.cosmic().on_bg_color()), if reachable { 0.85 } else { 0.4 }),
+            }),
+        }));
+    container(svg_icon)
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .class(theme::Container::custom(move |theme: &cosmic::Theme| {
+            let base = Color::from(theme.cosmic().on_bg_color());
+            let fill = match tint {
+                Some(c) => with_alpha(c, if reachable { 1.0 } else { 0.4 }),
+                None => with_alpha(base, 0.14),
+            };
+            let border_col = if tint.is_some() && reachable {
+                Color::WHITE
+            } else {
+                with_alpha(base, 0.35)
+            };
+            iced_container::Style {
+                background: Some(Background::Color(fill)),
+                border: Border { radius: (size * 0.5).into(), width: 1.2, color: border_col },
+                ..Default::default()
+            }
+        }))
+        .into()
+}
+
 fn panel_icon_handle(icon_key: &str, lit: bool) -> icon::Handle {
     match panel_icon_svg(icon_key) {
         Some(bytes) => {
@@ -554,6 +610,8 @@ struct HueLights<const WINDOW_MODE: bool = false> {
     expanded: HashSet<String>,
     all_scenes: HashSet<String>,
     open_light_drawer: Option<String>,
+    open_lights_menu: Option<String>,
+    motion_hint_dismissed: bool,
     favorites: Vec<Favorite>,
     exclude_all_on: HashSet<String>,
     confirm_all_on_pref: bool,
@@ -586,6 +644,7 @@ struct HueLights<const WINDOW_MODE: bool = false> {
     settings_open: bool,
     /// The animated Help & Feature Guide page is shown instead of the tabs.
     help_open: bool,
+    help_selected: Option<usize>,
     help_phase: f32,
     /// Optional local Ask AI (OFF by default — opt-in in Settings).
     ask_ai_enabled: bool,
@@ -619,6 +678,13 @@ enum Message {
     Expand(String),
     AllScenes(String),
     ToggleLightDrawer(String),
+    ToggleLightsMenu(String),
+    LightsMenuBrightness(String),
+    LightsMenuColor(String),
+    LightsMenuRename(String),
+    LightsMenuIcon(String),
+    LightsMenuWireOnMap(String),
+    DismissMotionHint,
     ToggleFavorite(String, String),
     ToggleExcludeAllOn(String, bool),
     LightMirek(String, u16),
@@ -718,6 +784,8 @@ enum Message {
     SetAskAi(bool),
     ToggleSettings,
     ToggleHelp,
+    HelpSelect(Option<usize>),
+    HelpTry(help::HelpAction),
     ToggleAskAi,
     AskAiInput(String),
     AskAiSubmit,
@@ -990,6 +1058,9 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             }
             MapMsg::MotionAreaSensitivity(area_id, val) => {
                 self.send(cmd_motion_area_update(&area_id, None, Some(val)));
+            }
+            MapMsg::DismissMotionHint => {
+                self.motion_hint_dismissed = true;
             }
             MapMsg::OpenLampDialog(dialog) => {
                 self.floorplan.open_lamp_dialog(dialog, &self.stats);
@@ -1329,6 +1400,29 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                 if let Some(pos) = self.floorplan.doc.lamps.get_mut(&id) {
                     pos.icon = norm;
                     self.save_floorplan(false);
+                } else {
+                    let lights = extract_bridge_lights(&self.stats);
+                    let room_id = lights
+                        .iter()
+                        .find(|l| l.id == id)
+                        .map(|l| l.room_id.as_str())
+                        .unwrap_or("");
+                    let (x, y) = self
+                        .floorplan
+                        .doc
+                        .boxes
+                        .iter()
+                        .find(|b| !room_id.is_empty() && b.hue_id.as_deref() == Some(room_id))
+                        .map(|b| (b.x + b.w * 0.5, b.y + b.h * 0.5))
+                        .unwrap_or((
+                            self.floorplan.doc.canvas.width * 0.5,
+                            self.floorplan.doc.canvas.height * 0.5,
+                        ));
+                    self.floorplan.doc.lamps.insert(
+                        id,
+                        FloorplanLamp { x, y, z: 0.0, icon: norm },
+                    );
+                    self.save_floorplan(false);
                 }
             }
             MapMsg::LampStartWire(id) => {
@@ -1532,6 +1626,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
 
     fn any_picker_open(&self) -> bool {
         self.synth_room_picker_open
+            || self.open_lights_menu.is_some()
             || self.floorplan.any_menu_open()
             || self.schedule_draft.as_ref().is_some_and(|d| d.target_picker_open)
             || self.rule_draft.as_ref().is_some_and(|d| d.trigger_picker_open || d.target_picker_open)
@@ -1539,6 +1634,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
 
     fn close_pickers(&mut self) {
         self.synth_room_picker_open = false;
+        self.open_lights_menu = None;
         self.floorplan.close_menus();
         if let Some(d) = &mut self.schedule_draft {
             d.target_picker_open = false;
@@ -1835,6 +1931,68 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         flex_row(pills).row_spacing(6).column_spacing(6).into()
     }
 
+    fn motion_aware_hint_card(&self) -> Option<Element<'_, Message>> {
+        if !should_show_motion_aware_hint(&self.stats, self.motion_hint_dismissed) {
+            return None;
+        }
+        const EMERALD: Color = Color::from_rgb(16.0 / 255.0, 185.0 / 255.0, 129.0 / 255.0);
+        let eligible = motion_aware_eligible_rooms(&self.stats);
+        let dot = container(space::horizontal())
+            .width(Length::Fixed(10.0))
+            .height(Length::Fixed(10.0))
+            .class(theme::Container::custom(|_| iced_container::Style {
+                background: Some(Background::Color(EMERALD)),
+                border: Border { radius: 5.0.into(), ..Default::default() },
+                ..Default::default()
+            }));
+        let header = row![
+            dot,
+            text::heading(tr("Bridge Pro MotionAware™ Ready")),
+            space::horizontal(),
+            button::custom(text::caption("×"))
+                .padding([2, 7])
+                .class(theme::Button::MenuItem)
+                .on_press(Message::DismissMotionHint),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let mut body = column![
+            header,
+            dim(tr("1. Open the Philips Hue mobile app → Settings → MotionAware")),
+            dim(tr("2. Pick 3+ lights in a room and run the 30-second calibration once")),
+            dim(tr("3. Return here — live radar badges, sensitivity & visual rules appear automatically!")),
+        ]
+        .spacing(4);
+
+        if !eligible.is_empty() {
+            body = body.push(
+                text::caption(trf("Ready rooms (3+ lights): {0}", &[eligible.join(", ")])).class(
+                    theme::Text::Custom(|_| iced_text::Style {
+                        color: Some(EMERALD),
+                        ..Default::default()
+                    }),
+                ),
+            );
+        }
+
+        Some(
+            container(body)
+                .padding(10)
+                .width(Length::Fill)
+                .class(theme::Container::custom(|_| iced_container::Style {
+                    background: Some(Background::Color(with_alpha(EMERALD, 0.10))),
+                    border: Border {
+                        radius: corners::now().radius.into(),
+                        width: 1.0,
+                        color: with_alpha(EMERALD, 0.45),
+                    },
+                    ..Default::default()
+                }))
+                .into(),
+        )
+    }
+
     fn lights_tab(&self) -> Element<'_, Message> {
         let rooms = list(&self.stats, "rooms");
         if rooms.is_empty() {
@@ -1845,6 +2003,9 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             });
         }
         let mut content = column![].spacing(10);
+        if let Some(hint) = self.motion_aware_hint_card() {
+            content = content.push(hint);
+        }
         if let Some(strip) = self.favorites_strip() {
             content = content.push(strip);
         }
@@ -1988,6 +2149,9 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         if open {
             for light in list(room, "lights") {
                 card_content = card_content.push(self.light_row(light));
+                if self.open_lights_menu.as_deref() == Some(s(light, "id")) {
+                    card_content = card_content.push(self.light_submenu(light));
+                }
                 if self.open_light_drawer.as_deref() == Some(s(light, "id")) {
                     card_content = card_content.push(self.light_drawer(light));
                 }
@@ -2056,6 +2220,14 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         let reachable = light.get("reachable").and_then(Value::as_bool) != Some(false);
         let c = color(light.get("color").unwrap_or(&Value::Null));
         let drawer_open = self.open_light_drawer.as_deref() == Some(id.as_str());
+        let menu_open = self.open_lights_menu.as_deref() == Some(id.as_str());
+        let icon_key = self
+            .floorplan
+            .doc
+            .lamps
+            .get(&id)
+            .map(|p| normalize_lamp_icon(&p.icon))
+            .unwrap_or("bulb");
         let mut name = s(light, "name").to_string();
         if !reachable {
             name += &format!(" · {}", tr("unreachable"));
@@ -2078,8 +2250,8 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         };
 
         let dot_btn = cosmic::widget::tooltip(
-            button::custom(swatch_sized(on.then_some(c), reachable, 14.0))
-                .padding(4)
+            button::custom(lamp_icon_badge(icon_key, on.then_some(c), reachable, 24.0))
+                .padding(2)
                 .class(if drawer_open { theme::Button::Suggested } else { theme::Button::MenuItem })
                 .on_press(Message::ToggleLightDrawer(id.clone())),
             text::body(tr("Color, warmth & effects")),
@@ -2093,16 +2265,53 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             let target = format!("light:{id}");
             let bri = if on { self.bri_of(&target, num(light, "bri")) } else { 1 };
             let t1 = target.clone();
+            let slider_w = if self.window_mode { 104.0 } else { 86.0 };
             line = line.push(
                 slider(0..=100, bri, move |v| Message::Bri(t1.clone(), v))
                     .step(5u8)
                     .on_release(Message::BriDone(target))
-                    .width(Length::Fixed(104.0)),
+                    .width(Length::Fixed(slider_w)),
             );
         }
         let switch_id = id.clone();
         line = line.push(toggler(on).on_toggle(move |v| Message::LightOn(switch_id.clone(), v)));
+        line = line.push(
+            button::custom(text::caption("⋯"))
+                .padding([3, 7])
+                .class(if menu_open { theme::Button::Suggested } else { theme::Button::MenuItem })
+                .on_press(Message::ToggleLightsMenu(id)),
+        );
         container(line).padding([4, 4, 4, 8]).into()
+    }
+
+    fn light_submenu<'a>(&'a self, light: &'a Value) -> Element<'a, Message> {
+        let id = s(light, "id").to_string();
+        let pinned = is_favorite(&self.favorites, "light", &id);
+        let pin_label = if pinned { tr("Unpin favorite") } else { tr("Pin favorite") };
+        let items = column![
+            menu_button(text::caption(format!("{}…", tr("Brightness"))))
+                .on_press(Message::LightsMenuBrightness(id.clone())),
+            menu_button(text::caption(tr("Color & Warmth")))
+                .on_press(Message::LightsMenuColor(id.clone())),
+            menu_button(text::caption(format!("{}…", tr("Rename"))))
+                .on_press(Message::LightsMenuRename(id.clone())),
+            menu_button(text::caption(format!("{}…", tr("Lamp icon"))))
+                .on_press(Message::LightsMenuIcon(id.clone())),
+            menu_button(text::caption(tr("Wire rule on Map")))
+                .on_press(Message::LightsMenuWireOnMap(id.clone())),
+            menu_button(text::caption(pin_label))
+                .on_press(Message::ToggleFavorite("light".into(), id)),
+        ]
+        .spacing(2);
+        container(
+            container(items)
+                .padding(4)
+                .width(Length::Fill)
+                .class(sub_card(&self.skin)),
+        )
+        .padding([2, 4, 4, 24])
+        .width(Length::Fill)
+        .into()
     }
 
     fn light_drawer<'a>(&'a self, light: &'a Value) -> Element<'a, Message> {
@@ -3094,6 +3303,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                 self.window_mode,
                 self.window_width,
                 self.pending_sync_count,
+                self.motion_hint_dismissed,
             )
             .map(Message::Map),
             Tab::Schedules => self.schedules_tab(),
@@ -3455,7 +3665,15 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             return overlay;
         }
         if self.help_open {
-            return help::view_help_page(self.help_phase, &self.skin, self.window_mode, Message::ToggleHelp);
+            return help::view_help_page(
+                self.help_phase,
+                &self.skin,
+                self.window_mode,
+                self.help_selected,
+                Message::ToggleHelp,
+                Message::HelpSelect,
+                Message::HelpTry,
+            );
         }
         if self.ask_ai_enabled && self.ask_ai_open {
             return self.ask_ai_page();
@@ -3466,11 +3684,23 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         let content = column![padded_control(self.details()).padding([12, 16]), self.actions()]
             .width(if self.window_mode { Length::Fill } else { Length::Fixed(POPUP_WIDTH) })
             .padding([0, 0, 8, 0]);
-        if self.window_mode {
+        let base: Element<Message> = if self.window_mode {
             // Keep every action reachable when the normal window is resized smaller.
             scrollable(content).height(Length::Fill).into()
         } else {
             content.into()
+        };
+        let dragging_bri = match &self.floorplan.lamp_dialog {
+            Some(LampDialog::Brightness(lid)) => self.dragging.get(&format!("light:{lid}")).map(|(v, _)| *v),
+            _ => None,
+        };
+        if let Some(dialog) = view_lamp_dialog_overlay(&self.floorplan, &self.stats, &self.skin, dragging_bri) {
+            iced_stack![base, dialog.map(Message::Map)]
+                .width(if self.window_mode { Length::Fill } else { Length::Fixed(POPUP_WIDTH) })
+                .height(if self.window_mode { Length::Fill } else { Length::Shrink })
+                .into()
+        } else {
+            base
         }
     }
 
@@ -3820,6 +4050,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                 }
             }
             Message::ToggleLightDrawer(id) => {
+                self.open_lights_menu = None;
                 if self.open_light_drawer.as_deref() == Some(id.as_str()) {
                     self.open_light_drawer = None;
                     self.theme_draft = None;
@@ -3828,7 +4059,48 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                     self.theme_draft = None;
                 }
             }
+            Message::ToggleLightsMenu(id) => {
+                if self.open_lights_menu.as_deref() == Some(id.as_str()) {
+                    self.open_lights_menu = None;
+                } else {
+                    self.open_lights_menu = Some(id);
+                }
+            }
+            Message::LightsMenuBrightness(id) => {
+                self.open_lights_menu = None;
+                self.floorplan.open_lamp_dialog(LampDialog::Brightness(id), &self.stats);
+            }
+            Message::LightsMenuColor(id) => {
+                self.open_lights_menu = None;
+                self.open_light_drawer = Some(id);
+                self.theme_draft = None;
+            }
+            Message::LightsMenuRename(id) => {
+                self.open_lights_menu = None;
+                self.floorplan.open_lamp_dialog(LampDialog::Rename(id), &self.stats);
+            }
+            Message::LightsMenuIcon(id) => {
+                self.open_lights_menu = None;
+                self.floorplan.open_lamp_dialog(LampDialog::Icon(id), &self.stats);
+            }
+            Message::LightsMenuWireOnMap(id) => {
+                self.open_lights_menu = None;
+                self.open_light_drawer = None;
+                self.floorplan.close_menus();
+                self.floorplan.close_dialog();
+                self.tab = Tab::Map;
+                self.floorplan.mode = CanvasMode::Wire;
+                if self.floorplan.doc.lamps.contains_key(&id) {
+                    self.floorplan.pending_wire_from = Some(("light".into(), id));
+                } else {
+                    self.floorplan.pending_wire_from = None;
+                }
+            }
+            Message::DismissMotionHint => {
+                self.motion_hint_dismissed = true;
+            }
             Message::ToggleFavorite(kind, id) => {
+                self.open_lights_menu = None;
                 toggle_favorite(&mut self.favorites, &kind, &id);
                 let val = (!self.favorites.is_empty()).then(|| favorites_to_value(&self.favorites));
                 self.setting_error = write_pref(FAVORITES_KEY, val).is_err();
@@ -4244,18 +4516,23 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             Message::NoteDone => return self.finish_note(true),
             Message::Escape(id) => {
                 let shown = if self.window_mode { self.core.main_window_id() == Some(id) } else { self.popup == Some(id) };
-                let confirm = self.confirm_unpair || self.confirm_all_on;
-                let menus = self.any_settings_menu_open() || self.any_picker_open();
-                let drawer = self.any_drawer_open();
+                let help_detail = self.help_open && self.help_selected.is_some();
+                let confirm = !self.help_open && (self.confirm_unpair || self.confirm_all_on);
+                let menus = !self.help_open && (self.any_settings_menu_open() || self.any_picker_open());
+                let drawer = !self.help_open && self.any_drawer_open();
                 match esc_step(
                     shown,
                     self.shot.open(),
+                    help_detail,
                     confirm,
                     menus,
                     drawer,
                     self.settings_open || self.help_open || self.ask_ai_open,
                 ) {
                     EscStep::Note => return self.finish_note(false),
+                    EscStep::HelpOverview => {
+                        self.help_selected = None;
+                    }
                     EscStep::Confirm => {
                         self.confirm_unpair = false;
                         self.confirm_all_on = false;
@@ -4274,6 +4551,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                     EscStep::Back => {
                         self.settings_open = false;
                         self.help_open = false;
+                        self.help_selected = None;
                         self.ask_ai_open = false;
                     }
                     // Like the window's own close (the tray keeps running); the popup like a click on the icon.
@@ -4360,23 +4638,65 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             Message::ToggleSettings => {
                 self.settings_open = !self.settings_open;
                 self.help_open = false;
+                self.help_selected = None;
                 self.ask_ai_open = false;
                 self.close_settings_menus();
+                self.close_pickers();
                 self.confirm_unpair = false;
                 self.confirm_all_on = false;
             }
             Message::ToggleHelp => {
                 self.help_open = !self.help_open;
+                self.help_selected = None;
                 self.settings_open = false;
                 self.ask_ai_open = false;
                 self.close_settings_menus();
                 self.close_pickers();
+            }
+            Message::HelpSelect(idx) => {
+                self.help_selected = help::resolve_selected_feature(idx);
+            }
+            Message::HelpTry(action) => {
+                self.help_open = false;
+                self.help_selected = None;
+                self.ask_ai_open = false;
+                self.close_settings_menus();
+                self.close_pickers();
+                self.floorplan.close_dialog();
+                match action {
+                    help::HelpAction::OpenLights => {
+                        self.settings_open = false;
+                        self.tab = Tab::Lights;
+                    }
+                    help::HelpAction::OpenMap => {
+                        self.settings_open = false;
+                        self.tab = Tab::Map;
+                        self.floorplan.mode = CanvasMode::Select;
+                    }
+                    help::HelpAction::OpenMapRules => {
+                        self.settings_open = false;
+                        self.tab = Tab::Map;
+                        self.floorplan.mode = CanvasMode::Wire;
+                    }
+                    help::HelpAction::OpenSchedules => {
+                        self.settings_open = false;
+                        self.tab = Tab::Schedules;
+                    }
+                    help::HelpAction::OpenSynth => {
+                        self.settings_open = false;
+                        self.tab = Tab::Synth;
+                    }
+                    help::HelpAction::OpenSettings => {
+                        self.settings_open = true;
+                    }
+                }
             }
             Message::ToggleAskAi => {
                 if self.ask_ai_enabled {
                     self.ask_ai_open = !self.ask_ai_open;
                     self.settings_open = false;
                     self.help_open = false;
+                    self.help_selected = None;
                     self.close_settings_menus();
                     self.close_pickers();
                     if self.ask_ai_open {
@@ -4578,15 +4898,134 @@ mod tests {
 
     #[test]
     fn esc_closes_the_innermost_thing_first() {
-        assert_eq!(esc_step(true, true, true, true, true, true), EscStep::Note);
-        assert_eq!(esc_step(true, false, true, true, true, true), EscStep::Confirm);
-        assert_eq!(esc_step(true, false, false, true, true, true), EscStep::Menus);
-        assert_eq!(esc_step(true, false, false, false, true, true), EscStep::Drawer);
-        assert_eq!(esc_step(true, false, false, false, false, true), EscStep::Back);
-        assert_eq!(esc_step(true, false, false, false, false, false), EscStep::Close);
+        assert_eq!(esc_step(true, true, true, true, true, true, true), EscStep::Note);
+        assert_eq!(esc_step(true, false, true, true, true, true, true), EscStep::HelpOverview);
+        assert_eq!(esc_step(true, false, false, true, true, true, true), EscStep::Confirm);
+        assert_eq!(esc_step(true, false, false, false, true, true, true), EscStep::Menus);
+        assert_eq!(esc_step(true, false, false, false, false, true, true), EscStep::Drawer);
+        assert_eq!(esc_step(true, false, false, false, false, false, true), EscStep::Back);
+        assert_eq!(esc_step(true, false, false, false, false, false, false), EscStep::Close);
         // Not from the window or the open popup (e.g. the panel button): nothing.
-        assert_eq!(esc_step(false, true, true, true, true, true), EscStep::Nothing);
-        assert_eq!(esc_step(false, false, false, false, false, false), EscStep::Nothing);
+        assert_eq!(esc_step(false, true, true, true, true, true, true), EscStep::Nothing);
+        assert_eq!(esc_step(false, false, false, false, false, false, false), EscStep::Nothing);
+    }
+
+    #[test]
+    fn help_esc_steps_from_detail_to_overview_to_closed() {
+        use cosmic::Application;
+        let mut app = HueLights::<false>::default();
+        let popup_id = cosmic::iced::window::Id::unique();
+        app.popup = Some(popup_id);
+
+        // Open Help -> select feature 2 (Visual Rules)
+        let _ = app.update(Message::ToggleHelp);
+        assert!(app.help_open);
+        assert_eq!(app.help_selected, None);
+
+        let _ = app.update(Message::HelpSelect(Some(2)));
+        assert_eq!(app.help_selected, Some(2));
+
+        // Out-of-bounds selection is rejected safely
+        let _ = app.update(Message::HelpSelect(Some(999)));
+        assert_eq!(app.help_selected, None);
+
+        // Select feature 1, then press Esc -> goes back to Help overview
+        let _ = app.update(Message::HelpSelect(Some(1)));
+        assert_eq!(app.help_selected, Some(1));
+        let _ = app.update(Message::Escape(popup_id));
+        assert!(app.help_open);
+        assert_eq!(app.help_selected, None);
+
+        // Press Esc again -> closes Help completely
+        let _ = app.update(Message::Escape(popup_id));
+        assert!(!app.help_open);
+        assert_eq!(app.help_selected, None);
+
+        // Try-it-now jumps straight to the target mode and closes Help
+        let _ = app.update(Message::ToggleHelp);
+        let _ = app.update(Message::HelpSelect(Some(2)));
+        let _ = app.update(Message::HelpTry(help::HelpAction::OpenMapRules));
+        assert!(!app.help_open);
+        assert_eq!(app.help_selected, None);
+        assert_eq!(app.tab, Tab::Map);
+        assert_eq!(app.floorplan.mode, CanvasMode::Wire);
+    }
+
+    #[test]
+    fn lights_tab_submenu_modals_and_esc_flow() {
+        use cosmic::Application;
+        let mut app = HueLights::<false>::default();
+        let popup_id = cosmic::iced::window::Id::unique();
+        app.popup = Some(popup_id);
+        app.stats = json!({
+            "phase": "ok",
+            "bridge": {"is_pro": true, "model_id": "BSB003"},
+            "motion_areas": [],
+            "rooms": [{
+                "id": "r1",
+                "kind": "room",
+                "name": "Living Room",
+                "lights": [{
+                    "id": "l1",
+                    "device_id": "d1",
+                    "name": "Floor Lamp",
+                    "on": true,
+                    "bri": 75.0,
+                    "color": "#ffd27a",
+                    "reachable": true
+                }]
+            }]
+        });
+        app.floorplan.doc.lamps.insert(
+            "l1".into(),
+            FloorplanLamp { x: 100.0, y: 100.0, z: 0.0, icon: "bulb".into() },
+        );
+
+        // Toggle Lights tab `⋯` submenu open & closed
+        let _ = app.update(Message::ToggleLightsMenu("l1".into()));
+        assert_eq!(app.open_lights_menu.as_deref(), Some("l1"));
+        assert!(app.any_picker_open());
+
+        // Esc closes submenu cleanly without closing the popup
+        let _ = app.update(Message::Escape(popup_id));
+        assert_eq!(app.open_lights_menu, None);
+
+        // Brightness modal opens from Lights submenu and closes on Esc
+        let _ = app.update(Message::ToggleLightsMenu("l1".into()));
+        let _ = app.update(Message::LightsMenuBrightness("l1".into()));
+        assert_eq!(app.open_lights_menu, None);
+        assert_eq!(app.floorplan.lamp_dialog, Some(LampDialog::Brightness("l1".into())));
+        let _ = app.update(Message::Escape(popup_id));
+        assert_eq!(app.floorplan.lamp_dialog, None);
+
+        // Color & Warmth opens the light drawer
+        let _ = app.update(Message::LightsMenuColor("l1".into()));
+        assert_eq!(app.open_light_drawer.as_deref(), Some("l1"));
+
+        // Rename modal pre-fills current lamp name
+        let _ = app.update(Message::LightsMenuRename("l1".into()));
+        assert_eq!(app.floorplan.lamp_dialog, Some(LampDialog::Rename("l1".into())));
+        assert_eq!(app.floorplan.lamp_rename_draft, "Floor Lamp");
+        let _ = app.update(Message::Escape(popup_id));
+        assert_eq!(app.floorplan.lamp_dialog, None);
+
+        // Lamp icon modal syncs 1:1 with floorplan
+        let _ = app.update(Message::LightsMenuIcon("l1".into()));
+        assert_eq!(app.floorplan.lamp_dialog, Some(LampDialog::Icon("l1".into())));
+        let _ = app.update(Message::Map(MapMsg::LampSetIcon("l1".into(), "pendant".into())));
+        assert_eq!(app.floorplan.doc.lamps["l1"].icon, "pendant");
+
+        // Wire rule on Map jumps to Map tab in Rules mode with lamp armed
+        let _ = app.update(Message::LightsMenuWireOnMap("l1".into()));
+        assert_eq!(app.tab, Tab::Map);
+        assert_eq!(app.floorplan.mode, CanvasMode::Wire);
+        assert_eq!(app.floorplan.pending_wire_from, Some(("light".into(), "l1".into())));
+
+        // MotionAware hint dismissal
+        assert!(should_show_motion_aware_hint(&app.stats, app.motion_hint_dismissed));
+        let _ = app.update(Message::DismissMotionHint);
+        assert!(app.motion_hint_dismissed);
+        assert!(!should_show_motion_aware_hint(&app.stats, app.motion_hint_dismissed));
     }
 
     #[test]

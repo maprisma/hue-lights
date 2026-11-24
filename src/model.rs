@@ -1446,6 +1446,53 @@ pub fn parse_sensors(stats: &Value) -> Vec<HueSensor> {
     out
 }
 
+pub fn is_bridge_pro(stats: &Value) -> bool {
+    stats.get("bridge").is_some_and(|b| j_bool(b, "is_pro"))
+}
+
+/// Whether to show the beginner Bridge Pro MotionAware™ setup hint card.
+/// Strictly hidden when `!bridge.is_pro`, when `motion_areas` is non-empty, or when dismissed.
+pub fn should_show_motion_aware_hint(stats: &Value, dismissed: bool) -> bool {
+    !dismissed && is_bridge_pro(stats) && parse_motion_areas(stats).is_empty()
+}
+
+/// Lists rooms eligible for Bridge Pro MotionAware™ (either rooms with 3+ candidate devices
+/// reported by the bridge, or rooms containing 3+ lights).
+pub fn motion_aware_eligible_rooms(stats: &Value) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    let rooms = j_list(stats, "rooms");
+    if let Some(bridge) = stats.get("bridge") {
+        for rid_val in j_list(bridge, "motion_area_candidate_rooms") {
+            let Some(rid) = rid_val.as_str() else { continue };
+            if rid.is_empty() {
+                continue;
+            }
+            if let Some(room) = rooms.iter().find(|r| j_str(r, "id") == rid) {
+                let name = j_str(room, "name");
+                if !name.is_empty() && seen.insert(name.to_string()) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    if !names.is_empty() {
+        return names;
+    }
+    for room in rooms {
+        if j_str(room, "kind") != "room" {
+            continue;
+        }
+        if j_list(room, "lights").len() >= 3 {
+            let name = j_str(room, "name");
+            if !name.is_empty() && seen.insert(name.to_string()) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
 pub fn parse_motion_areas(stats: &Value) -> Vec<MotionArea> {
     let mut out = Vec::new();
     for item in j_list(stats, "motion_areas") {
@@ -2370,5 +2417,48 @@ mod tests {
         assert_eq!(btn_cmd["rule"]["trigger_state"], "long_press");
         assert_eq!(btn_cmd["rule"]["mirror_off"], false);
         assert_eq!(btn_cmd["rule"]["match_bri"], false);
+    }
+
+    #[test]
+    fn motion_aware_hint_visibility_and_eligible_rooms() {
+        let pro_empty = json!({
+            "bridge": {"is_pro": true, "model_id": "BSB003", "motion_area_candidates": 4, "motion_area_candidate_rooms": []},
+            "motion_areas": [],
+            "rooms": [
+                {"id": "r1", "kind": "room", "name": "Living Room", "lights": [{"id": "l1"}, {"id": "l2"}, {"id": "l3"}]},
+                {"id": "r2", "kind": "room", "name": "Hallway", "lights": [{"id": "l4"}]},
+                {"id": "z1", "kind": "zone", "name": "Downstairs", "lights": [{"id": "l1"}, {"id": "l2"}, {"id": "l3"}]}
+            ]
+        });
+        assert!(is_bridge_pro(&pro_empty));
+        assert!(should_show_motion_aware_hint(&pro_empty, false));
+        assert!(!should_show_motion_aware_hint(&pro_empty, true));
+        assert_eq!(motion_aware_eligible_rooms(&pro_empty), vec!["Living Room".to_string()]);
+
+        // Bridge explicitly lists candidate rooms -> preferred over fallback count
+        let pro_with_cand_rooms = json!({
+            "bridge": {"is_pro": true, "motion_area_candidates": 3, "motion_area_candidate_rooms": ["r2"]},
+            "motion_areas": [],
+            "rooms": [
+                {"id": "r1", "kind": "room", "name": "Living Room", "lights": [{"id": "l1"}, {"id": "l2"}, {"id": "l3"}]},
+                {"id": "r2", "kind": "room", "name": "Office", "lights": [{"id": "l4"}, {"id": "l5"}, {"id": "l6"}]}
+            ]
+        });
+        assert_eq!(motion_aware_eligible_rooms(&pro_with_cand_rooms), vec!["Office".to_string()]);
+
+        // Non-Pro bridge -> strictly hidden
+        let v2_bridge = json!({
+            "bridge": {"is_pro": false, "model_id": "BSB002"},
+            "motion_areas": []
+        });
+        assert!(!is_bridge_pro(&v2_bridge));
+        assert!(!should_show_motion_aware_hint(&v2_bridge, false));
+
+        // Bridge Pro with configured motion areas -> strictly hidden
+        let pro_configured = json!({
+            "bridge": {"is_pro": true, "model_id": "BSB003"},
+            "motion_areas": [{"id": "ma-1", "name": "Living Room", "enabled": true}]
+        });
+        assert!(!should_show_motion_aware_hint(&pro_configured, false));
     }
 }

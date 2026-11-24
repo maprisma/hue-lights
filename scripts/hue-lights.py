@@ -762,6 +762,39 @@ def parse_motion_areas(resources, rooms=None):
     return areas
 
 
+def parse_motion_area_candidates(resources, rooms=None):
+    """Count Hue Bridge Pro `motion_area_candidate` resources and list eligible rooms (3+ candidates)."""
+    if not isinstance(resources, list):
+        return 0, []
+    seen = set()
+    cand_devices = set()
+    for res in resources:
+        if not isinstance(res, dict) or res.get("type") != "motion_area_candidate":
+            continue
+        cid = res.get("id")
+        if not valid_uuid(cid) or cid in seen:
+            continue
+        seen.add(cid)
+        owner = (res.get("owner") if isinstance(res.get("owner"), dict) else {}).get("rid")
+        if valid_uuid(owner):
+            cand_devices.add(owner)
+
+    eligible_rooms = []
+    if isinstance(rooms, list) and cand_devices:
+        for r in rooms:
+            if not isinstance(r, dict) or r.get("kind") != "room" or not valid_uuid(r.get("id")):
+                continue
+            matched = set()
+            for l in r.get("lights") or []:
+                if isinstance(l, dict):
+                    did = l.get("device_id")
+                    if did in cand_devices:
+                        matched.add(did)
+            if len(matched) >= 3:
+                eligible_rooms.append(r["id"])
+    return len(seen), eligible_rooms
+
+
 def annotate_motion_aware_lights(rooms, motion_areas):
     """Set `motion_aware` and `motion_active` flags on every light in `rooms`."""
     aware_ids = set()
@@ -4502,6 +4535,8 @@ class Hue:
         self.sensors = []
         self._sensor_service_owners = {}
         self.motion_areas = []
+        self.motion_area_candidates = 0
+        self.motion_area_candidate_rooms = []
         self.entertainment_areas = []
         self._light_to_ent_service = {}
         self.floorplan = load_floorplan()
@@ -4620,6 +4655,8 @@ class Hue:
                     "model": self.config.get("model", ""),
                     "model_id": model_id,
                     "is_pro": is_pro,
+                    "motion_area_candidates": int(getattr(self, "motion_area_candidates", 0)),
+                    "motion_area_candidate_rooms": list(getattr(self, "motion_area_candidate_rooms", [])),
                 }
             fp = getattr(self, "floorplan", None)
             if fp is None and self.rooms:
@@ -4738,6 +4775,7 @@ class Hue:
             bridge_home_gl = extract_bridge_home_gl(data["data"])
             bridge_model_id = extract_bridge_model_id(data["data"])
             motion_areas = parse_motion_areas(data["data"], rooms)
+            motion_area_candidates, motion_area_candidate_rooms = parse_motion_area_candidates(data["data"], rooms)
             annotate_motion_aware_lights(rooms, motion_areas)
             sensors = parse_sensors(data["data"])
             sensor_svc_owners = _extract_sensor_service_owners(data["data"])
@@ -4753,6 +4791,8 @@ class Hue:
                     self.bridge_home_gl = bridge_home_gl
                     self.bridge_model_id = bridge_model_id
                     self.motion_areas = motion_areas
+                    self.motion_area_candidates = motion_area_candidates
+                    self.motion_area_candidate_rooms = motion_area_candidate_rooms
                     self.sensors = sensors
                     self._sensor_service_owners = sensor_svc_owners
                     self.entertainment_areas = entertainment_areas
@@ -4888,6 +4928,7 @@ class Hue:
                     self.rooms, self.light_count, self.on_count, self.pending = [], 0, 0, {}
                     self.bridge_home_gl, self.bridge_schedules, self.api_queue = "", [], []
                     self.bridge_model_id, self.sensors, self._sensor_service_owners, self.motion_areas = "", [], {}, []
+                    self.motion_area_candidates, self.motion_area_candidate_rooms = 0, []
                     self.entertainment_areas, self._light_to_ent_service = [], {}
                     if self.floorplan and self.floorplan.get("bridge_id") and self.floorplan["bridge_id"] != bridge_id:
                         self.floorplan = None
@@ -5757,6 +5798,7 @@ class Hue:
                 self.config, self.rooms, self.light_count, self.on_count = {}, [], 0, 0
                 self.bridge_home_gl, self.bridge_schedules = "", []
                 self.bridge_model_id, self.sensors, self._sensor_service_owners, self.motion_areas = "", [], {}, []
+                self.motion_area_candidates, self.motion_area_candidate_rooms = 0, []
                 self.entertainment_areas, self._light_to_ent_service = [], {}
                 self._local_sched_fired = {}
                 self._rebuild_schedules()

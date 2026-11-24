@@ -27,8 +27,22 @@ const CANVAS_W: f32 = 120.0;
 const CANVAS_H: f32 = 84.0;
 const FRAME_W: f32 = 124.0;
 const FRAME_H: f32 = 84.0;
+const DETAIL_CANVAS_WIN_W: f32 = 320.0;
+const DETAIL_CANVAS_WIN_H: f32 = 196.0;
+const DETAIL_CANVAS_POPUP_W: f32 = 360.0;
+const DETAIL_CANVAS_POPUP_H: f32 = 180.0;
 
 // ------------------------------------------------------------------------- Public Page View
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpAction {
+    OpenLights,
+    OpenMap,
+    OpenMapRules,
+    OpenSchedules,
+    OpenSynth,
+    OpenSettings,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnimKind {
@@ -47,6 +61,10 @@ struct FeatureSpec {
     kind: AnimKind,
     title: &'static str,
     desc: &'static str,
+    summary: &'static str,
+    steps: &'static [&'static str],
+    tip: &'static str,
+    try_action: Option<HelpAction>,
 }
 
 const FEATURES: [FeatureSpec; 9] = [
@@ -54,57 +72,157 @@ const FEATURES: [FeatureSpec; 9] = [
         kind: AnimKind::Lights,
         title: "Lights, Color & Themes",
         desc: "Control rooms, zones, and individual lamps with live brightness sliders, Kelvin warmth presets, native Hue effects, and per-lamp Light Themes.",
+        summary: "Everything you need for daily lighting is right on the Lights tab. Switch whole rooms or fine-tune any single lamp with one click.",
+        steps: &[
+            "Toggle a room switch on the right or drag its slider to dim every lamp in that room together.",
+            "Click a room card to expand its individual lamps, scenes, and quick buttons.",
+            "Click a lamp's icon badge (or choose Color & Warmth from its ⋯ menu) to pick Kelvin warmth, colors, Hue effects, or Light Themes.",
+            "Use the ⋯ button on any lamp to rename it, change its icon, pin it as a favorite, or wire a rule on the Map.",
+        ],
+        tip: "Pin your favorite rooms or lamps so they stay in a 1-click strip at the very top of the Lights tab.",
+        try_action: Some(HelpAction::OpenLights),
     },
     FeatureSpec {
         kind: AnimKind::Floorplan,
         title: "Visual Floorplan Map",
         desc: "Arrange your rooms, furniture, and 12 custom lamp icons on a 2D map of your home. Hover any lamp to see its name, right-click to toggle, or use the sidebar menu for quick dialogs.",
+        summary: "Build a live, interactive 2D map of your home where every lamp glows in its real color and brightness — and sync room changes back to your Hue Bridge.",
+        steps: &[
+            "Open the Map tab and pick a starting layout from the template menu (Auto from Hue Bridge places your existing rooms automatically).",
+            "Click + Add to add rooms, zones, or furniture stamps like sofas, beds, desks, and doors — then drag corners to resize rooms.",
+            "Drag lamps from the Lamps sidebar onto your rooms, or click ⋯ next to a lamp to change its 12 custom icons, brightness, or name.",
+            "Hover any lamp to see its name and brightness, click to select, or right-click directly on the canvas to switch it on or off.",
+        ],
+        tip: "Under View you can upload a photo or sketch of your real floorplan as a faint background image to trace your rooms over.",
+        try_action: Some(HelpAction::OpenMap),
     },
     FeatureSpec {
         kind: AnimKind::Rules,
         title: "Visual Rules",
         desc: "Switch to the Map's Rules tab and draw a line between lamps or sensors to link them. Click any line to edit Follow, Mirror, Exclusive, or Companion rules — or delete it.",
+        summary: "Automate how lamps and sensors react to each other by simply drawing a glowing line on your map — no code or complex menus required.",
+        steps: &[
+            "Open the Map tab and click the Rules button in the top-left toolbar to enter wiring mode.",
+            "Drag from any trigger lamp or sensor to a target lamp (or pick Wire rule on Map from a lamp's ⋯ menu, then click the target lamp).",
+            "Choose a behavior in the popup dialog: Follow (turn on together), Mirror (sync on & off), Exclusive (turn the other off), or Companion (only if off).",
+            "Click any colored wire on the canvas anytime to adjust time windows, toggle it on/off, or delete it.",
+        ],
+        tip: "Use Exclusive rules between bright ceiling lights and cozy mood lamps so turning one on automatically switches the other off.",
+        try_action: Some(HelpAction::OpenMapRules),
     },
     FeatureSpec {
         kind: AnimKind::MotionAware,
         title: "Bridge Pro MotionAware & Sensors",
         desc: "See live presence badges on Hue Bridge Pro MotionAware lamps and place physical Hue motion sensors, contact sensors, and switches on your map to trigger automations.",
+        summary: "Turn Hue Bridge Pro lights into radar-like motion areas and bring your physical Hue motion sensors, door contacts, and dimmer switches onto the map.",
+        steps: &[
+            "On a Hue Bridge Pro, open the Philips Hue mobile app → Settings → MotionAware, select 3+ lights in a room, and run the 30-second calibration once.",
+            "Return to Maprisma Hue Lights — live green presence badges appear automatically on MotionAware rooms and lamps.",
+            "Click a MotionAware room on the Map to toggle detection on/off or adjust its radar sensitivity slider.",
+            "Place physical Hue motion sensors, contact sensors, or switches from the Map sidebar onto the canvas and wire them to lamps in Rules mode.",
+        ],
+        tip: "Sensor and MotionAware rules can include an Active between time window (like 21:00–06:00) so hallway lights only react at night.",
+        try_action: Some(HelpAction::OpenMap),
     },
     FeatureSpec {
         kind: AnimKind::Schedules,
         title: "Schedules",
         desc: "Run weekday or sunrise/sunset schedules directly on your Hue Bridge 24/7, or run live PC schedules — including 1-click room scene scheduling from the map.",
+        summary: "Wake up to a gentle fade-in or automatically switch lights on at sunset, running either directly on your Hue Bridge 24/7 or live on this PC.",
+        steps: &[
+            "Open the Schedules tab and click + New schedule.",
+            "Pick a room, zone, or single light as the target, then choose a clock time or Sunrise / Sunset with an optional offset.",
+            "Select the weekdays, choose On (with brightness & optional fade-in), Off, or Scene, and click Save.",
+        ],
+        tip: "Click any room on the Map and press the clock button next to a scene to create a 1-click scheduled scene.",
+        try_action: Some(HelpAction::OpenSchedules),
     },
     FeatureSpec {
         kind: AnimKind::Synth,
         title: "Audio Light Synth",
         desc: "Turn system audio or your microphone into real-time light shows with 3-band Bass, Mids, and Treble beat detection — analyzed 100% locally in memory.",
+        summary: "Sync your Hue lights to music, games, or movies in real time using local 3-band frequency analysis — nothing is ever recorded or sent over the network.",
+        steps: &[
+            "Open the Synth tab and pick an audio source: System audio, Microphone, or Demo beat to test right away.",
+            "Choose a reaction Mode (Club, Chill, Ambient, or Strobe), a color Palette, and the Target room.",
+            "Press Start and optionally assign individual lamps to Bass, Mids, or Treble for a multi-layered light show.",
+        ],
+        tip: "Turn up Smoothness for relaxing ambient color waves, or lower it in Club mode for punchy beat flashes.",
+        try_action: Some(HelpAction::OpenSynth),
     },
     FeatureSpec {
         kind: AnimKind::Skins,
         title: "Skins, Icons & Shortcuts",
         desc: "Personalize the whole app with 6 skins, 8 panel icons, custom corners, and 8 languages. Press F12 anytime to save a screenshot, or Esc to close dialogs.",
+        summary: "Match Maprisma Hue Lights to your desktop setup with custom skins, panel icons, corner rounding, text scaling, and handy keyboard shortcuts.",
+        steps: &[
+            "Click the gear icon in the top-right header to open Settings.",
+            "Pick an App skin (Native, Synthwave, Cozy, Terminal, Disco, or Zen), a Panel icon, corner style, and language.",
+            "Use keyboard shortcuts anywhere: press Esc to step back or close dialogs, and F12 to save a clean screenshot.",
+        ],
+        tip: "Right-click the Hue panel icon in your top bar anytime to switch every light in your home off immediately.",
+        try_action: Some(HelpAction::OpenSettings),
     },
     FeatureSpec {
         kind: AnimKind::AskAi,
         title: "Ask AI (Optional)",
         desc: "Off by default — enable it in Settings if you want natural-language control for lamps, rooms, themes, scenes, rules, and schedules. Works 100% locally with optional local Ollama support.",
+        summary: "Control your lighting by typing plain sentences in English or German. Ask AI is completely optional, off by default, and runs locally on your PC.",
+        steps: &[
+            "Open Settings and turn on the Ask AI toggle — a sparkle button appears in the top header.",
+            "Click the sparkle button and type what you want, like \"Dim living room to 40%\" or \"Warm reading light on desk\".",
+            "Review the executed actions right below your prompt, or click an example chip to try common commands.",
+        ],
+        tip: "Works immediately with the built-in local parser, and automatically upgrades if you run a local Ollama model on localhost.",
+        try_action: Some(HelpAction::OpenSettings),
     },
     FeatureSpec {
         kind: AnimKind::McpServer,
         title: "MCP Server for AI Agents",
         desc: "Use your Hue Bridge from external AI coding and desktop agents via the built-in local stdio MCP server (maprisma-hue-lights --mcp or maprisma-hue-mcp). Credentials stay private.",
+        summary: "Connect external AI assistants and coding agents to your Philips Hue Bridge over local stdio MCP while keeping your bridge key private on this machine.",
+        steps: &[
+            "Pair your Hue Bridge in Maprisma Hue Lights once so your local configuration is saved.",
+            "In your AI agent's MCP server configuration, register the command \"maprisma-hue-lights\" with argument \"--mcp\" (or \"maprisma-hue-mcp\").",
+            "Restart your AI client to expose safe tools for reading lights, switching rooms, recalling scenes, and managing schedules.",
+        ],
+        tip: "Your Hue application key stays inside the local helper process and is never revealed to the AI model.",
+        try_action: None,
     },
 ];
 
-/// Renders the full Help & Feature Guide page with 7 animated feature cards.
+#[cfg(test)]
+pub const FEATURE_COUNT: usize = FEATURES.len();
+
+/// Validates a selected feature index against the available help cards.
+pub fn resolve_selected_feature(selected: Option<usize>) -> Option<usize> {
+    selected.filter(|&idx| idx < FEATURES.len())
+}
+
+/// Renders the interactive Help & Feature Guide page:
+/// - Overview (`selected == None`): 9 clickable animated feature cards.
+/// - Detail (`selected == Some(idx)`): larger animation + beginner step-by-step guide + Quick Tip + Try it now.
 pub fn view_help_page<'a, M: Clone + 'static>(
     phase: f32,
     skin: &'a str,
     window_mode: bool,
+    selected: Option<usize>,
     on_back: M,
+    on_select: impl Fn(Option<usize>) -> M + 'a,
+    on_try: impl Fn(HelpAction) -> M + 'a,
 ) -> Element<'a, M> {
     let norm_phase = wrap_phase(phase);
+
+    if let Some(idx) = resolve_selected_feature(selected) {
+        return view_help_detail(
+            &FEATURES[idx],
+            norm_phase,
+            skin,
+            window_mode,
+            on_select(None),
+            on_try,
+        );
+    }
 
     let header = row![
         button::text(tr("Back"))
@@ -115,12 +233,10 @@ pub fn view_help_page<'a, M: Clone + 'static>(
     ]
     .align_y(Alignment::Center);
 
-    let intro = padded_control(dim(tr(
-        "Explore everything you can do with Maprisma Hue Lights.",
-    )));
+    let intro = padded_control(dim(tr("Click any card for a bigger visual guide.")));
 
     let mut cards = column![].spacing(10).width(Length::Fill);
-    for feat in &FEATURES {
+    for (idx, feat) in FEATURES.iter().enumerate() {
         let preview = container(
             cosmic::widget::canvas(HelpAnimProgram { kind: feat.kind, phase: norm_phase })
                 .width(Length::Fixed(CANVAS_W))
@@ -132,18 +248,38 @@ pub fn view_help_page<'a, M: Clone + 'static>(
         .align_y(Alignment::Center)
         .class(preview_frame_style(skin));
 
-        let copy = column![text::heading(tr(feat.title)), text::body(tr(feat.desc))]
-            .spacing(4)
+        let hint = text::caption(tr("Tap for step-by-step guide ›")).class(theme::Text::Custom(
+            |theme: &cosmic::Theme| iced_text::Style {
+                color: Some(Color::from(theme.cosmic().accent_color())),
+                ..Default::default()
+            },
+        ));
+
+        let copy = column![
+            text::heading(tr(feat.title)),
+            text::body(tr(feat.desc)),
+            hint,
+        ]
+        .spacing(4)
+        .width(Length::Fill);
+
+        let chevron = text::title4("›").class(theme::Text::Custom(|theme: &cosmic::Theme| {
+            iced_text::Style {
+                color: Some(with_alpha(Color::from(theme.cosmic().on_bg_color()), 0.48)),
+                ..Default::default()
+            }
+        }));
+
+        let card_inner = row![preview, copy, chevron]
+            .spacing(12)
+            .align_y(Alignment::Center)
             .width(Length::Fill);
 
-        let card = container(
-            row![preview, copy]
-                .spacing(12)
-                .align_y(Alignment::Center),
-        )
-        .padding(10)
-        .width(Length::Fill)
-        .class(help_card_style(skin));
+        let card = button::custom(card_inner)
+            .padding(10)
+            .width(Length::Fill)
+            .class(help_card_button_style(skin))
+            .on_press(on_select(Some(idx)));
 
         cards = cards.push(card);
     }
@@ -171,6 +307,131 @@ pub fn view_help_page<'a, M: Clone + 'static>(
         divider::horizontal::default(),
         intro,
         list_area,
+    ]
+    .width(if window_mode { Length::Fill } else { Length::Fixed(POPUP_WIDTH) })
+    .height(if window_mode { Length::Fill } else { Length::Shrink })
+    .into()
+}
+
+fn view_help_detail<'a, M: Clone + 'static>(
+    feat: &FeatureSpec,
+    norm_phase: f32,
+    skin: &'a str,
+    window_mode: bool,
+    on_all_features: M,
+    on_try: impl Fn(HelpAction) -> M + 'a,
+) -> Element<'a, M> {
+    let header = row![
+        button::text(tr("All features"))
+            .leading_icon(icon::from_name("go-previous-symbolic").size(16))
+            .on_press(on_all_features),
+        space::horizontal().width(Length::Fill),
+        dim(tr("Help").to_uppercase()),
+    ]
+    .align_y(Alignment::Center);
+
+    let (cw, ch) = if window_mode {
+        (DETAIL_CANVAS_WIN_W, DETAIL_CANVAS_WIN_H)
+    } else {
+        (DETAIL_CANVAS_POPUP_W, DETAIL_CANVAS_POPUP_H)
+    };
+
+    let big_preview = container(
+        container(
+            cosmic::widget::canvas(HelpAnimProgram { kind: feat.kind, phase: norm_phase })
+                .width(Length::Fixed(cw))
+                .height(Length::Fixed(ch)),
+        )
+        .padding(8)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .class(preview_frame_style(skin)),
+    )
+    .width(Length::Fill)
+    .align_x(Alignment::Center);
+
+    let mut steps_col = column![text::heading(tr("How to do it"))].spacing(10);
+    for (i, step_text) in feat.steps.iter().enumerate() {
+        let num_badge = container(
+            text::caption((i + 1).to_string()).class(theme::Text::Custom(
+                |theme: &cosmic::Theme| iced_text::Style {
+                    color: Some(Color::from(theme.cosmic().accent_color())),
+                    ..Default::default()
+                },
+            )),
+        )
+        .width(Length::Fixed(22.0))
+        .height(Length::Fixed(22.0))
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .class(step_badge_style(skin));
+
+        steps_col = steps_col.push(
+            row![num_badge, text::body(tr(step_text))]
+                .spacing(10)
+                .align_y(Alignment::Start),
+        );
+    }
+
+    let steps_card = container(steps_col)
+        .padding(12)
+        .width(Length::Fill)
+        .class(help_card_style(skin));
+
+    let tip_card = container(
+        column![
+            row![
+                text::caption("💡"),
+                text::heading(tr("Quick Tip")),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            text::body(tr(feat.tip)),
+        ]
+        .spacing(6),
+    )
+    .padding(12)
+    .width(Length::Fill)
+    .class(tip_card_style(skin));
+
+    let mut detail_body = column![
+        text::title4(tr(feat.title)),
+        big_preview,
+        text::body(tr(feat.summary)),
+        steps_card,
+        tip_card,
+    ]
+    .spacing(12)
+    .width(Length::Fill);
+
+    if let Some(action) = feat.try_action {
+        detail_body = detail_body.push(
+            row![
+                space::horizontal(),
+                button::suggested(tr("Try it now →")).on_press(on_try(action)),
+            ]
+            .align_y(Alignment::Center),
+        );
+    }
+
+    let padded = container(detail_body).padding([10, 16, 16, 16]).width(Length::Fill);
+
+    let scroll_area: Element<'a, M> = if window_mode {
+        scrollable(padded)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
+    } else {
+        container(scrollable(padded).height(Length::Shrink).width(Length::Fill))
+            .max_height(POPUP_LIST_MAX_HEIGHT)
+            .width(Length::Fill)
+            .into()
+    };
+
+    column![
+        padded_control(header),
+        divider::horizontal::default(),
+        scroll_area,
     ]
     .width(if window_mode { Length::Fill } else { Length::Fixed(POPUP_WIDTH) })
     .height(if window_mode { Length::Fill } else { Length::Shrink })
@@ -206,6 +467,118 @@ fn help_card_style(skin: &str) -> theme::Container<'static> {
                 radius: corners::now().control.into(),
                 width,
                 color: border,
+            },
+            ..Default::default()
+        }
+    })
+}
+
+fn help_card_button_style(skin: &str) -> theme::Button {
+    let skin_st = skin_style(skin);
+    theme::Button::Custom {
+        active: Box::new(move |_focused, theme: &cosmic::Theme| {
+            let base = Color::from(theme.cosmic().on_bg_color());
+            let (bg, border, width) = match skin_st {
+                Some(st) => (
+                    with_alpha(st.bg_tint, 0.26),
+                    with_alpha(st.border_tint, 0.50),
+                    st.border_width,
+                ),
+                None => (with_alpha(base, 0.045), with_alpha(base, 0.12), 1.0),
+            };
+            cosmic::widget::button::Style {
+                background: Some(Background::Color(bg)),
+                border_radius: corners::now().control.into(),
+                border_width: width,
+                border_color: border,
+                text_color: Some(base),
+                ..Default::default()
+            }
+        }),
+        disabled: Box::new(move |theme: &cosmic::Theme| {
+            let base = Color::from(theme.cosmic().on_bg_color());
+            cosmic::widget::button::Style {
+                background: Some(Background::Color(with_alpha(base, 0.03))),
+                border_radius: corners::now().control.into(),
+                border_width: 1.0,
+                border_color: with_alpha(base, 0.08),
+                text_color: Some(with_alpha(base, 0.5)),
+                ..Default::default()
+            }
+        }),
+        hovered: Box::new(move |_focused, theme: &cosmic::Theme| {
+            let base = Color::from(theme.cosmic().on_bg_color());
+            let accent = Color::from(theme.cosmic().accent_color());
+            let (bg, border, width) = match skin_st {
+                Some(st) => (
+                    with_alpha(st.bg_tint, 0.42),
+                    with_alpha(st.accent, 0.78),
+                    st.border_width.max(1.25),
+                ),
+                None => (with_alpha(accent, 0.10), with_alpha(accent, 0.55), 1.25),
+            };
+            cosmic::widget::button::Style {
+                background: Some(Background::Color(bg)),
+                border_radius: corners::now().control.into(),
+                border_width: width,
+                border_color: border,
+                text_color: Some(base),
+                ..Default::default()
+            }
+        }),
+        pressed: Box::new(move |_focused, theme: &cosmic::Theme| {
+            let base = Color::from(theme.cosmic().on_bg_color());
+            let accent = Color::from(theme.cosmic().accent_color());
+            let (bg, border, width) = match skin_st {
+                Some(st) => (
+                    with_alpha(st.bg_tint, 0.52),
+                    st.accent,
+                    st.border_width.max(1.5),
+                ),
+                None => (with_alpha(accent, 0.16), accent, 1.5),
+            };
+            cosmic::widget::button::Style {
+                background: Some(Background::Color(bg)),
+                border_radius: corners::now().control.into(),
+                border_width: width,
+                border_color: border,
+                text_color: Some(base),
+                ..Default::default()
+            }
+        }),
+    }
+}
+
+fn step_badge_style(skin: &str) -> theme::Container<'static> {
+    let skin_st = skin_style(skin);
+    theme::Container::custom(move |theme: &cosmic::Theme| {
+        let accent = skin_st
+            .map(|st| st.accent)
+            .unwrap_or_else(|| Color::from(theme.cosmic().accent_color()));
+        iced_container::Style {
+            background: Some(Background::Color(with_alpha(accent, 0.16))),
+            border: Border {
+                radius: 11.0.into(),
+                width: 1.0,
+                color: with_alpha(accent, 0.50),
+            },
+            ..Default::default()
+        }
+    })
+}
+
+fn tip_card_style(skin: &str) -> theme::Container<'static> {
+    let skin_st = skin_style(skin);
+    theme::Container::custom(move |theme: &cosmic::Theme| {
+        let accent = skin_st
+            .map(|st| st.accent)
+            .unwrap_or_else(|| Color::from(theme.cosmic().accent_color()));
+        iced_container::Style {
+            background: Some(Background::Color(with_alpha(accent, 0.11))),
+            border: Border {
+                radius: corners::now().control.into(),
+                width: 1.0,
+                color: with_alpha(accent, 0.42),
             },
             ..Default::default()
         }
@@ -352,9 +725,10 @@ impl<M> Program<M, cosmic::Theme, cosmic::Renderer> for HelpAnimProgram {
     ) -> Vec<Geometry<cosmic::Renderer>> {
         let mut frame = Frame::new(renderer, bounds.size());
         let p = wrap_phase(self.phase);
-        let sx = (bounds.width / CANVAS_W).max(0.01);
-        let sy = (bounds.height / CANVAS_H).max(0.01);
-        let ctx = DrawCtx { sx, sy, s: sx.min(sy) };
+        let s = (bounds.width / CANVAS_W).min(bounds.height / CANVAS_H).max(0.01);
+        let ox = (bounds.width - CANVAS_W * s) * 0.5;
+        let oy = (bounds.height - CANVAS_H * s) * 0.5;
+        let ctx = DrawCtx { ox, oy, s };
 
         match self.kind {
             AnimKind::Lights => draw_lights(&mut frame, ctx, p),
@@ -374,18 +748,18 @@ impl<M> Program<M, cosmic::Theme, cosmic::Renderer> for HelpAnimProgram {
 
 #[derive(Clone, Copy)]
 struct DrawCtx {
-    sx: f32,
-    sy: f32,
+    ox: f32,
+    oy: f32,
     s: f32,
 }
 
 impl DrawCtx {
     fn pt(self, x: f32, y: f32) -> Point {
-        Point::new(x * self.sx, y * self.sy)
+        Point::new(self.ox + x * self.s, self.oy + y * self.s)
     }
 
     fn sz(self, w: f32, h: f32) -> Size {
-        Size::new(w * self.sx, h * self.sy)
+        Size::new(w * self.s, h * self.s)
     }
 
     fn r(self, v: f32) -> f32 {
@@ -1421,5 +1795,48 @@ mod tests {
             assert!(v >= prev - 1e-6);
             prev = v;
         }
+    }
+
+    #[test]
+    fn all_features_have_beginner_steps_tips_and_valid_selection_bounds() {
+        assert_eq!(FEATURE_COUNT, 9);
+        assert_eq!(FEATURES.len(), FEATURE_COUNT);
+        for (idx, feat) in FEATURES.iter().enumerate() {
+            assert!(!feat.title.trim().is_empty(), "feature {idx} missing title");
+            assert!(!feat.desc.trim().is_empty(), "feature {idx} missing desc");
+            assert!(!feat.summary.trim().is_empty(), "feature {idx} missing summary");
+            assert!(
+                feat.steps.len() >= 3,
+                "feature {} should have at least 3 beginner steps, got {}",
+                feat.title,
+                feat.steps.len()
+            );
+            for (sidx, step) in feat.steps.iter().enumerate() {
+                assert!(
+                    !step.trim().is_empty(),
+                    "feature {} step {sidx} is empty",
+                    feat.title
+                );
+            }
+            assert!(!feat.tip.trim().is_empty(), "feature {} missing tip", feat.title);
+            assert_eq!(resolve_selected_feature(Some(idx)), Some(idx));
+        }
+
+        // Bounds checks on detail selection
+        assert_eq!(resolve_selected_feature(None), None);
+        assert_eq!(resolve_selected_feature(Some(FEATURE_COUNT)), None);
+        assert_eq!(resolve_selected_feature(Some(FEATURE_COUNT + 42)), None);
+        assert_eq!(resolve_selected_feature(Some(usize::MAX)), None);
+
+        // Actionable scenarios expose a "Try it now" target
+        assert_eq!(FEATURES[0].try_action, Some(HelpAction::OpenLights));
+        assert_eq!(FEATURES[1].try_action, Some(HelpAction::OpenMap));
+        assert_eq!(FEATURES[2].try_action, Some(HelpAction::OpenMapRules));
+        assert_eq!(FEATURES[3].try_action, Some(HelpAction::OpenMap));
+        assert_eq!(FEATURES[4].try_action, Some(HelpAction::OpenSchedules));
+        assert_eq!(FEATURES[5].try_action, Some(HelpAction::OpenSynth));
+        assert_eq!(FEATURES[6].try_action, Some(HelpAction::OpenSettings));
+        assert_eq!(FEATURES[7].try_action, Some(HelpAction::OpenSettings));
+        assert_eq!(FEATURES[8].try_action, None);
     }
 }
