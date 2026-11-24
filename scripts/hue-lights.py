@@ -1523,6 +1523,10 @@ def load_config():
             and re.fullmatch(r"[0-9a-f]{64}", str(data.get("fingerprint", "")))
             and BRIDGE_ID_RE.match(str(data.get("bridge_id", "")))):
         return {}
+    if "name" in data:
+        data["name"] = clean(data.get("name") or "Hue Bridge", 60) or "Hue Bridge"
+    if "model" in data:
+        data["model"] = clean(data.get("model") or "", 40)
     return data
 
 
@@ -2140,9 +2144,14 @@ class SynthController:
             return False
         changed = False
         if "source" in cmd and cmd["source"] in SYNTH_SOURCES:
-            self.source = cmd["source"]
-            self.error = ""
-            changed = True
+            new_source = cmd["source"]
+            if new_source != self.source:
+                if self.running:
+                    # Changing audio source always stops capture so parec never starts without an explicit Start click.
+                    self.stop()
+                self.source = new_source
+                self.error = ""
+                changed = True
         if "mode" in cmd and cmd["mode"] in SYNTH_MODES:
             self.mode = cmd["mode"]
             changed = True
@@ -3016,11 +3025,31 @@ class Hue:
                 if self._local_sched_fired.get(sid) == bucket or sched.get("last_fired") == bucket:
                     self._local_sched_fired[sid] = bucket
                     continue
+                # Verify the target can be queued before claiming the minute on disk.
+                action = sched.get("action")
+                dispatch_ready = False
+                if action == "scene":
+                    scene_id = sched.get("scene_id", "")
+                    dispatch_ready = valid_uuid(scene_id) and self.may_queue("scene", scene_id)
+                else:
+                    tkind = sched.get("target_kind")
+                    tid = sched.get("target_id")
+                    if tkind == "light":
+                        dispatch_ready = self.may_queue("light", tid)
+                    elif tkind in ("room", "zone"):
+                        for room in self.rooms:
+                            if room["kind"] == tkind and room["id"] == tid:
+                                if valid_uuid(room.get("grouped_light")):
+                                    dispatch_ready = self.may_queue("grouped_light", room["grouped_light"])
+                                else:
+                                    dispatch_ready = any(self.may_queue("light", l["id"]) for l in room["lights"])
+                                break
+                if not dispatch_ready:
+                    continue
                 if not claim_local_schedule_bucket(sid, bucket):
                     sched["last_fired"] = bucket
                     self._local_sched_fired[sid] = bucket
                     continue
-                action = sched.get("action")
                 ok = False
                 if action == "scene":
                     scene_id = sched.get("scene_id", "")

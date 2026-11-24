@@ -1185,7 +1185,15 @@ class AudioSynthTests(Base):
             self.assertNotIn("color", h.pending[("light", L2)])  # L2 is CT-only
             self.assertIn(("light", L1), h.echo_suppress)
 
-            # Stop cleanly
+            # Switching capture source while running MUST stop synth (never auto-launch parec)
+            h.handle({"cmd": "synth_config", "source": "mic"})
+            self.assertFalse(h.snapshot()["synth"]["running"])
+            self.assertEqual(h.snapshot()["synth"]["source"], "mic")
+
+            # Restart in demo and stop cleanly
+            h.handle({"cmd": "synth_config", "source": "demo"})
+            h.handle({"cmd": "synth_start"})
+            self.assertTrue(h.snapshot()["synth"]["running"])
             h.handle({"cmd": "synth_stop"})
             snap_stopped = h.snapshot()["synth"]
             self.assertFalse(snap_stopped["running"])
