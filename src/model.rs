@@ -1,4 +1,4 @@
-//! Pure UI model helpers for Maprisma Hue Lights: tabs, room filters, pinned favorites,
+//! Pure UI model helpers for Maprisma Lights: tabs, room filters, pinned favorites,
 //! All-On room exclusions, color/warmth/effect presets, schedule/rule draft builders,
 //! formatting helpers, and unit tests.
 

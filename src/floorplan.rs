@@ -539,6 +539,8 @@ pub enum MapMsg {
     BoxSyncEntertainment(String, String),
     BoxSyncRoom,
     BoxRemoveFromCanvas(String),
+    BoxConfirmDeleteOnBridge(String),
+    BoxCancelDeleteOnBridge,
     BoxDeleteOnBridge(String),
     RecallScene(String),
     NewSceneNameInput(String),
@@ -570,6 +572,7 @@ pub struct FloorplanState {
     pub doc: FloorplanDocument,
     pub undo_doc: Option<FloorplanDocument>,
     pub confirm_template_id: Option<String>,
+    pub confirm_delete_bridge_box: Option<String>,
     pub floor_rename_open: bool,
     pub floor_rename_draft: String,
     pub local_dirty: bool,
@@ -617,6 +620,7 @@ impl Default for FloorplanState {
             doc: FloorplanDocument::default(),
             undo_doc: None,
             confirm_template_id: None,
+            confirm_delete_bridge_box: None,
             floor_rename_open: false,
             floor_rename_draft: String::new(),
             local_dirty: false,
@@ -685,6 +689,7 @@ impl FloorplanState {
         self.box_ent_menu_open = false;
         self.open_lamp_menu = None;
         self.open_sensor_menu = None;
+        self.confirm_delete_bridge_box = None;
     }
 
     pub fn has_dialog_open(&self) -> bool {
@@ -772,6 +777,7 @@ impl FloorplanState {
         self.selection = sel.clone();
         self.archetype_menu_open = false;
         self.box_ent_menu_open = false;
+        self.confirm_delete_bridge_box = None;
         match sel {
             Some(Selection::Lamp(ref lid)) => {
                 let name = extract_bridge_lights(stats)
@@ -5117,6 +5123,8 @@ fn view_inspector<'a>(
             }
 
             // Box footer actions: Sync room, Remove from canvas, Delete on Bridge
+            let confirming_bridge_delete =
+                state.confirm_delete_bridge_box.as_deref() == Some(bid.as_str());
             let mut footer = row![
                 button::standard(tr("Sync rooms")).on_press(MapMsg::BoxSyncRoom),
                 space::horizontal(),
@@ -5124,13 +5132,44 @@ fn view_inspector<'a>(
             ]
             .spacing(6)
             .align_y(Alignment::Center);
-            if b.hue_id.is_some() {
+            if b.hue_id.is_some() && !confirming_bridge_delete {
                 footer = footer.push(
-                    button::destructive(tr("Delete on Bridge")).on_press(MapMsg::BoxDeleteOnBridge(bid.clone())),
+                    button::destructive(tr("Delete on Bridge"))
+                        .on_press(MapMsg::BoxConfirmDeleteOnBridge(bid.clone())),
                 );
             }
             col = col.push(divider::horizontal::light());
             col = col.push(footer);
+            if b.hue_id.is_some() && confirming_bridge_delete {
+                col = col.push(
+                    container(
+                        column![
+                            text::caption(tr("Delete on Bridge?")).class(theme::Text::Custom(
+                                |theme: &cosmic::Theme| iced_text::Style {
+                                    color: Some(Color::from(theme.cosmic().destructive_color())),
+                                    ..Default::default()
+                                }
+                            )),
+                            dim_caption(tr(
+                                "This permanently removes the room or zone from your Philips Hue Bridge."
+                            )),
+                            row![
+                                button::standard(tr("Cancel"))
+                                    .on_press(MapMsg::BoxCancelDeleteOnBridge),
+                                space::horizontal(),
+                                button::destructive(tr("Delete"))
+                                    .on_press(MapMsg::BoxDeleteOnBridge(bid.clone())),
+                            ]
+                            .spacing(8)
+                            .align_y(Alignment::Center),
+                        ]
+                        .spacing(6),
+                    )
+                    .padding(8)
+                    .width(Length::Fill)
+                    .class(studio_card(skin)),
+                );
+            }
             col.into()
         }
 

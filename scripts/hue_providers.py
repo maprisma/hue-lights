@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-device local-first lighting providers for Maprisma Hue Lights & Omarchy Hue Lights.
+"""Multi-device local-first lighting providers for Maprisma Lights.
 
 Pure Python standard library only (zero external dependencies, Python 3.9+ compatible).
 Supports 8 additional local smart-lighting ecosystems alongside Philips Hue Bridge:
@@ -830,7 +830,7 @@ def build_wled_payload(body, effects_list=None):
         payload["on"] = bool(body["on"].get("on"))
     if "dimming" in body and isinstance(body["dimming"], dict):
         bri = finite(body["dimming"].get("brightness"), 100.0, 1.0, 100.0)
-        payload["bri"] = int(clamp(round(bri * 2.55), 1, 255))
+        payload["bri"] = int(clamp(round(bri * 255.0 / 100.0), 1, 255))
     seg0 = {}
     if "color" in body and isinstance(body["color"], dict) and isinstance(body["color"].get("xy"), dict):
         xy = body["color"]["xy"]

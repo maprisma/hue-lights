@@ -1,4 +1,4 @@
-// Hue Lights for COSMIC: Philips Hue rooms, zones, lights, scenes, schedules and rules from the panel.
+// Maprisma Lights: multi-brand local smart lighting & Floorplan Studio for COSMIC, KDE and Hyprland.
 // Lit bulb in the accent while any light is on, dim bulb when all are off or no bridge
 // is paired. Left click opens the popup; right click switches every light off.
 //
@@ -688,6 +688,8 @@ struct HueLights<const WINDOW_MODE: bool = false> {
     theme_draft: Option<ThemeDraft>,
     provider_draft: Option<ProviderDraft>,
     confirm_remove_provider: Option<String>,
+    confirm_delete_schedule: Option<String>,
+    confirm_delete_rule: Option<String>,
     activity_open: bool,
     // A slider being dragged: its value, and when it was last sent.
     dragging: HashMap<String, (u8, Instant)>,
@@ -793,6 +795,7 @@ enum Message {
     ScheduleFade(u16),
     ScheduleSave,
     ScheduleToggle(String, bool),
+    ScheduleConfirmDelete(Option<String>),
     ScheduleDelete(String),
     // Rules
     RulesPause(bool),
@@ -813,6 +816,7 @@ enum Message {
     RuleTimeEnd(String),
     RuleSave,
     RuleToggle(String, bool),
+    RuleConfirmDelete(Option<String>),
     RuleDelete(String),
     ToggleActivity,
     // Synth
@@ -1987,9 +1991,17 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             MapMsg::BoxRemoveFromCanvas(bid) => {
                 self.floorplan.doc.boxes.retain(|b| b.id != bid);
                 self.floorplan.selection = None;
+                self.floorplan.confirm_delete_bridge_box = None;
                 self.save_floorplan(false);
             }
+            MapMsg::BoxConfirmDeleteOnBridge(bid) => {
+                self.floorplan.confirm_delete_bridge_box = Some(bid);
+            }
+            MapMsg::BoxCancelDeleteOnBridge => {
+                self.floorplan.confirm_delete_bridge_box = None;
+            }
             MapMsg::BoxDeleteOnBridge(bid) => {
+                self.floorplan.confirm_delete_bridge_box = None;
                 if let Some(pos) = self.floorplan.doc.boxes.iter().position(|b| b.id == bid) {
                     let b = self.floorplan.doc.boxes.remove(pos);
                     self.floorplan.selection = None;
@@ -2215,7 +2227,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         let mut hero = icon::icon(panel_icon_handle(&self.panel_icon, lit)).size(32);
         hero = if lit { hero.class(lit_svg_for(&self.skin)) } else { hero.opacity(0.6) };
         let meta = if self.paired() { bridge_text(&self.stats) } else { tr("No bridge paired") };
-        let mut header = row![hero, column![text::title4(tr("Maprisma Hue Lights")), dim(meta)].spacing(4), space::horizontal()]
+        let mut header = row![hero, column![text::title4(tr("Maprisma Lights")), dim(meta)].spacing(4), space::horizontal()]
             .spacing(12)
             .align_y(Alignment::Center);
         if self.phase() == "ok" {
@@ -2300,7 +2312,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
     fn pairing(&self) -> Element<'_, Message> {
         let stats = &self.stats;
         let pairing = self.phase() == "pairing";
-        let mut content = column![text::heading(tr("Pair a Hue bridge"))].spacing(8);
+        let mut content = column![text::heading(tr("Connect Your Lights"))].spacing(8);
         if pairing {
             content = content.push(text::body(trf("Press the round link button on top of the bridge now. Waiting {0} s for {1} …", &[num(stats, "pair_remaining").to_string(), s(stats, "pair_ip").to_string()])));
             content = content.push(button::standard(tr("Cancel")).on_press(Message::CancelPair));
@@ -3349,13 +3361,22 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         .align_y(Alignment::Center);
 
         let meta = format!("{target_name} · {trigger}");
-        let foot = row![
+        let confirming = self.confirm_delete_schedule.as_deref() == Some(id.as_str());
+        let mut foot = row![
             dim(action),
             space::horizontal(),
-            button::destructive(tr("Delete")).on_press(Message::ScheduleDelete(id)),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
+        if confirming {
+            foot = foot
+                .push(button::standard(tr("Cancel")).on_press(Message::ScheduleConfirmDelete(None)))
+                .push(button::destructive(tr("Delete")).on_press(Message::ScheduleDelete(id)));
+        } else {
+            foot = foot.push(
+                button::destructive(tr("Delete")).on_press(Message::ScheduleConfirmDelete(Some(id))),
+            );
+        }
 
         container(column![head, dim(meta), foot].spacing(6))
             .padding(12)
@@ -3696,13 +3717,18 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         if !conds.is_empty() {
             col = col.push(dim(conds.join(" · ")));
         }
-        col = col.push(
-            row![
-                space::horizontal(),
-                button::destructive(tr("Delete")).on_press(Message::RuleDelete(id)),
-            ]
-            .align_y(Alignment::Center),
-        );
+        let confirming = self.confirm_delete_rule.as_deref() == Some(id.as_str());
+        let mut foot = row![space::horizontal()].spacing(8).align_y(Alignment::Center);
+        if confirming {
+            foot = foot
+                .push(button::standard(tr("Cancel")).on_press(Message::RuleConfirmDelete(None)))
+                .push(button::destructive(tr("Delete")).on_press(Message::RuleDelete(id)));
+        } else {
+            foot = foot.push(
+                button::destructive(tr("Delete")).on_press(Message::RuleConfirmDelete(Some(id))),
+            );
+        }
+        col = col.push(foot);
 
         container(col).padding(12).width(Length::Fill).class(card(None, &self.skin)).into()
     }
@@ -4109,7 +4135,15 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         let mut content = column![self.header()].spacing(12);
         let error = s(&self.stats, "error");
         if !error.is_empty() {
-            content = content.push(error_text(maprisma_hue_lights::i18n::error(&self.stats)));
+            content = content.push(
+                row![
+                    error_text(maprisma_hue_lights::i18n::error(&self.stats)),
+                    space::horizontal(),
+                    button::standard(tr("Retry")).on_press(Message::Refresh),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
         }
         if !self.paired() {
             content = content.push(divider::horizontal::default());
@@ -4299,7 +4333,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         // Schedule mode (On Hue Bridge vs On this PC (live))
         page = page.push(setting(
             tr("Schedule mode"),
-            tr("Bridge schedules run 24/7 even when your PC is off; PC schedules run while Maprisma Hue is open."),
+            tr("Bridge schedules run 24/7 even when your PC is off; PC schedules run while Maprisma Lights is open."),
             choice(schedule_mode_label(&self.schedule_mode), self.schedule_mode_open, Message::ToggleScheduleMode),
         ));
         if self.schedule_mode_open {
@@ -4343,7 +4377,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         let current_lang = choices.iter().find(|(code, _)| *code == language).map(|(_, l)| l.clone()).unwrap_or_default();
         page = page.push(setting(
             tr("Language"),
-            tr("Choose the display language for Maprisma Hue Lights."),
+            tr("Choose the display language for Maprisma Lights."),
             choice(current_lang, self.language_open, Message::ToggleLanguage),
         ));
         if self.language_open {
@@ -4391,6 +4425,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
 
         if self.language_error { page = page.push(padded_control(error_text(tr("Could not save language setting.")))); }
         if self.setting_error { page = page.push(padded_control(error_text(tr("Could not save the setting.")))); }
+        page = page.push(padded_control(dim(format!("Maprisma Lights v{}", env!("CARGO_PKG_VERSION")))));
         let page = page.width(if self.window_mode { Length::Fill } else { Length::Fixed(POPUP_WIDTH) }).padding([0, 0, 8, 0]);
         scrollable(page).height(if self.window_mode { Length::Fill } else { Length::Shrink }).into()
     }
@@ -5148,7 +5183,11 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             Message::ScheduleToggle(id, enabled) => {
                 self.send(json!({"cmd": "schedule_toggle", "id": id, "enabled": enabled}));
             }
+            Message::ScheduleConfirmDelete(id) => {
+                self.confirm_delete_schedule = id;
+            }
             Message::ScheduleDelete(id) => {
+                self.confirm_delete_schedule = None;
                 self.send(json!({"cmd": "schedule_delete", "id": id}));
             }
 
@@ -5267,7 +5306,11 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             Message::RuleToggle(id, enabled) => {
                 self.send(json!({"cmd": "rule_toggle", "id": id, "enabled": enabled}));
             }
+            Message::RuleConfirmDelete(id) => {
+                self.confirm_delete_rule = id;
+            }
             Message::RuleDelete(id) => {
+                self.confirm_delete_rule = None;
                 self.send(json!({"cmd": "rule_delete", "id": id}));
             }
             Message::ToggleActivity => {

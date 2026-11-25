@@ -38,7 +38,7 @@ pub fn menu() -> Item {
     };
     let mut root = item(0, "", None);
     root.children = vec![
-        item(1, &tr("Open Maprisma Hue Lights"), Some(Action::Open)),
+        item(1, &tr("Open Maprisma Lights"), Some(Action::Open)),
         item(2, &tr("Quit tray"), Some(Action::Quit)),
     ];
     let mut languages = item(3, &tr("Language"), None);
@@ -58,7 +58,7 @@ mod tests {
     fn menu_actions() {
         let m = menu();
         assert_eq!(m.children.len(), 3);
-        assert_eq!(m.find(1).unwrap().label, "Open Maprisma Hue Lights");
+        assert_eq!(m.find(1).unwrap().label, "Open Maprisma Lights");
         assert_eq!(m.activate(1), Some(Action::Open));
         assert_eq!(m.activate(2), Some(Action::Quit));
         assert_eq!(m.activate(0), None);

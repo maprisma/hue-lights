@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MCP (Model Context Protocol) JSON-RPC 2.0 stdio server for Maprisma Hue Lights.
+"""MCP (Model Context Protocol) JSON-RPC 2.0 stdio server for Maprisma Lights.
 
 Reuses scripts/hue-lights.py directly (zero external dependencies, Python 3 stdlib only).
 All bridge communication goes through Hue.api() / Hue.refresh() with pinned TLS.
@@ -227,7 +227,7 @@ TOOLS = [
     },
     {
         "name": "hue_get_floorplan",
-        "description": "Get the current Hue Lights floorplan document (template_id, canvas, room/zone boxes, lamp positions, and sensor positions).",
+        "description": "Get the current Maprisma Lights floorplan document (template_id, canvas, room/zone boxes, lamp positions, and sensor positions).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -474,7 +474,7 @@ class HueMCPServer:
         with self.hue.lock:
             paired = bool(self.hue.config)
         if not paired:
-            raise ToolError("Hue Bridge is not paired. Pair a Hue Bridge in Hue Lights first.")
+            raise ToolError("Hue Bridge is not paired. Pair a Hue Bridge in Maprisma Lights first.")
         self._ensure_fresh(force=force_refresh)
 
     def _api(self, method, path, body=None):

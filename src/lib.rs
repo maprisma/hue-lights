@@ -5,7 +5,7 @@ pub mod look;
 use i18n::{tr, trf};
 use serde_json::Value;
 use std::path::PathBuf;
-pub const TITLE: &str = "Maprisma Hue Lights";
+pub const TITLE: &str = "Maprisma Lights";
 pub const ICON: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights-symbolic";
 /// The bulb when no light is on (data/icons/hue-bulb-off-symbolic.svg, installed under this name).
 pub const ICON_OFF: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights-off-symbolic";

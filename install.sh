@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build and install Maprisma Hue Lights for the current user (no root needed):
-#   ~/.local/bin/maprisma-hue-lights                   the applet
-#   ~/.local/share/maprisma-hue-lights/scripts/        the bridge helper
+# Build and install Maprisma Lights for the current user (no root needed):
+#   ~/.local/bin/maprisma-hue-lights                   the applet (symlinked as maprisma-lights)
+#   ~/.local/share/maprisma-hue-lights/scripts/        the bridge & multi-brand helper
 #   ~/.local/share/applications/…desktop             makes it an applet for the panel
 #   ~/.local/share/icons/hicolor/scalable/apps/…svg  the bulb icons (lit, lit in the accent, off)
 # Then add it in COSMIC Settings › Desktop › Panel › Applets.
@@ -14,6 +14,7 @@ bin="$HOME/.local/bin"
 cargo build --release
 install -Dm755 target/release/maprisma-hue-lights "$bin/maprisma-hue-lights"
 install -Dm755 target/release/maprisma-hue-lights-tray "$bin/maprisma-hue-lights-tray"
+ln -sf maprisma-hue-lights "$bin/maprisma-lights"
 # Desktop Exec has two escaping layers: argument quoting, then string-value escaping.
 desktop_exec() {
     local v=$1
@@ -31,22 +32,22 @@ tray_exec="$(desktop_exec "$bin/maprisma-hue-lights-tray")"
 cat > "$data/applications/$id.Window.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Maprisma Hue Lights
-Name[de]=Maprisma Hue Lights
-Comment[de]=Philips-Hue-Räume, Zonen, Lampen und Szenen in der Leiste
-Name[fr]=Maprisma Hue Lights
-Comment[fr]=Pièces, zones, lampes et scènes Philips Hue dans le panneau
-Name[es]=Maprisma Hue Lights
-Comment[es]=Habitaciones, zonas, luces y escenas Philips Hue en el panel
-Name[it]=Maprisma Hue Lights
-Comment[it]=Stanze, zone, luci e scene Philips Hue nel pannello
-Name[pt]=Maprisma Hue Lights
-Comment[pt]=Divisões, zonas, luzes e cenas Philips Hue no painel
-Name[nl]=Maprisma Hue Lights
-Comment[nl]=Philips Hue-kamers, zones, lampen en scènes in het paneel
-Name[pl]=Maprisma Hue Lights
-Comment[pl]=Pokoje, strefy, lampy i sceny Philips Hue w panelu
-Comment=Philips Hue rooms, zones, lights and scenes in the panel
+Name=Maprisma Lights
+Name[de]=Maprisma Lights
+Comment[de]=Smarte Beleuchtung für mehrere Marken & Grundriss-Studio in der Leiste
+Name[fr]=Maprisma Lights
+Comment[fr]=Éclairage connecté multimarque et Studio Plan dans le panneau
+Name[es]=Maprisma Lights
+Comment[es]=Iluminación inteligente multimarca y estudio de planos en el panel
+Name[it]=Maprisma Lights
+Comment[it]=Illuminazione smart multimarca e studio planimetrie nel pannello
+Name[pt]=Maprisma Lights
+Comment[pt]=Iluminação inteligente multimarca e estúdio de plantas no painel
+Name[nl]=Maprisma Lights
+Comment[nl]=Slimme verlichting voor meerdere merken en plattegrondstudio in het paneel
+Name[pl]=Maprisma Lights
+Comment[pl]=Inteligentne oświetlenie wielu marek i studio planów w panelu
+Comment=Multi-brand smart lighting & Visual Floorplan Studio in the panel
 Exec=$window_exec
 Icon=$id-symbolic
 Terminal=false
@@ -57,14 +58,14 @@ EOF
 cat > "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$id.Tray.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Maprisma Hue Lights Tray
-Name[de]=Maprisma Hue Lights – Tray
-Name[fr]=Maprisma Hue Lights – Zone de notification
-Name[es]=Maprisma Hue Lights – Bandeja
-Name[it]=Maprisma Hue Lights – Area di notifica
-Name[pt]=Maprisma Hue Lights – Bandeja
-Name[nl]=Maprisma Hue Lights – Systeemvak
-Name[pl]=Maprisma Hue Lights – Zasobnik
+Name=Maprisma Lights Tray
+Name[de]=Maprisma Lights – Tray
+Name[fr]=Maprisma Lights – Zone de notification
+Name[es]=Maprisma Lights – Bandeja
+Name[it]=Maprisma Lights – Area di notifica
+Name[pt]=Maprisma Lights – Bandeja
+Name[nl]=Maprisma Lights – Systeemvak
+Name[pl]=Maprisma Lights – Zasobnik
 Exec=$tray_exec
 Icon=$id-symbolic
 Terminal=false
@@ -94,4 +95,4 @@ while IFS= read -r line; do
     fi
 done < "data/$id.desktop" > "$data/applications/$id.desktop"
 gtk-update-icon-cache -q -t "$data/icons/hicolor" 2>/dev/null || true
-echo "Installed. Add “Maprisma Hue Lights” in COSMIC Settings › Desktop › Panel › Applets."
+echo "Installed. Add “Maprisma Lights” in COSMIC Settings › Desktop › Panel › Applets."

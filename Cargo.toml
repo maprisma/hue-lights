@@ -1,9 +1,9 @@
 [package]
 name = "maprisma-hue-lights"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
-description = "Philips Hue desktop & panel app for COSMIC, KDE and Hyprland: Visual Floorplan Studio, lamp icons, rooms, Light Themes, schedules, wired rules & Audio Light Synth"
+description = "Maprisma Lights: multi-brand local smart lighting & Floorplan Studio for Linux (COSMIC, KDE, Hyprland)"
 
 [[bin]]
 name = "maprisma-hue-lights-tray"

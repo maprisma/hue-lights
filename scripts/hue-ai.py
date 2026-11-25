@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local-first natural-language Ask AI engine for Maprisma Hue Lights.
+"""Local-first natural-language Ask AI engine for Maprisma Lights.
 
 Zero external dependencies (Python 3 standard library only). Works 100% offline
 out-of-the-box for English and German commands (lights, rooms, scenes, themes,

@@ -1,4 +1,4 @@
-//! Help & Feature Guide page for Maprisma Hue Lights.
+//! Help & Feature Guide page for Maprisma Lights.
 //!
 //! Renders an App-Store-style feature tour listing the 7 major capabilities of the
 //! app, each paired with a live, smooth-looping pure-vector animated mini-canvas
@@ -117,7 +117,7 @@ const FEATURES: [FeatureSpec; 9] = [
         summary: "Turn Hue Bridge Pro lights into radar-like motion areas and bring your physical Hue motion sensors, door contacts, and dimmer switches onto the map.",
         steps: &[
             "On a Hue Bridge Pro, open the Philips Hue mobile app → Settings → MotionAware, select 3+ lights in a room, and run the 30-second calibration once.",
-            "Return to Maprisma Hue Lights — live green presence badges appear automatically on MotionAware rooms and lamps.",
+            "Return to Maprisma Lights — live green presence badges appear automatically on MotionAware rooms and lamps.",
             "Click a MotionAware room on the Map to toggle detection on/off or adjust its radar sensitivity slider.",
             "Place physical Hue motion sensors, contact sensors, or switches from the Map sidebar onto the canvas and wire them to lamps in Rules mode.",
         ],
@@ -154,7 +154,7 @@ const FEATURES: [FeatureSpec; 9] = [
         kind: AnimKind::Skins,
         title: "Skins, Icons & Shortcuts",
         desc: "Personalize the whole app with 6 skins, 8 panel icons, custom corners, and 8 languages. Press F12 anytime to save a screenshot, or Esc to close dialogs.",
-        summary: "Match Maprisma Hue Lights to your desktop setup with custom skins, panel icons, corner rounding, text scaling, and handy keyboard shortcuts.",
+        summary: "Match Maprisma Lights to your desktop setup with custom skins, panel icons, corner rounding, text scaling, and handy keyboard shortcuts.",
         steps: &[
             "Click the gear icon in the top-right header to open Settings.",
             "Pick an App skin (Native, Synthwave, Cozy, Terminal, Disco, or Zen), a Panel icon, corner style, and language.",
@@ -182,7 +182,7 @@ const FEATURES: [FeatureSpec; 9] = [
         desc: "Use your Hue Bridge from external AI coding and desktop agents via the built-in local stdio MCP server (maprisma-hue-lights --mcp or maprisma-hue-mcp). Credentials stay private.",
         summary: "Connect external AI assistants and coding agents to your Philips Hue Bridge over local stdio MCP while keeping your bridge key private on this machine.",
         steps: &[
-            "Pair your Hue Bridge in Maprisma Hue Lights once so your local configuration is saved.",
+            "Pair your Hue Bridge in Maprisma Lights once so your local configuration is saved.",
             "In your AI agent's MCP server configuration, register the command \"maprisma-hue-lights\" with argument \"--mcp\" (or \"maprisma-hue-mcp\").",
             "Restart your AI client to expose safe tools for reading lights, switching rooms, recalling scenes, and managing schedules.",
         ],
