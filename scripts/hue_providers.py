@@ -233,8 +233,16 @@ def is_extra_resource(rid):
     return provider_prefix(rid) != "hue"
 
 
+# Home LAN ranges only: RFC 1918 plus IPv4 link-local. ipaddress.is_private also covers
+# 0/8, 100.64/10 (CGNAT), 192.0.0/24, 198.18/15 (benchmarking) and documentation ranges.
+LAN_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
+))
+LOOPBACK_NETWORK = ipaddress.ip_network("127.0.0.0/8")
+
+
 def _is_allowed_ipv4(ip_str, allow_loopback=False):
-    if ip_str == METADATA_IP:
+    if not isinstance(ip_str, str) or ip_str == METADATA_IP:
         return False
     try:
         ip = ipaddress.ip_address(ip_str)
@@ -242,9 +250,11 @@ def _is_allowed_ipv4(ip_str, allow_loopback=False):
         return False
     if ip.version != 4:
         return False
-    if ip.is_loopback:
+    if ip in LOOPBACK_NETWORK:
         return bool(allow_loopback)
-    return (ip.is_private or ip.is_link_local) and not ip.is_multicast and not ip.is_unspecified
+    if ip == ipaddress.ip_address(METADATA_IP):
+        return False
+    return any(ip in net for net in LAN_NETWORKS)
 
 
 def valid_local_host(host, allow_loopback=False):
@@ -504,8 +514,26 @@ def _http_request(
     else:
         conn = http.client.HTTPConnection(ip, int(port), timeout=timeout)
 
+    # Watchdog for the whole request: socket timeouts restart on every read, so a device that drips
+    # header or body bytes could otherwise hold this thread far past `timeout`.
+    expired = threading.Event()
+    sock_ref = []  # the connected socket: http.client drops conn.sock after "Connection: close" headers
+
+    def _expire():
+        expired.set()
+        sock = sock_ref[0] if sock_ref else getattr(conn, "sock", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    watchdog = threading.Timer(max(0.0, deadline - time.monotonic()), _expire)
+    watchdog.daemon = True
+    watchdog.start()
     try:
         conn.connect()
+        sock_ref.append(conn.sock)
         if use_https:
             der = conn.sock.getpeercert(binary_form=True)
             if not der:
@@ -536,8 +564,15 @@ def _http_request(
             if total > max_body:
                 raise ProviderError("Response too large.")
             chunks.append(chunk)
+        if expired.is_set():
+            raise ProviderError("Response timed out.")
         return resp.status, b"".join(chunks)
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        if expired.is_set():
+            raise ProviderError("Request timed out.") from exc
+        raise
     finally:
+        watchdog.cancel()
         try:
             conn.close()
         except OSError:
@@ -1504,6 +1539,8 @@ class ProviderManager:
         self.connections = []
         self.conn_generations = {}     # conn_id -> int (bumped on edit/toggle/remove)
         self.results = {}              # conn_id -> {"rooms", "sensors", "light_count", "on_count"}
+        self.results_gen = {}          # conn_id -> generation the current results were fetched under
+        self._save_lock = threading.Lock()  # one providers.json snapshot+write+replace at a time
         self.connected = {}            # conn_id -> bool
         self.errors = {}               # conn_id -> str
         self.wled_effects = {}         # conn_id -> [str]
@@ -1521,7 +1558,9 @@ class ProviderManager:
         self._next_poll_at = {}        # conn_id -> monotonic timestamp
         # Server-side one-time pairing tokens (never emitted in snapshots!)
         self._paired_tokens = {}       # pair_id -> {"kind", "host", "port", "token", "fp", "expires"}
-        self._pending_cmds = {}        # (kind, rid) -> body (coalesced & bounded)
+        self._send_locks = {}          # conn_id -> Lock held while a command is sent / the connection is edited
+        self._spare_send_lock = threading.Lock()
+        self._pending_cmds = {}        # (kind, rid) -> (conn generation, body) (coalesced & bounded)
         self._refresh_hold_until = 0.0
         self._last_refresh = 0.0
         self._worker_wake = threading.Event()
@@ -1543,7 +1582,8 @@ class ProviderManager:
 
     def load(self):
         path = self._path()
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        # O_NONBLOCK: a FIFO planted at this path must not block the helper before fstat rejects it
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
             fd = os.open(path, flags)
         except FileNotFoundError:
@@ -1567,10 +1607,13 @@ class ProviderManager:
                     self._load_blocked = True
                     self.load_warning = "providers.json permissions are too open and could not be fixed — refusing to overwrite."
                     return
-            with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            with os.fdopen(fd, "rb") as fh:
                 fd = -1
-                raw = json.load(fh)
-        except (OSError, ValueError):
+                blob = fh.read(262145)
+            if len(blob) > 262144:
+                raise ValueError("providers.json too large")
+            raw = json.loads(blob.decode("utf-8"))
+        except (OSError, ValueError, RecursionError):
             self._load_blocked = True
             self.load_warning = "providers.json could not be parsed — refusing to overwrite."
             return
@@ -1580,13 +1623,20 @@ class ProviderManager:
                     os.close(fd)
                 except OSError:
                     pass
-        items = raw.get("providers") if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+        items = raw.get("providers") if isinstance(raw, dict) else raw
+        if not isinstance(items, list):
+            self._load_blocked = True
+            self.load_warning = "providers.json could not be parsed — refusing to overwrite."
+            return
         loaded = []
         seen = set()
         for entry in items:
             if len(loaded) >= MAX_PROVIDERS:
                 break
-            clean_c = sanitize_connection(entry)
+            try:
+                clean_c = sanitize_connection(entry)
+            except (TypeError, ValueError, AttributeError, KeyError, RecursionError):
+                clean_c = None
             if clean_c and clean_c["id"] not in seen:
                 seen.add(clean_c["id"])
                 loaded.append(clean_c)
@@ -1598,19 +1648,30 @@ class ProviderManager:
     def save(self):
         if self._load_blocked:
             raise ProviderError(self.load_warning or "Could not load providers.json — refusing to overwrite.")
-        self._ensure_private_dir()
-        with self.lock:
-            payload = {"version": 1, "providers": list(self.connections)}
-        data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-        path = self._path()
-        tmp = os.path.join(self.config_dir, f".providers.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
+        # Snapshot, write and replace as one step, so a slower save of older state (e.g. a poll
+        # thread pinning a certificate) can never replace a newer one. Lock order: _save_lock, then lock.
+        with self._save_lock:
+            self._ensure_private_dir()
+            with self.lock:
+                payload = {"version": 1, "providers": copy.deepcopy(self.connections)}
+            data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            path = self._path()
+            tmp = os.path.join(self.config_dir, f".providers.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            except BaseException:
+                os.close(fd)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
             os.close(fd)
-        os.replace(tmp, path)
+            os.replace(tmp, path)
 
     def secrets(self):
         with self.lock:
@@ -1686,6 +1747,10 @@ class ProviderManager:
         return cand
 
     def trust_new_certificate(self, cid):
+        with self._send_lock(cid):
+            return self._trust_new_certificate_unlocked(cid)
+
+    def _trust_new_certificate_unlocked(self, cid):
         """B4: Clear the pinned TLS fingerprint while keeping the connection ID and saved token."""
         found = False
         with self.lock:
@@ -1693,6 +1758,7 @@ class ProviderManager:
                 if c["id"] == cid:
                     c["cert_fingerprint"] = ""
                     self.conn_generations[cid] = self.conn_generations.get(cid, 0) + 1
+                    self._drop_pending_for(cid)
                     self.errors.pop(cid, None)
                     self._fail_counts.pop(cid, None)
                     self._next_poll_at.pop(cid, None)
@@ -1708,6 +1774,15 @@ class ProviderManager:
         clean_c = self._resolve_saved_or_paired_secret(raw, consume_pair=True)
         if not clean_c:
             raise ProviderError("Invalid device configuration (check local IP / host).")
+        with self.lock:
+            if not any(c["id"] == clean_c["id"] for c in self.connections):
+                # A new device never reuses an ID the panel names: IDs (and their generations) of
+                # removed devices are never seen again.
+                clean_c["id"] = uuid.uuid4().hex[:12]
+        with self._send_lock(clean_c["id"]):
+            return self._save_connection_unlocked(clean_c)
+
+    def _save_connection_unlocked(self, clean_c):
         meta = PROVIDER_KINDS[clean_c["kind"]]
         if meta["requires_token"] and not clean_c["token"]:
             raise ProviderError("Access token is required (enter a token or re-pair for this host).")
@@ -1730,6 +1805,8 @@ class ProviderManager:
                     raise ProviderError("Maximum number of devices reached.")
                 self.connections.append(clean_c)
             self.conn_generations[clean_c["id"]] = self.conn_generations.get(clean_c["id"], 0) + 1
+            self._drop_pending_for(clean_c["id"])
+            self._forget_device_state(clean_c["id"])
             self.errors.pop(clean_c["id"], None)
             self._fail_counts.pop(clean_c["id"], None)
             self._next_poll_at.pop(clean_c["id"], None)
@@ -1738,25 +1815,35 @@ class ProviderManager:
         return clean_c
 
     def remove_connection(self, cid):
+        with self._send_lock(cid):
+            return self._remove_connection_unlocked(cid)
+
+    def _remove_connection_unlocked(self, cid):
         with self.lock:
+            if not any(c["id"] == cid for c in self.connections):
+                return False  # unknown ID from the panel: nothing to change, nothing remembered
             self.connections = [c for c in self.connections if c["id"] != cid]
-            self.conn_generations[cid] = self.conn_generations.get(cid, 0) + 1
-            self.results.pop(cid, None)
-            self.connected.pop(cid, None)
+            self._drop_pending_for(cid)
+            self._forget_device_state(cid)
+            # IDs are never reused (save_connection), so all per-ID bookkeeping can go.
+            self.conn_generations.pop(cid, None)
+            self._send_locks.pop(cid, None)
             self.errors.pop(cid, None)
-            self.wled_effects.pop(cid, None)
-            self.nanoleaf_scenes.pop(cid, None)
-            self.lifx_state.pop(cid, None)
-            self.shelly_meta = {k: v for k, v in self.shelly_meta.items() if not k.startswith(f"shelly:{cid}:")}
-            self.dirigera_kelvin = {k: v for k, v in self.dirigera_kelvin.items() if not k.startswith(f"dirigera:{cid}:")}
+            self._fail_counts.pop(cid, None)
+            self._next_poll_at.pop(cid, None)
         self.save()
 
     def toggle_connection(self, cid, enabled):
+        with self._send_lock(cid):
+            return self._toggle_connection_unlocked(cid, enabled)
+
+    def _toggle_connection_unlocked(self, cid, enabled):
         with self.lock:
             for c in self.connections:
                 if c["id"] == cid:
                     c["enabled"] = bool(enabled)
                     self.conn_generations[cid] = self.conn_generations.get(cid, 0) + 1
+                    self._drop_pending_for(cid)
                     if not enabled:
                         self.results.pop(cid, None)
                         self.connected[cid] = False
@@ -1812,14 +1899,42 @@ class ProviderManager:
         self._refresh_hold_until = 0.0
         self._worker_wake.set()
 
+    @staticmethod
+    def _rid_conn_id(rid):
+        parts = str(rid or "").split(":", 2)
+        return parts[1] if len(parts) >= 2 else ""
+
+    def _forget_device_state(self, cid):
+        """Drop everything learned from a connection's previous target (caller holds self.lock)."""
+        self.results.pop(cid, None)
+        self.results_gen.pop(cid, None)
+        self.connected.pop(cid, None)
+        self.wled_effects.pop(cid, None)
+        self.nanoleaf_scenes.pop(cid, None)
+        self.lifx_state.pop(cid, None)
+        self.shelly_meta = {k: v for k, v in self.shelly_meta.items() if not k.startswith(f"shelly:{cid}:")}
+        self.dirigera_kelvin = {k: v for k, v in self.dirigera_kelvin.items() if not k.startswith(f"dirigera:{cid}:")}
+
+    def _drop_pending_for(self, cid):
+        """Forget queued commands of one connection (caller holds self.lock): after an edit, a
+        toggle or a removal they must never reach the new or a removed host."""
+        for key in [k for k in self._pending_cmds if self._rid_conn_id(k[1]) == cid]:
+            del self._pending_cmds[key]
+
     def queue_command(self, kind, rid, body):
         with self.lock:
             key = (kind, rid)
             if key not in self._pending_cmds and len(self._pending_cmds) >= MAX_PENDING_EXTRA:
                 return False
-            merged = dict(self._pending_cmds.get(key, {}))
+            cid = self._rid_conn_id(rid)
+            gen = self.conn_generations.get(cid, 0)
+            if self.results_gen.get(cid) != gen:
+                # The light/scene was learned from an earlier target (or not yet from this one).
+                return False
+            prev = self._pending_cmds.get(key)
+            merged = dict(prev[1]) if prev and prev[0] == gen else {}
             merged.update(body)
-            self._pending_cmds[key] = merged
+            self._pending_cmds[key] = (gen, merged)
             self._refresh_hold_until = time.time() + 1.5
         self._worker_wake.set()
         return True
@@ -1828,16 +1943,16 @@ class ProviderManager:
         with self.lock:
             if not self._pending_cmds:
                 return False
-            key, body = next(iter(self._pending_cmds.items()))
+            key, (gen, body) = next(iter(self._pending_cmds.items()))
             del self._pending_cmds[key]
         kind, rid = key
         try:
             if kind == "scene":
-                self.recall_scene(rid)
+                self.recall_scene(rid, gen=gen)
                 self._refresh_hold_until = time.time() + 0.5
                 self._last_refresh = 0.0
             else:
-                self.set_light(rid, body)
+                self.set_light(rid, body, gen=gen)
         except Exception as exc:  # noqa: BLE001
             parts = rid.split(":", 2)
             if len(parts) >= 2:
@@ -1893,7 +2008,9 @@ class ProviderManager:
             pass
         return {}
 
-    def fetch_single(self, conn, gen=None):
+    def fetch_single(self, conn, gen=None, commit=True):
+        """Fetch one device. Learned metadata (effects, scenes, meta) is kept only when `commit` and
+        the connection still has generation `gen`, so tests and stale polls never overwrite it."""
         kind = conn["kind"]
         host, port = conn["host"], conn["port"]
         token = conn.get("token", "")
@@ -1919,7 +2036,12 @@ class ProviderManager:
             if fp_capture and gen is not None:
                 self._persist_captured_fp(conn["id"], gen, fp_capture[0])
             states = json.loads(raw.decode("utf-8"))
-            areas = self._fetch_ha_areas(conn, hdrs, fp_capture)
+            # Pin the follow-up request to the certificate just seen (trust on first use), so a
+            # certificate swap between the two requests cannot receive the bearer token.
+            pinned_conn = dict(conn)
+            if conn["use_https"] and not expected_fp and fp_capture:
+                pinned_conn["cert_fingerprint"] = fp_capture[0]
+            areas = self._fetch_ha_areas(pinned_conn, hdrs, [])
             rooms, sensors = parse_home_assistant_states(conn, states, entity_areas=areas)
             return rooms, sensors
 
@@ -1937,7 +2059,8 @@ class ProviderManager:
                 pass
             rooms, sensors, effects = parse_wled(conn, data, presets)
             with self.lock:
-                self.wled_effects[conn["id"]] = effects
+                if commit and self._gen_current(conn["id"], gen):
+                    self.wled_effects[conn["id"]] = effects
             return rooms, sensors
 
         if kind == "wiz":
@@ -1953,7 +2076,8 @@ class ProviderManager:
             if not decoded:
                 raise ProviderError("No LAN response from LIFX device.")
             with self.lock:
-                self.lifx_state[conn["id"]] = decoded
+                if commit and self._gen_current(conn["id"], gen):
+                    self.lifx_state[conn["id"]] = decoded
             return lifx_to_rooms(conn, decoded)
 
         if kind == "govee":
@@ -1983,7 +2107,8 @@ class ProviderManager:
             data = json.loads(raw.decode("utf-8"))
             rooms, sensors, scene_map = parse_nanoleaf(conn, data)
             with self.lock:
-                self.nanoleaf_scenes[conn["id"]] = scene_map
+                if commit and self._gen_current(conn["id"], gen):
+                    self.nanoleaf_scenes[conn["id"]] = scene_map
             return rooms, sensors
 
         if kind == "shelly":
@@ -1998,7 +2123,8 @@ class ProviderManager:
                     if 200 <= s2 < 300:
                         rooms, sensors, meta_map = parse_shelly_gen2(conn, json.loads(r1.decode("utf-8")), json.loads(r2.decode("utf-8")))
                         with self.lock:
-                            self.shelly_meta.update(meta_map)
+                            if commit and self._gen_current(conn["id"], gen):
+                                self.shelly_meta.update(meta_map)
                         return rooms, sensors
             except ProviderError:
                 raise
@@ -2011,7 +2137,8 @@ class ProviderManager:
                 raise ProviderError(f"Shelly HTTP {st}")
             rooms, sensors, meta_map = parse_shelly_gen1(conn, json.loads(raw.decode("utf-8")))
             with self.lock:
-                self.shelly_meta.update(meta_map)
+                if commit and self._gen_current(conn["id"], gen):
+                    self.shelly_meta.update(meta_map)
             return rooms, sensors
 
         if kind == "dirigera":
@@ -2041,7 +2168,8 @@ class ProviderManager:
                 pass
             rooms, sensors, k_bounds = parse_dirigera(conn, devices, raw_scenes)
             with self.lock:
-                self.dirigera_kelvin.update(k_bounds)
+                if commit and self._gen_current(conn["id"], gen):
+                    self.dirigera_kelvin.update(k_bounds)
             return rooms, sensors
 
         raise ProviderError(f"Unknown provider: {kind}")
@@ -2051,7 +2179,9 @@ class ProviderManager:
         if not clean_c:
             raise ProviderError("Invalid host or configuration.")
         try:
-            rooms, _sensors = self.fetch_single(clean_c)
+            # commit=False: a test (maybe of an edited, unsaved host under a saved ID) never
+            # touches the saved connection's cached effects, scenes or device metadata.
+            rooms, _sensors = self.fetch_single(clean_c, commit=False)
         except Exception as exc:  # noqa: BLE001
             redacted = self.redact(str(exc), extra_secrets={clean_c.get("token", "")})
             raise ProviderError(friendly_provider_error(redacted)) from exc
@@ -2085,6 +2215,7 @@ class ProviderManager:
                     self.errors[cid] = ""
                     return
                 self.results[cid] = {"rooms": rooms, "sensors": sensors, "light_count": lcount, "on_count": ocount}
+                self.results_gen[cid] = gen
                 self.connected[cid] = True
                 self.errors[cid] = ""
             else:
@@ -2135,13 +2266,20 @@ class ProviderManager:
                     pass
                 self._drain_pending()
 
-    def set_light(self, rid, body):
+    def set_light(self, rid, body, gen=None):
+        # Held for the whole send: edit/toggle/remove/trust of this connection wait until it is done,
+        # so a command can never go to a host that was replaced while it was in flight.
+        with self._send_lock(self._rid_conn_id(rid)):
+            return self._set_light_unlocked(rid, body, gen)
+
+    def _set_light_unlocked(self, rid, body, gen=None):
         parts = rid.split(":", 2)
         if len(parts) < 3:
             return
         _prefix, cid, rest = parts[0], parts[1], parts[2]
         with self.lock:
-            conn = next((dict(c) for c in self.connections if c["id"] == cid and c.get("enabled")), None)
+            # A command queued for a host that was edited meanwhile is dropped, not sent to the new host.
+            conn = self._conn_for(cid, gen)
             wled_fx = list(self.wled_effects.get(cid, []))
             shelly_meta = dict(self.shelly_meta.get(rid, {}))
             lifx_st = dict(self.lifx_state.get(cid, {}))
@@ -2299,13 +2437,41 @@ class ProviderManager:
                     expected_fp=expected_fp,
                 )
 
-    def recall_scene(self, rid):
+    def _gen_current(self, cid, gen):
+        """Caller holds self.lock. True when `gen` is None (direct call) or still current for `cid`."""
+        return gen is None or self.conn_generations.get(cid) == gen
+
+    def _send_lock(self, cid):
+        """Per-connection send/edit lock. Only saved connections get their own lock (the panel can
+        name arbitrary IDs, so unknown ones share one lock instead of growing the table)."""
+        cid = str(cid or "")
+        with self.lock:
+            lk = self._send_locks.get(cid)
+            if lk is None:
+                if any(c["id"] == cid for c in self.connections):
+                    lk = self._send_locks[cid] = threading.Lock()
+                else:
+                    lk = self._spare_send_lock
+            return lk
+
+    def _conn_for(self, cid, gen):
+        """Enabled connection `cid` as a copy, only while it still has generation `gen` (None: any).
+        Caller holds self.lock, so the check and the choice of host happen together."""
+        if gen is not None and self.conn_generations.get(cid, 0) != gen:
+            return None
+        return next((dict(c) for c in self.connections if c["id"] == cid and c.get("enabled")), None)
+
+    def recall_scene(self, rid, gen=None):
+        with self._send_lock(self._rid_conn_id(rid)):
+            return self._recall_scene_unlocked(rid, gen)
+
+    def _recall_scene_unlocked(self, rid, gen=None):
         parts = rid.split(":", 2)
         if len(parts) < 3:
             return
         _prefix, cid, rest = parts[0], parts[1], parts[2]
         with self.lock:
-            conn = next((dict(c) for c in self.connections if c["id"] == cid and c.get("enabled")), None)
+            conn = self._conn_for(cid, gen)
             nano_map = dict(self.nanoleaf_scenes.get(cid, {}))
         if not conn:
             return

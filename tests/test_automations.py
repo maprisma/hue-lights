@@ -1263,9 +1263,13 @@ ENT_SVC1 = "eeeeeeee-1111-1111-1111-111111111111"
 ENT_SVC2 = "eeeeeeee-2222-2222-2222-222222222222"
 ENT_SVC3 = "eeeeeeee-3333-3333-3333-333333333333"
 
-MINIMAL_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + b"\x00" * 16
-MINIMAL_JPG = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
-MINIMAL_WEBP = b"RIFF\x14\x00\x00\x00WEBPVP8 \x08\x00\x00\x00\x00\x00\x00\x00"
+MINIMAL_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + struct.pack(">II", 16, 16) + b"\x08\x02\x00\x00\x00"
+MINIMAL_JPG = (
+    b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+    b"\xff\xc0\x00\x0b\x08" + struct.pack(">HH", 16, 16) + b"\x01\x01\x11\x00\xff\xd9"
+)
+MINIMAL_WEBP = b"RIFF\x1a\x00\x00\x00WEBPVP8 \x0e\x00\x00\x00\x30\x01\x00\x9d\x01\x2a" + struct.pack("<HH", 16, 16)
+BOMB_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + struct.pack(">II", 20000, 20000) + b"\x08\x02\x00\x00\x00"
 
 
 def sample_floorplan_resources():

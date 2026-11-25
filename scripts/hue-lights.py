@@ -116,6 +116,13 @@ _LAMP_ICON_ALIASES = {
 FLOORPLAN_BG_FITS = ("contain", "cover")
 FLOORPLAN_BG_EXTS = (".png", ".jpg", ".jpeg", ".webp")
 FLOORPLAN_BG_PREFIX = "floorplan_bg."
+MANAGED_FLOORPLAN_BG_NAMES = frozenset({
+    FLOORPLAN_BG_PREFIX + "png",
+    FLOORPLAN_BG_PREFIX + "jpg",
+    FLOORPLAN_BG_PREFIX + "webp",
+})
+MAX_FLOORPLAN_BG_DIM = 16384
+MAX_FLOORPLAN_BG_PIXELS = 64 * 1024 * 1024
 HUE_ARCHETYPES = frozenset({
     "living_room", "kitchen", "dining", "bedroom", "kids_bedroom",
     "bathroom", "nursery", "recreation", "office", "gym", "hallway",
@@ -191,13 +198,22 @@ def valid_uuid(value):
     return isinstance(value, str) and UUID_RE.match(value) is not None
 
 
+# Home LAN only: RFC 1918 and IPv4 link-local. ipaddress.is_private also covers 0/8, 192.0.0/24,
+# 198.18/15 (benchmarking) and the documentation ranges.
+BRIDGE_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
+))
+
+
 def valid_bridge_ip(value):
-    """Only private / link-local IPv4 literals: the bridge is always on the LAN."""
+    """Only home-LAN IPv4 literals: the bridge is always on the LAN."""
     try:
         ip = ipaddress.IPv4Address(str(value))
     except (ipaddress.AddressValueError, ValueError):
         return False
-    return ip.is_private and not ip.is_loopback and not ip.is_unspecified and not ip.is_multicast
+    if str(ip) == "169.254.169.254":
+        return False
+    return any(ip in net for net in BRIDGE_NETWORKS)
 
 
 def clamp(value, low, high):
@@ -2055,6 +2071,63 @@ def _strict_finite(value, low, high):
     if not math.isfinite(num):
         return None
     return clamp(num, low, high)
+
+
+def _image_dimensions(data, ext):
+    """Parse declared (width, height) from PNG/JPEG/WEBP headers, or return None if invalid."""
+    if not isinstance(data, (bytes, bytearray)):
+        return None
+    if ext == ".png":
+        if len(data) < 24 or data[12:16] != b"IHDR":
+            return None
+        w, h = struct.unpack(">II", data[16:24])
+        return (w, h)
+    if ext == ".jpg":
+        pos = 2
+        n = len(data)
+        sof = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+        while pos + 4 <= n:
+            if data[pos] != 0xFF:
+                return None
+            while pos < n and data[pos] == 0xFF:
+                pos += 1
+            if pos >= n:
+                return None
+            marker = data[pos]
+            pos += 1
+            if marker in (0xD8, 0xD9, 0x01) or (0xD0 <= marker <= 0xD7):
+                continue
+            if pos + 2 > n:
+                return None
+            seg_len = struct.unpack(">H", data[pos:pos + 2])[0]
+            if seg_len < 2 or pos + seg_len > n:
+                return None
+            if marker in sof:
+                if seg_len < 7:
+                    return None
+                h, w = struct.unpack(">HH", data[pos + 3:pos + 7])
+                return (w, h)
+            pos += seg_len
+        return None
+    if ext == ".webp":
+        if len(data) < 25:
+            return None
+        fourcc = data[12:16]
+        if fourcc == b"VP8X" and len(data) >= 30:
+            w = 1 + int.from_bytes(data[24:27], "little")
+            h = 1 + int.from_bytes(data[27:30], "little")
+            return (w, h)
+        if fourcc == b"VP8 " and len(data) >= 30 and data[23:26] == b"\x9d\x01\x2a":
+            w = struct.unpack("<H", data[26:28])[0] & 0x3FFF
+            h = struct.unpack("<H", data[28:30])[0] & 0x3FFF
+            return (w, h)
+        if fourcc == b"VP8L" and len(data) >= 25 and data[20] == 0x2F:
+            bits = struct.unpack("<I", data[21:25])[0]
+            w = (bits & 0x3FFF) + 1
+            h = ((bits >> 14) & 0x3FFF) + 1
+            return (w, h)
+        return None
+    return None
 
 
 def _detect_image_ext(data):
@@ -4140,13 +4213,7 @@ def clear_floorplan_background():
     if not stat.S_ISDIR(dir_info.st_mode) or dir_info.st_uid != os.getuid():
         return
     cfg_real = os.path.realpath(CONFIG_DIR)
-    try:
-        entries = os.listdir(CONFIG_DIR)
-    except OSError:
-        return
-    for entry in entries:
-        if not entry.startswith(FLOORPLAN_BG_PREFIX) or "/" in entry or "\\" in entry or ".." in entry:
-            continue
+    for entry in MANAGED_FLOORPLAN_BG_NAMES:
         full = os.path.join(CONFIG_DIR, entry)
         if os.path.realpath(os.path.dirname(full)) != cfg_real:
             continue
@@ -4196,6 +4263,14 @@ def set_floorplan_background(source_path):
     expected = ".jpg" if raw_ext == ".jpeg" else raw_ext
     if detected is None or detected != expected:
         raise ValueError("invalid image magic bytes")
+    dims = _image_dimensions(raw_bytes, detected)
+    if dims is None:
+        raise ValueError("unreadable image header")
+    img_w, img_h = dims
+    if (img_w <= 0 or img_h <= 0
+            or img_w > MAX_FLOORPLAN_BG_DIM or img_h > MAX_FLOORPLAN_BG_DIM
+            or img_w * img_h > MAX_FLOORPLAN_BG_PIXELS):
+        raise ValueError("image dimensions exceed limit")
 
     directory = private_config_dir()
     target_name = FLOORPLAN_BG_PREFIX + detected.lstrip(".")
@@ -4215,11 +4290,9 @@ def set_floorplan_background(source_path):
             pass
         raise
 
-    # Remove any older managed floorplan_bg.* with a different extension
-    for entry in os.listdir(directory):
-        if entry == target_name or not entry.startswith(FLOORPLAN_BG_PREFIX):
-            continue
-        if "/" in entry or "\\" in entry or ".." in entry:
+    # Remove only older managed floorplan_bg.{png,jpg,webp} files (never unrelated user files)
+    for entry in MANAGED_FLOORPLAN_BG_NAMES:
+        if entry == target_name:
             continue
         old_path = os.path.join(directory, entry)
         try:
@@ -4914,6 +4987,7 @@ class Hue:
         self.sse_wake = threading.Event()
         self._stop = threading.Event()
         self._sse_sock = None
+        self._provider_action_gate = threading.Lock()
         self.config = load_config()
         self.panel_open = False
         self.rooms = []
@@ -7281,6 +7355,9 @@ class Hue:
                 threading.Thread(target=_disc_providers, daemon=True).start()
         elif name == "test_provider" and self.providers_mgr:
             raw_prov = cmd.get("provider")
+            # One device test or pairing at a time: repeated commands never pile up threads.
+            if not self._provider_action_gate.acquire(blocking=False):
+                return
             self.providers_mgr.last_action = {"running": True, "kind": "test", "ok": False, "message": "", "pair_id": ""}
             self.emit()
             def _test_prov():
@@ -7289,15 +7366,24 @@ class Hue:
                     self.providers_mgr.last_action = {"running": False, "kind": "test", "ok": True, "message": self.redact(summary)[:160], "pair_id": ""}
                 except Exception as exc:  # noqa: BLE001
                     self.providers_mgr.last_action = {"running": False, "kind": "test", "ok": False, "message": self.redact(str(exc))[:160], "pair_id": ""}
+                finally:
+                    self._provider_action_gate.release()
                 self.emit()
-            threading.Thread(target=_test_prov, daemon=True).start()
+            self._start_provider_action(_test_prov)
         elif name == "pair_provider" and self.providers_mgr and self._providers_mod:
             pkind = str(cmd.get("kind") or "").lower()
             phost = str(cmd.get("host") or "").strip()
             pport = cmd.get("port")
             if pkind not in ("nanoleaf", "dirigera"):
                 return
-            eff_port = int(pport or (16021 if pkind == "nanoleaf" else 8443))
+            try:
+                eff_port = int(pport or (16021 if pkind == "nanoleaf" else 8443))
+            except (TypeError, ValueError):
+                return
+            if not 1 <= eff_port <= 65535:
+                return
+            if not self._provider_action_gate.acquire(blocking=False):
+                return
             self.providers_mgr.last_action = {"running": True, "kind": f"pair_{pkind}", "ok": False, "message": "", "pair_id": ""}
             self.emit()
             def _pair_prov():
@@ -7311,8 +7397,19 @@ class Hue:
                     self.providers_mgr.last_action = {"running": False, "kind": f"pair_{pkind}", "ok": True, "message": "Paired", "pair_id": pair_id}
                 except Exception as exc:  # noqa: BLE001
                     self.providers_mgr.last_action = {"running": False, "kind": f"pair_{pkind}", "ok": False, "message": self.redact(str(exc))[:160], "pair_id": ""}
+                finally:
+                    self._provider_action_gate.release()
                 self.emit()
-            threading.Thread(target=_pair_prov, daemon=True).start()
+            self._start_provider_action(_pair_prov)
+
+    def _start_provider_action(self, fn):
+        """Start a gated provider action; if the thread cannot start, free the gate again."""
+        try:
+            threading.Thread(target=fn, daemon=True).start()
+        except RuntimeError:
+            self._provider_action_gate.release()
+            self.providers_mgr.last_action = {"running": False, "kind": "", "ok": False, "message": "", "pair_id": ""}
+            self.emit()
 
     # -- loops
     def worker(self):

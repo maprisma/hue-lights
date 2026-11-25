@@ -179,7 +179,8 @@ class ProviderManagerPersistenceTests(unittest.TestCase):
             "host": "192.168.1.10",
             "token": "super-secret-ha-token-999",
         })
-        self.assertEqual(saved["id"], "ha1")
+        self.assertNotEqual(saved["id"], "ha1")  # new devices get a fresh server-side ID
+        cid = saved["id"]
         pfile = os.path.join(self.tmp, "providers.json")
         self.assertEqual(stat.S_IMODE(os.stat(pfile).st_mode), 0o600)
 
@@ -191,13 +192,13 @@ class ProviderManagerPersistenceTests(unittest.TestCase):
         self.assertNotIn("super-secret-ha-token-999", json.dumps(plist))
 
         # Editing without re-entering token preserves the saved token ONLY when target matches
-        mgr2.save_connection({"id": "ha1", "kind": "home_assistant", "name": "Renamed HA", "host": "192.168.1.10"})
+        mgr2.save_connection({"id": cid, "kind": "home_assistant", "name": "Renamed HA", "host": "192.168.1.10"})
         self.assertIn("super-secret-ha-token-999", mgr2.secrets())
         self.assertNotIn("super-secret-ha-token-999", mgr2.redact("Auth failed with super-secret-ha-token-999"))
 
         # Changing host MUST NOT reuse the saved token from the previous host
         with self.assertRaises(prov.ProviderError):
-            mgr2.save_connection({"id": "ha1", "kind": "home_assistant", "name": "Moved HA", "host": "192.168.1.99"})
+            mgr2.save_connection({"id": cid, "kind": "home_assistant", "name": "Moved HA", "host": "192.168.1.99"})
 
         # Server-side one-time pair_id keeps raw tokens out of snapshots
         pid = mgr2.store_paired_token("nanoleaf", "192.168.1.55", 16021, "paired-nano-secret-xyz")
@@ -210,7 +211,7 @@ class ProviderManagerPersistenceTests(unittest.TestCase):
             "port": 16021,
             "pair_id": pid,
         })
-        self.assertEqual(saved_nano["id"], "n_pair")
+        nid = saved_nano["id"]
         self.assertIn("paired-nano-secret-xyz", mgr2.secrets())
         # One-time pair_id is consumed and cannot be replayed
         with self.assertRaises(prov.ProviderError):
@@ -248,7 +249,7 @@ class ProviderManagerPersistenceTests(unittest.TestCase):
         with mgr2.lock:
             mgr2.connections[0]["cert_fingerprint"] = "b" * 64
         mgr2.save()
-        mgr2.trust_new_certificate("ha1")
+        mgr2.trust_new_certificate(cid)
         self.assertEqual(mgr2.connections[0]["cert_fingerprint"], "")
         self.assertIn("super-secret-ha-token-999", mgr2.secrets())
 
@@ -263,19 +264,19 @@ class ProviderManagerPersistenceTests(unittest.TestCase):
             })
 
         # B3 + C3: Offline fetch marks cached lights unreachable and triggers backoff
-        mgr2.save_connection({"id": "w1", "kind": "wiz", "name": "Bulb A", "host": "192.168.1.71", "room_name": "Study"})
-        mgr2.save_connection({"id": "w2", "kind": "wiz", "name": "Bulb B", "host": "192.168.1.72", "room_name": "Study"})
+        w1 = mgr2.save_connection({"id": "w1", "kind": "wiz", "name": "Bulb A", "host": "192.168.1.71", "room_name": "Study"})["id"]
+        w2 = mgr2.save_connection({"id": "w2", "kind": "wiz", "name": "Bulb B", "host": "192.168.1.72", "room_name": "Study"})["id"]
         with mgr2.lock:
             r_a, _ = prov.parse_wiz_pilot(
-                next(c for c in mgr2.connections if c["id"] == "w1"),
+                next(c for c in mgr2.connections if c["id"] == w1),
                 {"result": {"state": True, "dimming": 70, "temp": 2700}},
             )
             r_b, _ = prov.parse_wiz_pilot(
-                next(c for c in mgr2.connections if c["id"] == "w2"),
+                next(c for c in mgr2.connections if c["id"] == w2),
                 {"result": {"state": False, "dimming": 50, "temp": 2700}},
             )
-            mgr2.results["w1"] = {"rooms": r_a, "sensors": [], "light_count": 1, "on_count": 1}
-            mgr2.results["w2"] = {"rooms": r_b, "sensors": [], "light_count": 1, "on_count": 0}
+            mgr2.results[w1] = {"rooms": r_a, "sensors": [], "light_count": 1, "on_count": 1}
+            mgr2.results[w2] = {"rooms": r_b, "sensors": [], "light_count": 1, "on_count": 0}
         # E2: Two WiZ bulbs with same room_name ("Study") merge into 1 room card with 2 lights
         merged_rooms, _, _, _, _ = mgr2.snapshot_parts()
         study_rooms = [r for r in merged_rooms if r["name"] == "Study"]
@@ -293,8 +294,8 @@ class ProviderManagerPersistenceTests(unittest.TestCase):
         mgr2.fetch_single = fake_fetch
         try:
             mgr2.refresh_all(respect_backoff=True)
-            self.assertFalse(mgr2.results["w1"]["rooms"][0]["lights"][0]["reachable"])
-            self.assertIn("Device not reachable", mgr2.errors["w1"])
+            self.assertFalse(mgr2.results[w1]["rooms"][0]["lights"][0]["reachable"])
+            self.assertIn("Device not reachable", mgr2.errors[w1])
             # Immediate second poll with respect_backoff=True skips backed-off connections
             prev_calls = len(calls)
             mgr2.refresh_all(respect_backoff=True)
@@ -302,13 +303,13 @@ class ProviderManagerPersistenceTests(unittest.TestCase):
         finally:
             mgr2.fetch_single = orig_fetch
 
-        mgr2.toggle_connection("ha1", False)
-        mgr2.toggle_connection("n_pair", False)
-        mgr2.toggle_connection("w1", False)
-        mgr2.toggle_connection("w2", False)
+        mgr2.toggle_connection(cid, False)
+        mgr2.toggle_connection(nid, False)
+        mgr2.toggle_connection(w1, False)
+        mgr2.toggle_connection(w2, False)
         self.assertFalse(mgr2.has_enabled())
-        for cid in ("ha1", "n_pair", "w1", "w2"):
-            mgr2.remove_connection(cid)
+        for rid in (cid, nid, w1, w2):
+            mgr2.remove_connection(rid)
         self.assertEqual(mgr2.connections, [])
 
 
