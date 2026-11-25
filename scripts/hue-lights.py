@@ -1725,22 +1725,22 @@ def validate_rule(raw):
             return None
         trigger_state = ""
     elif trigger_kind in ("light", "room"):
-        if not valid_uuid(trigger_id):
+        if not _valid_fp_resource_id(trigger_id):
             return None
         if trigger_state not in ("on", "off"):
             return None
     elif trigger_kind in ("motion", "motion_area"):
-        if not valid_uuid(trigger_id):
+        if not _valid_fp_resource_id(trigger_id):
             return None
         if trigger_state not in ("motion", "clear"):
             return None
     elif trigger_kind == "contact":
-        if not valid_uuid(trigger_id):
+        if not _valid_fp_resource_id(trigger_id):
             return None
         if trigger_state not in ("open", "closed"):
             return None
     elif trigger_kind == "button":
-        if not valid_uuid(trigger_id):
+        if not _valid_fp_resource_id(trigger_id):
             return None
         if trigger_state not in ("press", "long_press"):
             return None
@@ -1758,7 +1758,7 @@ def validate_rule(raw):
         tkind = t.get("kind")
         tid = t.get("id")
         action = t.get("action")
-        if tkind not in ("light", "room") or not valid_uuid(tid) or action not in ("on", "off"):
+        if tkind not in ("light", "room") or not _valid_fp_resource_id(tid) or action not in ("on", "off"):
             return None
         if tkind == trigger_kind and tid == trigger_id:
             return None
@@ -1777,7 +1777,7 @@ def validate_rule(raw):
         scene_id = t.get("scene_id", "")
         if scene_id is None:
             scene_id = ""
-        if not isinstance(scene_id, str) or (scene_id and not valid_uuid(scene_id)):
+        if not isinstance(scene_id, str) or (scene_id and not _valid_fp_resource_id(scene_id)):
             return None
         targets.append({"kind": tkind, "id": tid, "action": action, "bri": bri, "scene_id": scene_id})
     if not targets:
@@ -1967,7 +1967,7 @@ def validate_local_schedule(raw):
         return None
     target_kind = raw.get("target_kind")
     target_id = raw.get("target_id")
-    if target_kind not in ("light", "room", "zone") or not valid_uuid(target_id):
+    if target_kind not in ("light", "room", "zone") or not _valid_fp_resource_id(target_id):
         return None
     target_name = clean(raw.get("target_name") or "", 60)
     trigger_kind = raw.get("trigger_kind", "time")
@@ -2000,7 +2000,7 @@ def validate_local_schedule(raw):
     scene_id = ""
     if action == "scene":
         scene_id = raw.get("scene_id")
-        if not valid_uuid(scene_id):
+        if not _valid_fp_resource_id(scene_id):
             return None
     elif action == "on":
         raw_bri = raw.get("bri")
@@ -2112,7 +2112,8 @@ def _validate_managed_bg_path(path):
 def _valid_fp_resource_id(value):
     if valid_uuid(value):
         return True
-    if _PROVIDERS_MOD is not None and _PROVIDERS_MOD.valid_resource_id(value):
+    mod = _PROVIDERS_MOD or _load_providers_module()
+    if mod is not None and mod.valid_resource_id(value):
         return True
     return False
 
@@ -2809,13 +2810,13 @@ def _sample_planned_lights_for_boxes(boxes):
         arch = b.get("archetype", "other")
         if arch == "living_room":
             out.append({
-                "id": f"plan-pendant-{idx}", "floor_id": fid, "name": f"{b['name']} Pendant",
+                "id": f"plan-pendant-{idx}", "floor_id": fid, "name": "Pendant",
                 "icon": "pendant", "x": cx, "y": cy, "strip_points": [],
                 "lumens": 1400, "beam_radius": 3.0, "kelvin": 2700, "color": "#ffd27a",
                 "on": True, "model_note": "Dimmable Warm Pendant", "price": 179.0,
             })
             out.append({
-                "id": f"plan-strip-{idx}", "floor_id": fid, "name": f"{b['name']} Cove Strip",
+                "id": f"plan-strip-{idx}", "floor_id": fid, "name": "Cove Lightstrip",
                 "icon": "strip", "x": round(b["x"] + 60.0, 1), "y": round(b["y"] + 42.0, 1),
                 "strip_points": [
                     {"x": round(b["x"] + 40.0, 1), "y": round(b["y"] + 42.0, 1)},
@@ -2844,7 +2845,7 @@ def _sample_planned_lights_for_boxes(boxes):
             })
         else:
             out.append({
-                "id": f"plan-ceil-{idx}", "floor_id": fid, "name": f"{b['name']} Ceiling",
+                "id": f"plan-ceil-{idx}", "floor_id": fid, "name": "Ceiling Light",
                 "icon": "ceiling", "x": cx, "y": cy, "strip_points": [],
                 "lumens": 1200, "beam_radius": 2.8, "kelvin": 2700, "color": "#ffd27a",
                 "on": True, "model_note": "Flush Ceiling Light", "price": 99.0,
@@ -3305,15 +3306,16 @@ def build_floorplan_sync_calls(floorplan, rooms, entertainment_areas=None, light
                 removals.setdefault(from_rid, set()).add(did)
             new_box_devices.setdefault(to_bid, []).append(did)
 
-    # Also include unassigned ("other") lamps placed inside newly-drawn unlinked room boxes
+    # Also include unassigned ("other") lamps placed inside newly-drawn unlinked room boxes (same floor only)
     for box in new_room_boxes:
+        bfloor = box.get("floor_id") or "eg"
         for lid, lpos in sorted(lamps.items()):
             if lid in light_to_room or lid not in light_to_device:
                 continue
             did = light_to_device[lid]
             if did in moved_devices:
                 continue
-            if _point_in_box(lpos["x"], lpos["y"], box):
+            if (lpos.get("floor_id") or "eg") == bfloor and _point_in_box(lpos["x"], lpos["y"], box):
                 moved_devices.add(did)
                 new_box_devices.setdefault(box["id"], []).append(did)
 
@@ -3374,9 +3376,12 @@ def build_floorplan_sync_calls(floorplan, rooms, entertainment_areas=None, light
         hid = box.get("hue_id")
         bname = clean(box.get("name") or "", 32)
         arch = box.get("archetype") if box.get("archetype") in HUE_ARCHETYPES else "other"
+        bfloor = box.get("floor_id") or "eg"
         placed_inside = [
             lid for lid, lpos in sorted(lamps.items())
-            if lid in all_known_lights and _point_in_box(lpos["x"], lpos["y"], box)
+            if lid in all_known_lights
+            and (lpos.get("floor_id") or "eg") == bfloor
+            and _point_in_box(lpos["x"], lpos["y"], box)
         ]
         if hid is None:
             if not bname:
@@ -4923,6 +4928,8 @@ class Hue:
         self.motion_area_candidate_rooms = []
         self.entertainment_areas = []
         self._light_to_ent_service = {}
+        # C1: Load providers module BEFORE load_floorplan/load_local_schedules/load_rules so multi-provider IDs validate
+        self._providers_mod = _load_providers_module()
         self.floorplan = load_floorplan()
         self.custom_themes = load_themes()
         local_sched_data = load_local_schedules()
@@ -4969,9 +4976,10 @@ class Hue:
         self.last_sent = {"light": 0.0, "grouped_light": 0.0, "scene": 0.0}
         self.last_refresh = 0.0
         self.refresh_hold_until = 0.0
-        self._providers_mod = _load_providers_module()
         self.providers_mgr = self._providers_mod.ProviderManager(CONFIG_DIR) if self._providers_mod else None
         self._last_extra_refresh = 0.0
+        if self.providers_mgr and getattr(self.providers_mgr, "load_warning", ""):
+            self.error = self.providers_mgr.load_warning
         if not self.config and self.providers_mgr and self.providers_mgr.has_enabled():
             self.phase = "connecting"
 
@@ -6476,10 +6484,16 @@ class Hue:
             if source == "local":
                 with self.lock:
                     if not self.known_target(cmd.get("target_kind"), cmd.get("target_id")):
+                        self.error = "Schedule could not be saved (unknown target)."
+                        self.emit()
                         return
                     if cmd.get("action") == "scene" and not self.known("scene", cmd.get("scene_id")):
+                        self.error = "Schedule could not be saved (unknown scene)."
+                        self.emit()
                         return
                     if len(self.local_schedules) >= MAX_LOCAL_SCHEDULES:
+                        self.error = "Schedule limit reached."
+                        self.emit()
                         return
                     raw_sched = {
                         "id": str(uuid.uuid4()),
@@ -6500,6 +6514,8 @@ class Hue:
                     }
                     sched = validate_local_schedule(raw_sched)
                     if sched is None:
+                        self.error = "Schedule could not be saved (invalid settings)."
+                        self.emit()
                         return
                     def _add_sched(data):
                         if len(data["schedules"]) >= MAX_LOCAL_SCHEDULES:
@@ -6608,6 +6624,9 @@ class Hue:
         elif name == "rule_save":
             rule = validate_rule(cmd.get("rule"))
             if rule is None:
+                with self.lock:
+                    self.error = "Rule could not be saved (invalid trigger or target)."
+                self.emit()
                 return
             with self.lock:
                 candidate = [r for r in self.rules if r["id"] != rule["id"]]
@@ -7235,6 +7254,18 @@ class Hue:
                 except Exception:
                     pass
                 self.emit()
+        elif name == "trust_provider_cert" and self.providers_mgr:
+            cid = str(cmd.get("id") or "")
+            if cid:
+                try:
+                    self.providers_mgr.trust_new_certificate(cid)
+                    self.providers_mgr.last_action = {"running": False, "kind": "trust_cert", "ok": True, "message": "Certificate trusted — reconnecting", "pair_id": ""}
+                except Exception as exc:  # noqa: BLE001
+                    self.providers_mgr.last_action = {"running": False, "kind": "trust_cert", "ok": False, "message": self.redact(str(exc))[:160], "pair_id": ""}
+                self.emit()
+        elif name == "clear_provider_action" and self.providers_mgr:
+            self.providers_mgr.last_action = {"running": False, "kind": "", "ok": False, "message": "", "pair_id": ""}
+            self.emit()
         elif name == "discover_providers" and self.providers_mgr and self._providers_mod:
             if not self.providers_mgr.discovering:
                 self.providers_mgr.discovering = True
@@ -7319,7 +7350,7 @@ class Hue:
                 self.wake.wait(2.0)
                 self.wake.clear()
             return
-        if self.config:
+        if self.config or self._has_extra_providers():
             self.check_local_schedules()
         if self.send_api_queue():
             self.emit()

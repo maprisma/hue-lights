@@ -2005,6 +2005,7 @@ pub fn cmd_floorplan_save(doc: &FloorplanDocument) -> Value {
     })
 }
 
+#[cfg(test)]
 pub fn cmd_floorplan_template(template_id: &str) -> Value {
     json!({ "cmd": "floorplan_template", "template_id": template_id })
 }

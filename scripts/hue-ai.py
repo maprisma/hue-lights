@@ -389,6 +389,13 @@ def _http_json(host, port, method, path, body=None, timeout=OLLAMA_CHAT_TIMEOUT)
 # ---------------------------------------------------------------------------
 # Catalog extraction from `hue.snapshot()` (zero secrets!)
 
+_EXTRA_RESOURCE_ID_RE = re.compile(r"^[a-z][a-z0-9_]{1,20}:[A-Za-z0-9_-]{1,40}:[A-Za-z0-9_.:-]{1,120}$")
+
+
+def _valid_resource_id(val):
+    return _valid_uuid(val) or (isinstance(val, str) and bool(_EXTRA_RESOURCE_ID_RE.match(val)))
+
+
 def _build_catalog(hue):
     snap = hue.snapshot() if callable(getattr(hue, "snapshot", None)) else {}
     rooms = []
@@ -399,17 +406,17 @@ def _build_catalog(hue):
         if not isinstance(r, dict):
             continue
         rkind = r.get("kind", "")
-        if rkind in ("room", "zone") and _valid_uuid(r.get("id")):
+        if rkind in ("room", "zone") and _valid_resource_id(r.get("id")):
             rooms.append(r)
         for l in r.get("lights") or []:
-            if isinstance(l, dict) and _valid_uuid(l.get("id")) and l["id"] not in seen_lights:
+            if isinstance(l, dict) and _valid_resource_id(l.get("id")) and l["id"] not in seen_lights:
                 seen_lights.add(l["id"])
                 entry = dict(l)
                 entry["_room_id"] = r.get("id", "")
                 entry["_room_name"] = r.get("name", "")
                 lights.append(entry)
         for sc in r.get("scenes") or []:
-            if isinstance(sc, dict) and _valid_uuid(sc.get("id")):
+            if isinstance(sc, dict) and _valid_resource_id(sc.get("id")):
                 scenes.append({
                     "id": sc["id"],
                     "name": sc.get("name", ""),
@@ -417,8 +424,8 @@ def _build_catalog(hue):
                     "room_name": r.get("name", ""),
                 })
     themes = [t for t in (snap.get("themes") or []) if isinstance(t, dict) and t.get("id")]
-    sensors = [s for s in (snap.get("sensors") or []) if isinstance(s, dict) and _valid_uuid(s.get("id"))]
-    motion_areas = [m for m in (snap.get("motion_areas") or []) if isinstance(m, dict) and _valid_uuid(m.get("id"))]
+    sensors = [s for s in (snap.get("sensors") or []) if isinstance(s, dict) and _valid_resource_id(s.get("id"))]
+    motion_areas = [m for m in (snap.get("motion_areas") or []) if isinstance(m, dict) and _valid_resource_id(m.get("id"))]
     return {
         "snap": snap,
         "rooms": rooms,
@@ -432,7 +439,10 @@ def _build_catalog(hue):
 
 
 def _is_paired(hue):
-    return bool(getattr(hue, "config", None))
+    if getattr(hue, "config", None):
+        return True
+    has_extra = getattr(hue, "_has_extra_providers", None)
+    return bool(has_extra()) if callable(has_extra) else False
 
 
 # ---------------------------------------------------------------------------

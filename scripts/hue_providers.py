@@ -25,6 +25,7 @@ Security:
 """
 
 import base64
+import concurrent.futures
 import copy
 import hashlib
 import http.client
@@ -1438,7 +1439,58 @@ def discover_providers(run_bounded=None):
     except OSError:
         pass
 
+    # Govee LAN multicast/broadcast scan on UDP 4001 -> replies arrive on 4002
+    try:
+        rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            rx.bind(("", 4002))
+        except OSError:
+            rx.bind(("", 0))
+        rx.settimeout(0.6)
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tx.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        scan_pkt = b'{"msg":{"cmd":"scan","data":{"account_topic":"reserve"}}}'
+        for target in (("239.255.255.250", 4001), ("255.255.255.255", 4001)):
+            try:
+                tx.sendto(scan_pkt, target)
+            except OSError:
+                pass
+        tx.close()
+        deadline = time.monotonic() + 0.8
+        while time.monotonic() < deadline:
+            try:
+                data, addr = rx.recvfrom(4096)
+                obj = json.loads(data.decode("utf-8", errors="ignore"))
+                d = (obj.get("msg") or {}).get("data") if isinstance(obj, dict) else None
+                if isinstance(d, dict) and (d.get("ip") or d.get("sku") or d.get("device")):
+                    ip = str(d.get("ip") or addr[0])
+                    sku = clean(d.get("sku") or "Govee Light", 40)
+                    add("govee", sku, ip, 4003)
+            except (socket.timeout, ValueError, OSError):
+                break
+        rx.close()
+    except OSError:
+        pass
+
     return sorted(found.values(), key=lambda d: (d["kind"], d["name"].lower()))
+
+
+def friendly_provider_error(raw_msg):
+    """Map raw network/socket/TLS errors to short, actionable plain-language messages (E5/B4)."""
+    txt = str(raw_msg or "").strip()
+    low = txt.lower()
+    if "fingerprint" in low or "certificate" in low or "mitm" in low:
+        return "The device's security certificate changed. If you renewed it, choose Trust new certificate."
+    if "errno 113" in low or "no route to host" in low or "network is unreachable" in low:
+        return "Device not reachable — check the IP, it may have changed."
+    if "errno 111" in low or "connection refused" in low:
+        return "Connection refused — check that the device is on and the port is right."
+    if "timed out" in low or "timeout" in low:
+        return "Device did not respond in time — check power and your local network."
+    if "name or service not known" in low or "nodename nor servname" in low or "gaierror" in low:
+        return "Host name could not be resolved on the local network."
+    return txt or "Connection failed"
 
 
 # --------------------------------------------------------------------------- ProviderManager
@@ -1462,6 +1514,11 @@ class ProviderManager:
         self.discovered = []
         self.discovering = False
         self.last_action = {"running": False, "kind": "", "ok": False, "message": "", "pair_id": ""}
+        self.load_warning = ""
+        self._load_blocked = False
+        # Per-connection backoff state for offline devices (C3)
+        self._fail_counts = {}         # conn_id -> int
+        self._next_poll_at = {}        # conn_id -> monotonic timestamp
         # Server-side one-time pairing tokens (never emitted in snapshots!)
         self._paired_tokens = {}       # pair_id -> {"kind", "host", "port", "token", "fp", "expires"}
         self._pending_cmds = {}        # (kind, rid) -> body (coalesced & bounded)
@@ -1489,19 +1546,33 @@ class ProviderManager:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
             fd = os.open(path, flags)
+        except FileNotFoundError:
+            return
         except OSError:
+            self._load_blocked = True
+            self.load_warning = "Could not open providers.json securely — refusing to overwrite."
             return
         try:
             st = os.fstat(fd)
-            if (not stat.S_ISREG(st.st_mode)
-                    or st.st_uid != os.getuid()
-                    or (st.st_mode & 0o077) != 0
-                    or st.st_size > 262144):
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > 262144:
+                self._load_blocked = True
+                self.load_warning = "providers.json is not a valid private file — refusing to overwrite."
                 return
+            if (st.st_mode & 0o077) != 0:
+                # C5: Repair relaxed permissions on user-owned providers.json instead of wiping saved devices
+                try:
+                    os.fchmod(fd, 0o600)
+                    self.load_warning = "Repaired permissions on providers.json to private (0600)."
+                except OSError:
+                    self._load_blocked = True
+                    self.load_warning = "providers.json permissions are too open and could not be fixed — refusing to overwrite."
+                    return
             with os.fdopen(fd, "r", encoding="utf-8") as fh:
                 fd = -1
                 raw = json.load(fh)
         except (OSError, ValueError):
+            self._load_blocked = True
+            self.load_warning = "providers.json could not be parsed — refusing to overwrite."
             return
         finally:
             if fd >= 0:
@@ -1525,6 +1596,8 @@ class ProviderManager:
                 self.conn_generations.setdefault(c["id"], 1)
 
     def save(self):
+        if self._load_blocked:
+            raise ProviderError(self.load_warning or "Could not load providers.json — refusing to overwrite.")
         self._ensure_private_dir()
         with self.lock:
             payload = {"version": 1, "providers": list(self.connections)}
@@ -1595,6 +1668,7 @@ class ProviderManager:
                         cand["cert_fingerprint"] = rec["fp"]
                     if consume_pair:
                         self._paired_tokens.pop(pair_id, None)
+        reset_fp = bool(merged.get("reset_cert_fingerprint"))
         if not cand["token"]:
             # Reuse saved token ONLY when kind, host, AND port still match the saved connection!
             with self.lock:
@@ -1604,10 +1678,31 @@ class ProviderManager:
                             and c["host"].lower() == cand["host"].lower()
                             and c["port"] == cand["port"]):
                         cand["token"] = c.get("token", "")
-                        if c.get("cert_fingerprint") and not cand["cert_fingerprint"]:
+                        if not reset_fp and c.get("cert_fingerprint") and not cand["cert_fingerprint"]:
                             cand["cert_fingerprint"] = c["cert_fingerprint"]
                         break
+        elif reset_fp:
+            cand["cert_fingerprint"] = ""
         return cand
+
+    def trust_new_certificate(self, cid):
+        """B4: Clear the pinned TLS fingerprint while keeping the connection ID and saved token."""
+        found = False
+        with self.lock:
+            for c in self.connections:
+                if c["id"] == cid:
+                    c["cert_fingerprint"] = ""
+                    self.conn_generations[cid] = self.conn_generations.get(cid, 0) + 1
+                    self.errors.pop(cid, None)
+                    self._fail_counts.pop(cid, None)
+                    self._next_poll_at.pop(cid, None)
+                    found = True
+                    break
+        if not found:
+            raise ProviderError("Device not found.")
+        self.save()
+        self.trigger_refresh()
+        return True
 
     def save_connection(self, raw):
         clean_c = self._resolve_saved_or_paired_secret(raw, consume_pair=True)
@@ -1617,6 +1712,13 @@ class ProviderManager:
         if meta["requires_token"] and not clean_c["token"]:
             raise ProviderError("Access token is required (enter a token or re-pair for this host).")
         with self.lock:
+            # E2: Block duplicate (kind, host, port) for a different connection ID
+            for c in self.connections:
+                if (c["id"] != clean_c["id"]
+                        and c["kind"] == clean_c["kind"]
+                        and c["host"].lower() == clean_c["host"].lower()
+                        and c["port"] == clean_c["port"]):
+                    raise ProviderError("A device with this address is already added.")
             replaced = False
             for idx, c in enumerate(self.connections):
                 if c["id"] == clean_c["id"]:
@@ -1629,6 +1731,8 @@ class ProviderManager:
                 self.connections.append(clean_c)
             self.conn_generations[clean_c["id"]] = self.conn_generations.get(clean_c["id"], 0) + 1
             self.errors.pop(clean_c["id"], None)
+            self._fail_counts.pop(clean_c["id"], None)
+            self._next_poll_at.pop(clean_c["id"], None)
         self.save()
         self.trigger_refresh()
         return clean_c
@@ -1684,7 +1788,7 @@ class ProviderManager:
                         interval = 4.0 if panel_open else 20.0
                         now = time.time()
                         if now >= self._refresh_hold_until and now - self._last_refresh >= interval:
-                            self.refresh_all()
+                            self.refresh_all(respect_backoff=True)
                             self._last_refresh = time.time()
                             if self._on_change:
                                 self._on_change()
@@ -1702,6 +1806,8 @@ class ProviderManager:
         self._worker_wake.set()
 
     def trigger_refresh(self):
+        with self.lock:
+            self._next_poll_at.clear()
         self._last_refresh = 0.0
         self._refresh_hold_until = 0.0
         self._worker_wake.set()
@@ -1947,37 +2053,87 @@ class ProviderManager:
         try:
             rooms, _sensors = self.fetch_single(clean_c)
         except Exception as exc:  # noqa: BLE001
-            raise ProviderError(self.redact(str(exc), extra_secrets={clean_c.get("token", "")})) from exc
+            redacted = self.redact(str(exc), extra_secrets={clean_c.get("token", "")})
+            raise ProviderError(friendly_provider_error(redacted)) from exc
         lcount = sum(len(r["lights"]) for r in rooms)
         return f"{clean_c['name']} · {lcount}"
 
-    def refresh_all(self):
+    def _poll_one(self, conn, gen):
+        cid = conn["id"]
+        try:
+            rooms, sensors = self.fetch_single(conn, gen=gen)
+            return cid, gen, True, (rooms, sensors), ""
+        except Exception as exc:  # noqa: BLE001
+            redacted = self.redact(str(exc), extra_secrets={conn.get("token", "")})
+            err_safe = friendly_provider_error(redacted)
+            return cid, gen, False, None, err_safe
+
+    def _apply_poll_outcome(self, cid, gen, ok, payload, err_safe):
+        now_mono = time.monotonic()
         with self.lock:
-            active = [(dict(c), self.conn_generations.get(c["id"], 0)) for c in self.connections if c.get("enabled")]
-        for conn, gen in active:
-            cid = conn["id"]
-            try:
-                rooms, sensors = self.fetch_single(conn, gen=gen)
+            still_live = any(c["id"] == cid and c.get("enabled") for c in self.connections)
+            if not still_live or self.conn_generations.get(cid) != gen:
+                return
+            if ok:
+                rooms, sensors = payload
                 lcount = sum(len(r["lights"]) for r in rooms)
                 ocount = sum(1 for r in rooms for l in r["lights"] if l["on"])
-                with self.lock:
-                    # Drop stale refresh if connection was removed, disabled, or edited while in-flight.
-                    still_live = any(c["id"] == cid and c.get("enabled") for c in self.connections)
-                    if not still_live or self.conn_generations.get(cid) != gen:
-                        continue
-                    if time.time() < self._refresh_hold_until:
-                        continue
-                    self.results[cid] = {"rooms": rooms, "sensors": sensors, "light_count": lcount, "on_count": ocount}
+                self._fail_counts.pop(cid, None)
+                self._next_poll_at.pop(cid, None)
+                if time.time() < self._refresh_hold_until:
                     self.connected[cid] = True
                     self.errors[cid] = ""
-            except Exception as exc:  # noqa: BLE001
-                err_safe = self.redact(str(exc), extra_secrets={conn.get("token", "")}) or "Connection failed"
-                with self.lock:
-                    still_live = any(c["id"] == cid and c.get("enabled") for c in self.connections)
-                    if not still_live or self.conn_generations.get(cid) != gen:
-                        continue
-                    self.connected[cid] = False
-                    self.errors[cid] = err_safe
+                    return
+                self.results[cid] = {"rooms": rooms, "sensors": sensors, "light_count": lcount, "on_count": ocount}
+                self.connected[cid] = True
+                self.errors[cid] = ""
+            else:
+                self.connected[cid] = False
+                self.errors[cid] = err_safe
+                # C3: Exponential backoff for failing/offline devices (10s, 20s, 40s, max 60s)
+                fails = self._fail_counts.get(cid, 0) + 1
+                self._fail_counts[cid] = fails
+                delay = min(60.0, 10.0 * (2 ** min(fails - 1, 3)))
+                self._next_poll_at[cid] = now_mono + delay
+                # B3: Mark previously cached lights unreachable so offline devices never look online
+                cached = self.results.get(cid)
+                if cached:
+                    for r in cached.get("rooms") or []:
+                        for l in r.get("lights") or []:
+                            l["reachable"] = False
+
+    def refresh_all(self, respect_backoff=False):
+        now_mono = time.monotonic()
+        with self.lock:
+            active = []
+            for c in self.connections:
+                if not c.get("enabled"):
+                    continue
+                cid = c["id"]
+                if respect_backoff and now_mono < self._next_poll_at.get(cid, 0.0):
+                    continue
+                active.append((dict(c), self.conn_generations.get(cid, 0)))
+        if not active:
+            return
+        if len(active) == 1:
+            conn, gen = active[0]
+            self._drain_pending()
+            cid, g, ok, payload, err = self._poll_one(conn, gen)
+            self._apply_poll_outcome(cid, g, ok, payload, err)
+            self._drain_pending()
+            return
+        # C3: Poll connections in parallel while draining pending commands as futures finish
+        max_w = min(8, len(active))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as pool:
+            futs = [pool.submit(self._poll_one, conn, gen) for conn, gen in active]
+            for fut in concurrent.futures.as_completed(futs):
+                self._drain_pending()
+                try:
+                    cid, g, ok, payload, err = fut.result()
+                    self._apply_poll_outcome(cid, g, ok, payload, err)
+                except Exception:
+                    pass
+                self._drain_pending()
 
     def set_light(self, rid, body):
         parts = rid.split(":", 2)
@@ -2205,6 +2361,7 @@ class ProviderManager:
                     "enabled": bool(c.get("enabled", True)),
                     "room_name": c.get("room_name", ""),
                     "has_token": bool(c.get("token")),
+                    "has_cert_fingerprint": bool(c.get("cert_fingerprint")),
                     "connected": bool(self.connected.get(cid, False)) if c.get("enabled") else False,
                     "light_count": int(res["light_count"]) if res else 0,
                     "error": self.errors.get(cid, "") if c.get("enabled") else "",
@@ -2214,4 +2371,25 @@ class ProviderManager:
                     sensors.extend(copy.deepcopy(res["sensors"]))
                     lcount += res["light_count"]
                     ocount += res["on_count"]
-            return rooms, sensors, lcount, ocount, plist
+            # E2: Merge single-device rooms that share the same custom room_name (case-insensitive)
+            merged_rooms = []
+            by_name = {}
+            for r in rooms:
+                prov = r.get("provider") or ""
+                is_hub = prov in ("home_assistant", "dirigera", "hue", "")
+                rname_key = (r.get("name") or "").strip().lower()
+                if not is_hub and rname_key and rname_key in by_name:
+                    target = by_name[rname_key]
+                    target["lights"].extend(r.get("lights") or [])
+                    target["scenes"].extend(r.get("scenes") or [])
+                    if r.get("on"):
+                        target["on"] = True
+                        target["color"] = r.get("color") or target.get("color")
+                    lit_bris = [float(l.get("bri", 100.0)) for l in target["lights"] if l.get("on")]
+                    if lit_bris:
+                        target["bri"] = round(sum(lit_bris) / len(lit_bris), 1)
+                else:
+                    merged_rooms.append(r)
+                    if not is_hub and rname_key:
+                        by_name[rname_key] = r
+            return merged_rooms, sensors, lcount, ocount, plist

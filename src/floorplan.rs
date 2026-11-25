@@ -449,6 +449,11 @@ pub enum MapMsg {
     SelectFloor(String),
     AddFloor,
     DeleteFloor(String),
+    FloorRenameStart,
+    FloorRenameInput(String),
+    FloorRenameSave,
+    FloorRenameCancel,
+    UndoFloorplan,
     BoxSetFloor(String, String),
     // Polygon reshaping
     BoxApplyShape(String, String),
@@ -563,6 +568,10 @@ pub enum MapMsg {
 #[derive(Debug, Clone)]
 pub struct FloorplanState {
     pub doc: FloorplanDocument,
+    pub undo_doc: Option<FloorplanDocument>,
+    pub confirm_template_id: Option<String>,
+    pub floor_rename_open: bool,
+    pub floor_rename_draft: String,
     pub local_dirty: bool,
     pub sidebar_open: bool,
     pub search: String,
@@ -606,6 +615,10 @@ impl Default for FloorplanState {
     fn default() -> Self {
         Self {
             doc: FloorplanDocument::default(),
+            undo_doc: None,
+            confirm_template_id: None,
+            floor_rename_open: false,
+            floor_rename_draft: String::new(),
             local_dirty: false,
             sidebar_open: true,
             search: String::new(),
@@ -820,17 +833,18 @@ pub fn snap_coord(val: f64, grid: i32, snap: bool) -> f64 {
     ((val / g).round() * g * 10.0).round() / 10.0
 }
 
-/// Finds the smallest-area `kind == "room"` box containing `(x, y)`.
+/// Finds the smallest-area `kind == "room"` box on `floor_id` containing `(x, y)`.
 /// On shared-wall ties, prefers the box matching `current_room_id` (mirrors `hue-lights.py`).
-pub fn containing_room_box<'a>(
+pub fn containing_room_box_on_floor<'a>(
     x: f64,
     y: f64,
+    floor_id: &str,
     boxes: &'a [FloorplanBox],
     current_room_id: &str,
 ) -> Option<&'a FloorplanBox> {
     let mut best: Option<&FloorplanBox> = None;
     for b in boxes {
-        if b.kind != "room" || !point_in_box(x, y, b) {
+        if b.kind != "room" || (!floor_id.is_empty() && b.floor_id != floor_id) || !point_in_box(x, y, b) {
             continue;
         }
         let area = b.area_px();
@@ -856,6 +870,16 @@ pub fn containing_room_box<'a>(
         }
     }
     best
+}
+
+#[cfg(test)]
+pub fn containing_room_box<'a>(
+    x: f64,
+    y: f64,
+    boxes: &'a [FloorplanBox],
+    current_room_id: &str,
+) -> Option<&'a FloorplanBox> {
+    containing_room_box_on_floor(x, y, "", boxes, current_room_id)
 }
 
 pub fn apply_resize(
@@ -913,6 +937,10 @@ pub fn apply_resize(
 /// Counts pending Bridge synchronization changes (new rooms/zones, room/zone renames or archetype
 /// updates, lamp-to-room moves, zone light membership diffs, and linked entertainment syncs).
 pub fn compute_pending_sync_count(doc: &FloorplanDocument, stats: &Value) -> usize {
+    // B2: Without a paired Hue bridge, never report pending Hue Bridge sync changes.
+    if stats.get("hue_paired").and_then(Value::as_bool) == Some(false) {
+        return 0;
+    }
     let mut pending = 0usize;
     let rooms_val = j_list(stats, "rooms");
 
@@ -920,7 +948,9 @@ pub fn compute_pending_sync_count(doc: &FloorplanDocument, stats: &Value) -> usi
     let mut known_zones: HashMap<&str, &Value> = HashMap::new();
     for r in rooms_val {
         let id = j_str(r, "id");
-        if id.is_empty() {
+        let prov = j_str(r, "provider");
+        // B2: Skip non-Hue provider rooms/zones
+        if id.is_empty() || id.contains(':') || (!prov.is_empty() && prov != "hue") {
             continue;
         }
         match j_str(r, "kind") {
@@ -934,13 +964,16 @@ pub fn compute_pending_sync_count(doc: &FloorplanDocument, stats: &Value) -> usi
         }
     }
 
-    // 1. Box creations & metadata diffs (rooms & zones)
+    // 1. Box creations & metadata diffs (Hue rooms & zones only)
     for b in &doc.boxes {
         match b.hue_id.as_deref() {
             None | Some("") => {
                 pending += 1;
             }
             Some(hid) => {
+                if hid.contains(':') {
+                    continue;
+                }
                 let existing = if b.kind == "zone" {
                     known_zones.get(hid)
                 } else {
@@ -957,17 +990,21 @@ pub fn compute_pending_sync_count(doc: &FloorplanDocument, stats: &Value) -> usi
                     if name_diff || arch_diff {
                         pending += 1;
                     }
-                    // Zone membership diff
+                    // Zone membership diff (B1: same floor only; B2: Hue lights only)
                     if b.kind == "zone" {
                         let current_lights: HashSet<&str> = j_list(ex, "lights")
                             .iter()
                             .map(|l| j_str(l, "id"))
-                            .filter(|id| !id.is_empty())
+                            .filter(|id| !id.is_empty() && !id.contains(':'))
                             .collect();
                         let placed_inside: HashSet<&str> = doc
                             .lamps
                             .iter()
-                            .filter(|(_, pos)| point_in_box(pos.x, pos.y, b))
+                            .filter(|(lid, pos)| {
+                                !lid.contains(':')
+                                    && pos.floor_id == b.floor_id
+                                    && point_in_box(pos.x, pos.y, b)
+                            })
                             .map(|(lid, _)| lid.as_str())
                             .collect();
                         let mut desired: HashSet<&str> = current_lights
@@ -985,15 +1022,21 @@ pub fn compute_pending_sync_count(doc: &FloorplanDocument, stats: &Value) -> usi
         }
     }
 
-    // 2. Room membership moves (lamp inside a room box linked to a different Hue room)
+    // 2. Room membership moves (Hue lights only, same floor only)
     let lights = extract_bridge_lights(stats);
     let mut moved_devices: HashSet<String> = HashSet::new();
     for light in &lights {
+        if light.id.contains(':') {
+            continue;
+        }
         let Some(pos) = doc.lamps.get(&light.id) else { continue };
-        let Some(target_box) = containing_room_box(pos.x, pos.y, &doc.boxes, &light.room_id) else {
+        let Some(target_box) = containing_room_box_on_floor(pos.x, pos.y, &pos.floor_id, &doc.boxes, &light.room_id) else {
             continue;
         };
         let to_room_id = target_box.hue_id.as_deref().unwrap_or("");
+        if to_room_id.contains(':') {
+            continue;
+        }
         if to_room_id != light.room_id {
             let key = if light.device_id.is_empty() {
                 light.id.clone()
@@ -1474,6 +1517,10 @@ impl<'a> FloorplanCanvasProgram<'a> {
     fn hit_selected_box_midpoint(&self, pt: Point, tf: CanvasTransform) -> Option<(String, usize, f64, f64)> {
         let Some(Selection::Box(ref bid)) = self.selection else { return None };
         let b = self.doc.boxes.iter().find(|b| b.id == *bid && b.floor_id == self.active_floor())?;
+        // C4: Only polygons use midpoint '+' corner-insert handles; rectangles use their 8 edge/corner resize handles
+        if !b.is_polygon() {
+            return None;
+        }
         let pts = b.effective_points();
         let n = pts.len();
         if n < 3 || n >= 32 {
@@ -1742,7 +1789,12 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                     return Some(Action::publish(MapMsg::Select(None)).and_capture());
                 }
 
-                // Select/Plan mode: priority = polygon vertex > wall midpoint '+' > resize handle > planned strip vertex > planned light > lamp > sensor > wire > stamp > box
+                // C4: Select/Plan mode: resize handles BEFORE polygon midpoints so rectangle edge handles resize cleanly
+                if let Some((orig, handle)) = self.hit_selected_box_handle(pos, tf) {
+                    state.hovered = None;
+                    state.drag = Some(DragOp::BoxResize { id: orig.id.clone(), handle, orig, preview: None });
+                    return Some(Action::capture());
+                }
                 if let Some((box_id, index)) = self.hit_selected_box_vertex(pos, tf) {
                     state.hovered = None;
                     state.drag = Some(DragOp::BoxVertex { box_id, index, preview: None });
@@ -1750,11 +1802,6 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                 }
                 if let Some((box_id, after_edge, mx, my)) = self.hit_selected_box_midpoint(pos, tf) {
                     return Some(Action::publish(MapMsg::InsertBoxVertex { box_id, after_edge, x: mx, y: my }).and_capture());
-                }
-                if let Some((orig, handle)) = self.hit_selected_box_handle(pos, tf) {
-                    state.hovered = None;
-                    state.drag = Some(DragOp::BoxResize { id: orig.id.clone(), handle, orig, preview: None });
-                    return Some(Action::capture());
                 }
                 if let Some((pid, index)) = self.hit_planned_strip_vertex(pos, tf) {
                     state.hovered = None;
@@ -3705,26 +3752,29 @@ pub fn view_map_tab<'a>(
         }
         .on_press(MapMsg::ToggleViewMenu);
 
-        let sync_label = if pending > 0 {
-            trf("Sync All ({0})", &[pending.to_string()])
-        } else {
-            tr("Sync All")
-        };
-        let sync_btn = if pending > 0 {
-            button::suggested(sync_label)
-        } else {
-            button::standard(sync_label)
-        }
-        .on_press(MapMsg::SyncAll);
-
-        vec![
+        let hue_paired = stats.get("hue_paired").and_then(Value::as_bool).unwrap_or(true);
+        let mut items: Vec<Element<MapMsg>> = vec![
             mode_switcher,
             sidebar_btn.into(),
             add_btn.into(),
             tpl_btn.into(),
             view_btn.into(),
-            sync_btn.into(),
-        ]
+        ];
+        if hue_paired {
+            let sync_label = if pending > 0 {
+                trf("Sync All ({0})", &[pending.to_string()])
+            } else {
+                tr("Sync All")
+            };
+            let sync_btn = if pending > 0 {
+                button::suggested(sync_label)
+            } else {
+                button::standard(sync_label)
+            }
+            .on_press(MapMsg::SyncAll);
+            items.push(sync_btn.into());
+        }
+        items
     };
 
     root = root.push(
@@ -3747,22 +3797,43 @@ pub fn view_map_tab<'a>(
                 .iter()
                 .filter(|(lid, p)| p.floor_id == fl.id && lights.iter().any(|l| l.id == **lid && l.on))
                 .count();
+            let display_name = tr(&fl.name);
             let lbl = if lit_on_floor > 0 {
-                format!("{} · {lit_on_floor}", fl.name)
+                format!("{display_name} · {lit_on_floor}")
             } else {
-                fl.name.clone()
+                display_name
             };
             let b = if active { button::suggested(lbl) } else { button::standard(lbl) };
             b.on_press(MapMsg::SelectFloor(fl.id.clone())).into()
         })
         .collect();
     floor_items.push(button::standard(tr("+ Floor")).on_press(MapMsg::AddFloor).into());
+    if state.floor_rename_open {
+        floor_items.push(
+            row![
+                text_input(tr("Floor name"), &state.floor_rename_draft)
+                    .on_input(MapMsg::FloorRenameInput)
+                    .on_submit(|_| MapMsg::FloorRenameSave)
+                    .width(Length::Fixed(130.0)),
+                button::suggested(tr("Save")).on_press(MapMsg::FloorRenameSave),
+                button::text(tr("Cancel")).on_press(MapMsg::FloorRenameCancel),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .into(),
+        );
+    } else {
+        floor_items.push(button::standard(tr("Rename")).on_press(MapMsg::FloorRenameStart).into());
+    }
     if state.doc.floors.len() > 1 {
         floor_items.push(
             button::destructive(tr("Delete Floor"))
                 .on_press(MapMsg::DeleteFloor(state.doc.active_floor_id.clone()))
                 .into(),
         );
+    }
+    if state.undo_doc.is_some() {
+        floor_items.push(button::standard(tr("Undo")).on_press(MapMsg::UndoFloorplan).into());
     }
 
     let ambient_row = row![
@@ -3837,12 +3908,21 @@ pub fn view_map_tab<'a>(
             .iter()
             .map(|tid| {
                 let active = state.doc.template_id == *tid;
-                let lbl = if active {
+                let confirming = state.confirm_template_id.as_deref() == Some(*tid);
+                let lbl = if confirming {
+                    tr("Click again to replace map")
+                } else if active {
                     format!("✓ {}", template_label(tid))
                 } else {
                     template_label(tid)
                 };
-                let b = if active { button::suggested(lbl) } else { button::standard(lbl) };
+                let b = if confirming {
+                    button::destructive(lbl)
+                } else if active {
+                    button::suggested(lbl)
+                } else {
+                    button::standard(lbl)
+                };
                 b.on_press(MapMsg::ApplyTemplate((*tid).to_string())).into()
             })
             .collect();
@@ -3888,7 +3968,7 @@ pub fn view_map_tab<'a>(
                 let pid_d = pl.id.clone();
                 list_col = list_col.push(
                     row![
-                        text::caption(format!("{} · {} lm · {} K", pl.name, pl.lumens, pl.kelvin)),
+                        text::caption(format!("{} · {} lm · {} K", tr(&pl.name), pl.lumens, pl.kelvin)),
                         space::horizontal(),
                         dim_caption(if pl.price > 0.0 { format!("{:.0}", pl.price) } else { String::new() }),
                         (if pl.on { button::suggested(tr("On")) } else { button::standard(tr("Off")) })
@@ -4872,6 +4952,9 @@ fn view_inspector<'a>(
                 .collect();
             col = col.push(dim_caption(tr("Room Shape")));
             col = col.push(flex_row(shape_btns).row_spacing(4).column_spacing(4));
+            if b.is_polygon() {
+                col = col.push(dim_caption(tr("Drag a midpoint to add a corner, right-click a corner to remove it.")));
+            }
 
             if state.doc.floors.len() > 1 {
                 let fl_btns: Vec<Element<MapMsg>> = state
@@ -5652,5 +5735,37 @@ mod tests {
         assert_eq!(parsed.planned_lights.len(), 1);
         assert_eq!(parsed.planned_lights[0].strip_points.len(), 3);
         assert_eq!(parsed.planned_lights[0].lumens, 1600);
+
+        // 5. B1 + B2: compute_pending_sync_count respects floor_id, skips non-Hue lights/boxes, and returns 0 when hue_paired=false
+        let multi_stats = json!({
+            "hue_paired": true,
+            "rooms": [
+                {
+                    "id": "r1", "kind": "room", "name": "Living", "archetype": "living_room", "provider": "hue",
+                    "lights": [{"id": "l1", "device_id": "d1", "name": "Lamp 1", "on": true, "bri": 80.0, "color": "#ffd27a"}]
+                },
+                {
+                    "id": "wiz:w1:room", "kind": "room", "name": "WiZ Desk", "provider": "wiz",
+                    "lights": [{"id": "wiz:w1:light", "device_id": "", "name": "WiZ", "on": true, "bri": 80.0, "color": "#ffffff"}]
+                }
+            ]
+        });
+        let mut sync_doc = FloorplanDocument::default();
+        sync_doc.boxes = vec![
+            sample_box("b-eg", "room", Some("r1"), "Living", 100.0, 100.0, 300.0, 240.0),
+            FloorplanBox {
+                floor_id: "og".into(),
+                ..sample_box("b-og", "room", Some("r2"), "Upper", 100.0, 100.0, 300.0, 240.0)
+            },
+            sample_box("b-wiz", "room", Some("wiz:w1:room"), "Renamed WiZ", 500.0, 100.0, 200.0, 200.0),
+        ];
+        sync_doc.lamps.insert("l1".into(), FloorplanLamp { x: 180.0, y: 180.0, z: 0.0, icon: "bulb".into(), floor_id: "eg".into() });
+        sync_doc.lamps.insert("wiz:w1:light".into(), FloorplanLamp { x: 560.0, y: 160.0, z: 0.0, icon: "desk".into(), floor_id: "eg".into() });
+        // l1 is in b-eg (r1) on EG; b-og overlaps on OG so must NOT trigger move; b-wiz is non-Hue so must NOT trigger rename!
+        assert_eq!(compute_pending_sync_count(&sync_doc, &multi_stats), 0);
+
+        let no_hue_stats = json!({ "hue_paired": false, "rooms": multi_stats["rooms"] });
+        sync_doc.boxes.push(sample_box("b-unlinked", "room", None, "New", 750.0, 100.0, 200.0, 200.0));
+        assert_eq!(compute_pending_sync_count(&sync_doc, &no_hue_stats), 0);
     }
 }

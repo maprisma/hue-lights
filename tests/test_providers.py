@@ -223,17 +223,92 @@ class ProviderManagerPersistenceTests(unittest.TestCase):
                 "pair_id": pid,
             })
 
-        # Non-0600 providers.json is refused on load
+        # C5: Relaxed 0644 permissions on user-owned providers.json are repaired to 0600 without losing devices
         os.chmod(pfile, 0o644)
-        mgr_bad = prov.ProviderManager(self.tmp)
-        self.assertEqual(mgr_bad.connections, [])
-        os.chmod(pfile, 0o600)
+        mgr_repaired = prov.ProviderManager(self.tmp)
+        self.assertEqual(len(mgr_repaired.connections), 2)
+        self.assertEqual(stat.S_IMODE(os.stat(pfile).st_mode), 0o600)
+        self.assertTrue(mgr_repaired.load_warning)
+
+        # C5: Corrupt providers.json blocks save() so it is never silently wiped
+        corrupt_dir = tempfile.mkdtemp(prefix="hue_prov_corrupt_")
+        try:
+            cpath = os.path.join(corrupt_dir, "providers.json")
+            with open(cpath, "w", encoding="utf-8") as fh:
+                fh.write("{corrupt json")
+            os.chmod(cpath, 0o600)
+            mgr_corrupt = prov.ProviderManager(corrupt_dir)
+            self.assertTrue(mgr_corrupt._load_blocked)
+            with self.assertRaises(prov.ProviderError):
+                mgr_corrupt.save()
+        finally:
+            shutil.rmtree(corrupt_dir, ignore_errors=True)
+
+        # B4: trust_new_certificate clears pinned fingerprint while keeping connection ID & saved token
+        with mgr2.lock:
+            mgr2.connections[0]["cert_fingerprint"] = "b" * 64
+        mgr2.save()
+        mgr2.trust_new_certificate("ha1")
+        self.assertEqual(mgr2.connections[0]["cert_fingerprint"], "")
+        self.assertIn("super-secret-ha-token-999", mgr2.secrets())
+
+        # E2: Duplicate (kind, host, port) for a different ID is rejected
+        with self.assertRaises(prov.ProviderError):
+            mgr2.save_connection({
+                "id": "ha_dup",
+                "kind": "home_assistant",
+                "name": "Dup HA",
+                "host": "192.168.1.10",
+                "token": "another-token",
+            })
+
+        # B3 + C3: Offline fetch marks cached lights unreachable and triggers backoff
+        mgr2.save_connection({"id": "w1", "kind": "wiz", "name": "Bulb A", "host": "192.168.1.71", "room_name": "Study"})
+        mgr2.save_connection({"id": "w2", "kind": "wiz", "name": "Bulb B", "host": "192.168.1.72", "room_name": "Study"})
+        with mgr2.lock:
+            r_a, _ = prov.parse_wiz_pilot(
+                next(c for c in mgr2.connections if c["id"] == "w1"),
+                {"result": {"state": True, "dimming": 70, "temp": 2700}},
+            )
+            r_b, _ = prov.parse_wiz_pilot(
+                next(c for c in mgr2.connections if c["id"] == "w2"),
+                {"result": {"state": False, "dimming": 50, "temp": 2700}},
+            )
+            mgr2.results["w1"] = {"rooms": r_a, "sensors": [], "light_count": 1, "on_count": 1}
+            mgr2.results["w2"] = {"rooms": r_b, "sensors": [], "light_count": 1, "on_count": 0}
+        # E2: Two WiZ bulbs with same room_name ("Study") merge into 1 room card with 2 lights
+        merged_rooms, _, _, _, _ = mgr2.snapshot_parts()
+        study_rooms = [r for r in merged_rooms if r["name"] == "Study"]
+        self.assertEqual(len(study_rooms), 1)
+        self.assertEqual(len(study_rooms[0]["lights"]), 2)
+
+        # B3 + C3: Failing fetch marks w1's cached light unreachable=False & schedules backoff
+        orig_fetch = mgr2.fetch_single
+        calls = []
+
+        def fake_fetch(conn, gen=None):
+            calls.append(conn["id"])
+            raise prov.ProviderError("[Errno 113] No route to host")
+
+        mgr2.fetch_single = fake_fetch
+        try:
+            mgr2.refresh_all(respect_backoff=True)
+            self.assertFalse(mgr2.results["w1"]["rooms"][0]["lights"][0]["reachable"])
+            self.assertIn("Device not reachable", mgr2.errors["w1"])
+            # Immediate second poll with respect_backoff=True skips backed-off connections
+            prev_calls = len(calls)
+            mgr2.refresh_all(respect_backoff=True)
+            self.assertEqual(len(calls), prev_calls)
+        finally:
+            mgr2.fetch_single = orig_fetch
 
         mgr2.toggle_connection("ha1", False)
         mgr2.toggle_connection("n_pair", False)
+        mgr2.toggle_connection("w1", False)
+        mgr2.toggle_connection("w2", False)
         self.assertFalse(mgr2.has_enabled())
-        mgr2.remove_connection("ha1")
-        mgr2.remove_connection("n_pair")
+        for cid in ("ha1", "n_pair", "w1", "w2"):
+            mgr2.remove_connection(cid)
         self.assertEqual(mgr2.connections, [])
 
 

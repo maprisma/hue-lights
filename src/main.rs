@@ -606,6 +606,7 @@ struct ProviderDraft {
     pair_id: String,
     use_https: bool,
     has_saved_token: bool,
+    has_cert_fingerprint: bool,
     original_kind: String,
     original_host: String,
     original_port: String,
@@ -686,6 +687,7 @@ struct HueLights<const WINDOW_MODE: bool = false> {
     rule_draft: Option<RuleDraft>,
     theme_draft: Option<ThemeDraft>,
     provider_draft: Option<ProviderDraft>,
+    confirm_remove_provider: Option<String>,
     activity_open: bool,
     // A slider being dragged: its value, and when it was last sent.
     dragging: HashMap<String, (u8, Instant)>,
@@ -883,6 +885,9 @@ enum Message {
     SaveProvider,
     ToggleProvider(String, bool),
     RemoveProvider(String),
+    CancelRemoveProvider,
+    TrustProviderCert(String),
+    AddAllDiscoveredProviders,
 }
 
 // Runs `work` on its own thread (saving must not hold up the popup) and answers with `done`.
@@ -1162,12 +1167,21 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                 self.floorplan.gallery_include_plan = on;
             }
             MapMsg::ApplyTemplate(tid) => {
-                self.floorplan.close_menus();
-                self.floorplan.close_dialog();
-                self.floorplan.local_dirty = false;
-                self.floorplan.selection = None;
-                self.refresh_pending_sync();
-                self.send(cmd_floorplan_template_with_plan(&tid, self.floorplan.gallery_include_plan));
+                // E3: Require 2-click confirm when replacing an existing non-empty map + save Undo snapshot
+                if !self.floorplan.doc.boxes.is_empty()
+                    && self.floorplan.confirm_template_id.as_deref() != Some(tid.as_str())
+                {
+                    self.floorplan.confirm_template_id = Some(tid);
+                } else {
+                    self.floorplan.confirm_template_id = None;
+                    self.floorplan.undo_doc = Some(self.floorplan.doc.clone());
+                    self.floorplan.close_menus();
+                    self.floorplan.close_dialog();
+                    self.floorplan.local_dirty = false;
+                    self.floorplan.selection = None;
+                    self.refresh_pending_sync();
+                    self.send(cmd_floorplan_template_with_plan(&tid, self.floorplan.gallery_include_plan));
+                }
             }
             MapMsg::AddBox(kind) => {
                 self.floorplan.close_menus();
@@ -1283,8 +1297,8 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                     idx += 1;
                 };
                 let name = match next_level {
-                    1 => tr("Upper Floor (OG)"),
-                    2 => tr("Attic (DG)"),
+                    1 => tr("Upper Floor"),
+                    2 => tr("Attic"),
                     n => trf("Floor {0}", &[n.to_string()]),
                 };
                 self.floorplan.doc.floors.push(FloorplanFloor {
@@ -1293,11 +1307,54 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                     level: next_level,
                 });
                 self.floorplan.doc.active_floor_id = fid;
+                self.floorplan.floor_rename_open = false;
                 self.floorplan.selection = None;
                 self.save_floorplan(false);
             }
+            MapMsg::FloorRenameStart => {
+                if let Some(fl) = self
+                    .floorplan
+                    .doc
+                    .floors
+                    .iter()
+                    .find(|f| f.id == self.floorplan.doc.active_floor_id)
+                {
+                    self.floorplan.floor_rename_draft = tr(&fl.name);
+                    self.floorplan.floor_rename_open = true;
+                }
+            }
+            MapMsg::FloorRenameInput(v) => {
+                self.floorplan.floor_rename_draft = v.chars().take(32).collect();
+            }
+            MapMsg::FloorRenameSave => {
+                let clean = self.floorplan.floor_rename_draft.trim().to_string();
+                if !clean.is_empty()
+                    && let Some(fl) = self
+                        .floorplan
+                        .doc
+                        .floors
+                        .iter_mut()
+                        .find(|f| f.id == self.floorplan.doc.active_floor_id)
+                {
+                    fl.name = clean;
+                    self.floorplan.floor_rename_open = false;
+                    self.save_floorplan(false);
+                }
+            }
+            MapMsg::FloorRenameCancel => {
+                self.floorplan.floor_rename_open = false;
+            }
+            MapMsg::UndoFloorplan => {
+                if let Some(prev) = self.floorplan.undo_doc.take() {
+                    self.floorplan.doc = prev;
+                    self.floorplan.selection = None;
+                    self.floorplan.floor_rename_open = false;
+                    self.save_floorplan(false);
+                }
+            }
             MapMsg::DeleteFloor(fid) => {
                 if self.floorplan.doc.floors.len() > 1 {
+                    self.floorplan.undo_doc = Some(self.floorplan.doc.clone());
                     self.floorplan.doc.floors.retain(|f| f.id != fid);
                     let fallback = self
                         .floorplan
@@ -2349,24 +2406,31 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                     };
                     let mut info_col = column![title_row, dim(subtitle)].spacing(2).width(Length::Fill);
                     if penabled && !perr.is_empty() {
-                        info_col = info_col.push(error_text(perr.to_string()));
+                        info_col = info_col.push(error_text(tr(perr)));
                     }
                     let pid_tog = pid.clone();
                     let pid_edit = pid.clone();
                     let pid_del = pid.clone();
+                    let confirming_del = self.confirm_remove_provider.as_deref() == Some(pid.as_str());
+                    let mut action_row = row![
+                        info_col,
+                        toggler(penabled).on_toggle(move |v| Message::ToggleProvider(pid_tog.clone(), v)),
+                        button::standard(tr("Edit")).on_press(Message::EditProvider(pid_edit)),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
+                    if confirming_del {
+                        action_row = action_row
+                            .push(button::destructive(tr("Confirm")).on_press(Message::RemoveProvider(pid_del)))
+                            .push(button::text(tr("Cancel")).on_press(Message::CancelRemoveProvider));
+                    } else {
+                        action_row = action_row
+                            .push(button::destructive(tr("Remove")).on_press(Message::RemoveProvider(pid_del)));
+                    }
                     sec = sec.push(
-                        container(
-                            row![
-                                info_col,
-                                toggler(penabled).on_toggle(move |v| Message::ToggleProvider(pid_tog.clone(), v)),
-                                button::standard(tr("Edit")).on_press(Message::EditProvider(pid_edit)),
-                                button::destructive(tr("Remove")).on_press(Message::RemoveProvider(pid_del)),
-                            ]
-                            .spacing(6)
-                            .align_y(Alignment::Center),
-                        )
-                        .padding(8)
-                        .class(card(None, &self.skin)),
+                        container(action_row)
+                            .padding(8)
+                            .class(card(None, &self.skin)),
                     );
                 }
             }
@@ -2404,28 +2468,74 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             }
             form = form.push(r1).push(r2);
 
+            // E4: Per-brand setup help
+            let setup_hint = match draft.kind.as_str() {
+                "home_assistant" => tr("In Home Assistant: Profile → Security → Long-lived access tokens."),
+                "nanoleaf" => tr("Hold the Nanoleaf power button for 5–7 seconds until LEDs flash, then click Pair via Power Button."),
+                "govee" => tr("Enable LAN Control in the Govee Home app first, then enter the light's local IP address."),
+                "dirigera" => tr("Press the Action Button underneath your IKEA DIRIGERA hub when prompted to pair securely."),
+                "wiz" => tr("Direct local UDP control on port 38899 — no pairing or cloud required."),
+                "lifx" => tr("Direct local LAN protocol on port 56700 — no hub required."),
+                "wled" => tr("Direct local HTTP control for WLED strips — no hub required."),
+                "shelly" => tr("Direct local HTTP control for Shelly bulbs, dimmers & light switches."),
+                _ => String::new(),
+            };
+            if !setup_hint.is_empty() {
+                form = form.push(dim(setup_hint));
+            }
+
             let disc_busy = flag(&self.stats, "discovering_providers");
             let discovered = list(&self.stats, "discovered_providers");
-            form = form.push(
-                row![
-                    dim(tr("Discovered on local network")),
-                    space::horizontal(),
-                    button::standard(if disc_busy { tr("Scanning…") } else { tr("Scan LAN") })
-                        .on_press_maybe((!disc_busy).then_some(Message::DiscoverProviders)),
-                ]
-                .align_y(Alignment::Center),
+            let existing_targets: HashSet<String> = list(&self.stats, "providers")
+                .iter()
+                .map(|p| format!("{}|{}|{}", s(p, "kind"), s(p, "host").to_lowercase(), num(p, "port") as u16))
+                .collect();
+            let addable_free = discovered
+                .iter()
+                .filter(|dev| {
+                    let dk = s(dev, "kind");
+                    let req_t = provider_meta(dk).is_some_and(|m| m.4);
+                    let key = format!("{dk}|{}|{}", s(dev, "host").to_lowercase(), num(dev, "port") as u16);
+                    !req_t && !existing_targets.contains(&key)
+                })
+                .count();
+            let mut disc_hdr = row![
+                dim(tr("Discovered on local network")),
+                space::horizontal(),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+            if addable_free >= 2 {
+                disc_hdr = disc_hdr.push(
+                    button::suggested(tr("Add all found")).on_press(Message::AddAllDiscoveredProviders),
+                );
+            }
+            disc_hdr = disc_hdr.push(
+                button::standard(if disc_busy { tr("Scanning…") } else { tr("Scan LAN") })
+                    .on_press_maybe((!disc_busy).then_some(Message::DiscoverProviders)),
             );
+            form = form.push(disc_hdr);
+            if discovered.is_empty() && !disc_busy {
+                form = form.push(dim(tr("Nothing found — find the IP in your router or the brand's app.")));
+            }
             for dev in discovered {
                 let dk = s(dev, "kind").to_string();
                 let dn = s(dev, "name").to_string();
                 let dh = s(dev, "host").to_string();
                 let dp = num(dev, "port") as u16;
                 let badge = s(dev, "badge").to_string();
+                let key = format!("{dk}|{}|{dp}", dh.to_lowercase());
+                let already = existing_targets.contains(&key);
+                let act_btn = if already {
+                    button::standard(tr("Added"))
+                } else {
+                    button::standard(tr("Use")).on_press(Message::ProviderUseDiscovered(dk, dn.clone(), dh.clone(), dp))
+                };
                 form = form.push(
                     row![
                         text::caption(format!("[{badge}] {dn} · {dh}:{dp}")),
                         space::horizontal(),
-                        button::standard(tr("Use")).on_press(Message::ProviderUseDiscovered(dk, dn, dh, dp)),
+                        act_btn,
                     ]
                     .align_y(Alignment::Center),
                 );
@@ -2470,8 +2580,12 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             && draft.host.trim().eq_ignore_ascii_case(draft.original_host.trim())
             && draft.port.trim() == draft.original_port.trim();
         if req_tok {
-            let placeholder = if same_saved_target || !draft.pair_id.is_empty() {
+            let placeholder = if !draft.pair_id.is_empty() {
+                tr("Paired — press Save")
+            } else if same_saved_target {
                 tr("Saved (leave blank to keep)")
+            } else if draft.kind == "home_assistant" {
+                tr("Paste long-lived access token")
             } else {
                 tr("Access Token")
             };
@@ -2480,6 +2594,21 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                     .on_input(Message::ProviderToken)
                     .password()
                     .width(Length::Fill),
+            );
+            if !draft.id.is_empty() && !same_saved_target && draft.token.trim().is_empty() && draft.pair_id.is_empty() {
+                form = form.push(dim(tr("Host or port changed — enter a token or re-pair before saving.")));
+            }
+        }
+        // B4: Allow trusting a renewed TLS certificate while keeping the connection ID intact
+        let has_cert_err = !draft.id.is_empty()
+            && list(&self.stats, "providers")
+                .iter()
+                .find(|p| s(p, "id") == draft.id)
+                .is_some_and(|p| s(p, "error").to_lowercase().contains("certificate"));
+        if !draft.id.is_empty() && (draft.kind == "dirigera" || draft.use_https) && (draft.has_cert_fingerprint || has_cert_err) {
+            form = form.push(
+                button::standard(tr("Trust new certificate"))
+                    .on_press(Message::TrustProviderCert(draft.id.clone())),
             );
         }
         if supports_pair {
@@ -2501,10 +2630,11 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             if running {
                 form = form.push(dim(tr("Working…")));
             } else if !msg.is_empty() {
+                let localized = tr(msg);
                 if ok {
-                    form = form.push(dim(format!("✓ {msg}")));
+                    form = form.push(dim(format!("✓ {localized}")));
                 } else {
-                    form = form.push(error_text(msg.to_string()));
+                    form = form.push(error_text(localized));
                 }
             }
         }
@@ -2786,6 +2916,26 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         let mut title_row = row![text::heading(rname.clone())].spacing(6).align_y(Alignment::Center);
         if let Some(pill) = provider_pill(s(room, "provider")) {
             title_row = title_row.push(pill);
+        }
+        let rlights = list(room, "lights");
+        let all_offline = !rlights.is_empty()
+            && rlights.iter().all(|l| l.get("reachable").and_then(Value::as_bool) == Some(false));
+        if all_offline {
+            const ORANGE: Color = Color::from_rgb(249.0 / 255.0, 115.0 / 255.0, 22.0 / 255.0);
+            let offline_pill = container(
+                text::caption(tr("Offline")).class(theme::Text::Color(ORANGE)),
+            )
+            .padding([1, 6])
+            .class(theme::Container::custom(|_| iced_container::Style {
+                background: Some(Background::Color(with_alpha(ORANGE, 0.14))),
+                border: Border {
+                    radius: corners::now().pill.into(),
+                    width: 1.0,
+                    color: with_alpha(ORANGE, 0.35),
+                },
+                ..Default::default()
+            }));
+            title_row = title_row.push(offline_pill);
         }
         let names = column![title_row, status_el].spacing(4);
         let expander = button::custom(
@@ -5492,11 +5642,14 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                     pair_id: String::new(),
                     use_https: kind == "dirigera",
                     has_saved_token: false,
+                    has_cert_fingerprint: false,
                     original_kind: String::new(),
                     original_host: String::new(),
                     original_port: String::new(),
                     awaiting_save: false,
                 });
+                // E7: Clear stale provider status message when opening Add/Edit
+                self.send(json!({"cmd": "clear_provider_action"}));
                 self.send(json!({"cmd": "discover_providers"}));
             }
             Message::EditProvider(cid) => {
@@ -5515,11 +5668,13 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                         pair_id: String::new(),
                         use_https: flag(p, "use_https"),
                         has_saved_token: flag(p, "has_token"),
+                        has_cert_fingerprint: flag(p, "has_cert_fingerprint"),
                         original_kind: pkind,
                         original_host: phost,
                         original_port: pport,
                         awaiting_save: false,
                     });
+                    self.send(json!({"cmd": "clear_provider_action"}));
                 }
             }
             Message::CloseProviderDraft => {
@@ -5631,7 +5786,60 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                 self.send(json!({"cmd": "toggle_provider", "id": cid, "enabled": en}));
             }
             Message::RemoveProvider(cid) => {
-                self.send(json!({"cmd": "remove_provider", "id": cid}));
+                if self.confirm_remove_provider.as_deref() == Some(cid.as_str()) {
+                    self.confirm_remove_provider = None;
+                    self.send(json!({"cmd": "remove_provider", "id": cid}));
+                } else {
+                    self.confirm_remove_provider = Some(cid);
+                }
+            }
+            Message::CancelRemoveProvider => {
+                self.confirm_remove_provider = None;
+            }
+            Message::TrustProviderCert(cid) => {
+                if let Some(d) = &mut self.provider_draft {
+                    d.has_cert_fingerprint = false;
+                }
+                self.send(json!({"cmd": "trust_provider_cert", "id": cid}));
+            }
+            Message::AddAllDiscoveredProviders => {
+                let existing: HashSet<String> = list(&self.stats, "providers")
+                    .iter()
+                    .map(|p| format!("{}|{}|{}", s(p, "kind"), s(p, "host").to_lowercase(), num(p, "port") as u16))
+                    .collect();
+                let room_override = self.provider_draft.as_ref().map(|d| d.room_name.trim().to_string()).unwrap_or_default();
+                let mut added_any = false;
+                for dev in list(&self.stats, "discovered_providers") {
+                    let dk = s(dev, "kind");
+                    if provider_meta(dk).is_some_and(|m| m.4) {
+                        continue;
+                    }
+                    let dh = s(dev, "host");
+                    let dp = num(dev, "port") as u16;
+                    let key = format!("{dk}|{}|{dp}", dh.to_lowercase());
+                    if existing.contains(&key) {
+                        continue;
+                    }
+                    self.send(json!({
+                        "cmd": "save_provider",
+                        "provider": {
+                            "id": "",
+                            "kind": dk,
+                            "name": s(dev, "name"),
+                            "host": dh,
+                            "port": dp,
+                            "room_name": room_override,
+                            "token": "",
+                            "pair_id": "",
+                            "use_https": false,
+                            "enabled": true,
+                        }
+                    }));
+                    added_any = true;
+                }
+                if added_any {
+                    self.provider_draft = None;
+                }
             }
         }
         Task::none()

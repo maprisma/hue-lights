@@ -1863,6 +1863,99 @@ class FloorplanAndBridgeSyncTests(Base):
         diffs = {d["light_id"]: d["to_room_id"] for d in hue.compute_room_membership_diffs(multi_fp, h.rooms)}
         self.assertEqual(diffs, {L1: R2, L3: R1})
 
+    def test_review_fixes_c1_c2_b1_c6(self):
+        # C1: Saved floorplan with non-Hue lamp survives Hue() startup even if _PROVIDERS_MOD was None
+        fp_with_wiz = hue.build_floorplan_template("studio_loft", [], bridge_id="")
+        fp_with_wiz["lamps"]["wiz:w1:light"] = {"x": 200.0, "y": 200.0, "z": 0.0, "icon": "bulb", "floor_id": "eg"}
+        hue.save_floorplan(fp_with_wiz)
+        old_mod = hue._PROVIDERS_MOD
+        try:
+            hue._PROVIDERS_MOD = None
+            loaded = hue.load_floorplan()
+            self.assertIsNotNone(loaded)
+            self.assertIn("wiz:w1:light", loaded["lamps"])
+        finally:
+            hue._PROVIDERS_MOD = old_mod
+
+        # C2: validate_local_schedule & validate_rule accept non-Hue resource IDs
+        sched = hue.validate_local_schedule({
+            "name": "WiZ Morning",
+            "target_kind": "light",
+            "target_id": "wiz:w1:light",
+            "trigger_kind": "time",
+            "time": "07:30",
+            "days": ["mon", "tue"],
+            "action": "on",
+            "bri": 80,
+        })
+        self.assertIsNotNone(sched)
+        self.assertEqual(sched["target_id"], "wiz:w1:light")
+
+        rule = hue.validate_rule({
+            "name": "Cross-brand",
+            "kind": "follow",
+            "trigger_kind": "light",
+            "trigger_id": L1,
+            "trigger_state": "on",
+            "targets": [{"kind": "light", "id": "ha:h1:light.desk", "action": "on"}],
+        })
+        self.assertIsNotNone(rule)
+        self.assertEqual(rule["targets"][0]["id"], "ha:h1:light.desk")
+
+        # C2: Rejected rule save surfaces an error instead of failing silently
+        h = self.make_hue()
+        h.handle({"cmd": "rule_save", "rule": {"name": "Bad", "kind": "follow", "trigger_kind": "light", "trigger_id": "bad", "targets": []}})
+        self.assertTrue(h.error)
+
+        # B1: build_floorplan_sync_calls zone membership filters by floor_id
+        fp_zone = {
+            "version": 2,
+            "floors": [{"id": "eg", "name": "EG", "level": 0}, {"id": "og", "name": "OG", "level": 1}],
+            "active_floor_id": "eg",
+            "boxes": [
+                {"id": "z-og", "kind": "zone", "hue_id": Z1, "name": "Upstairs", "archetype": "other",
+                 "x": 100.0, "y": 100.0, "w": 300.0, "h": 300.0, "floor_id": "og"},
+            ],
+            "lamps": {
+                # L1 is on EG at (150, 150) — must NOT be pulled into OG zone Z1!
+                L1: {"x": 150.0, "y": 150.0, "z": 0.0, "icon": "bulb", "floor_id": "eg"},
+                # L3 is on OG at (150, 150) — SHOULD stay in OG zone Z1
+                L3: {"x": 150.0, "y": 150.0, "z": 0.0, "icon": "bulb", "floor_id": "og"},
+            },
+            "stamps": [], "sensors": {}, "planned_lights": [],
+        }
+        calls = hue.build_floorplan_sync_calls(fp_zone, h.rooms)
+        zone_puts = [c for c in calls if c[0] == "PUT" and f"/zone/{Z1}" in c[1]]
+        self.assertEqual(len(zone_puts), 1)
+        child_rids = [ch["rid"] for ch in zone_puts[0][2]["children"]]
+        self.assertEqual(child_rids, [L3])
+
+        # C6: Ask AI catalog includes non-Hue rooms & lights
+        ai_spec = importlib.util.spec_from_file_location("hue_ai_test", os.path.join(HERE, "..", "scripts", "hue-ai.py"))
+        ai_mod = importlib.util.module_from_spec(ai_spec)
+        ai_spec.loader.exec_module(ai_mod)
+
+        class FakeExtraHue:
+            config = {}
+            def _has_extra_providers(self):
+                return True
+            def snapshot(self):
+                return {
+                    "rooms": [{
+                        "id": "wiz:w1:room", "kind": "room", "name": "Desk",
+                        "lights": [{"id": "wiz:w1:light", "name": "WiZ Bulb", "on": False, "bri": 80}],
+                        "scenes": [{"id": "wiz:w1:scene:1", "name": "Ocean"}],
+                    }],
+                    "themes": [], "sensors": [], "motion_areas": [],
+                }
+
+        fake = FakeExtraHue()
+        self.assertTrue(ai_mod._is_paired(fake))
+        cat = ai_mod._build_catalog(fake)
+        self.assertEqual(len(cat["rooms"]), 1)
+        self.assertEqual(cat["lights"][0]["id"], "wiz:w1:light")
+        self.assertEqual(cat["scenes"][0]["id"], "wiz:w1:scene:1")
+
 
 if __name__ == "__main__":
     unittest.main()
