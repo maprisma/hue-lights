@@ -89,10 +89,15 @@ MAX_FLOORPLAN_LAMPS = 120
 MAX_FLOORPLAN_SENSORS = 128
 MAX_FLOORPLAN_BG_BYTES = 15 * 1024 * 1024
 FLOORPLAN_VERSION = 1
+FLOORPLAN_VERSIONS = (1, 2)
 FLOORPLAN_TEMPLATES = (
-    "auto_bridge", "studio_loft", "one_bed_apt", "three_room_apt", "family_house", "desk_studio",
+    "auto_bridge", "studio_loft", "one_bed_apt", "three_room_apt", "family_house", "desk_studio", "bungalow_l_shape",
 )
-FLOORPLAN_STAMP_KINDS = ("door", "window", "sofa", "tv", "desk", "bed", "dining", "kitchen")
+FLOORPLAN_STAMP_KINDS = ("door", "window", "sofa", "tv", "desk", "bed", "dining", "kitchen", "stairs")
+MAX_FLOORPLAN_FLOORS = 12
+MAX_FLOORPLAN_PLANNED = 120
+MAX_FLOORPLAN_POLYGON_PTS = 32
+FLOOR_ID_RE = re.compile(r"^[a-z0-9_-]{1,24}$")
 FLOORPLAN_STAMP_ROTS = (0, 90, 180, 270)
 LAMP_ICONS = (
     "bulb", "spot", "strip", "floor", "table", "pendant",
@@ -2104,12 +2109,49 @@ def _validate_managed_bg_path(path):
     return norm
 
 
+def _valid_fp_resource_id(value):
+    if valid_uuid(value):
+        return True
+    if _PROVIDERS_MOD is not None and _PROVIDERS_MOD.valid_resource_id(value):
+        return True
+    return False
+
+
+def _validate_floor_id(value, default="eg"):
+    if value is None or value == "":
+        return default
+    if isinstance(value, str) and FLOOR_ID_RE.match(value.lower()):
+        return value.lower()
+    return None
+
+
+def _validate_polygon_points(raw_pts, min_pts=3, max_pts=MAX_FLOORPLAN_POLYGON_PTS):
+    if raw_pts is None:
+        return []
+    if not isinstance(raw_pts, list):
+        return None
+    if len(raw_pts) == 0:
+        return []
+    if len(raw_pts) < min_pts or len(raw_pts) > max_pts:
+        return None
+    out = []
+    for p in raw_pts:
+        if not isinstance(p, dict):
+            return None
+        px = _strict_finite(p.get("x"), -200.0, 4200.0)
+        py = _strict_finite(p.get("y"), -200.0, 3200.0)
+        if px is None or py is None:
+            return None
+        out.append({"x": round(px, 1), "y": round(py, 1)})
+    return out
+
+
 def validate_floorplan(raw):
-    """Strictly validate and normalize a floorplan.json payload, or return None."""
+    """Strictly validate and normalize a floorplan.json payload (v1 & v2), or return None."""
     if not isinstance(raw, dict):
         return None
     version = raw.get("version", FLOORPLAN_VERSION)
-    if isinstance(version, bool) or not isinstance(version, int) or version != FLOORPLAN_VERSION:
+    if isinstance(version, bool) or not isinstance(version, int) or version not in FLOORPLAN_VERSIONS:
         return None
 
     raw_bid = raw.get("bridge_id", "")
@@ -2183,6 +2225,41 @@ def validate_floorplan(raw):
     if not (isinstance(show_wires, bool) and isinstance(show_glows, bool) and isinstance(show_furniture, bool)):
         return None
 
+    px_per_meter = _strict_finite(raw.get("px_per_meter", 50.0), 20.0, 200.0)
+    if px_per_meter is None:
+        return None
+
+    raw_floors = raw.get("floors")
+    floors = []
+    if raw_floors is None:
+        floors = [{"id": "eg", "name": "Ground Floor", "level": 0}]
+    else:
+        if not isinstance(raw_floors, list) or len(raw_floors) > MAX_FLOORPLAN_FLOORS:
+            return None
+        seen_fids = set()
+        for f in raw_floors:
+            if not isinstance(f, dict):
+                return None
+            fid = _validate_floor_id(f.get("id"), "")
+            if not fid or fid in seen_fids:
+                return None
+            seen_fids.add(fid)
+            fname_raw = f.get("name", "Floor")
+            if not isinstance(fname_raw, str) or any(ch in fname_raw for ch in "<>&"):
+                return None
+            fname = clean(fname_raw, 32) or "Floor"
+            flevel = f.get("level", 0)
+            if isinstance(flevel, bool) or not isinstance(flevel, int) or flevel < -5 or flevel > 20:
+                return None
+            floors.append({"id": fid, "name": fname, "level": flevel})
+        if not floors:
+            floors = [{"id": "eg", "name": "Ground Floor", "level": 0}]
+
+    floor_id_set = {f["id"] for f in floors}
+    active_floor_id = _validate_floor_id(raw.get("active_floor_id"), floors[0]["id"])
+    if active_floor_id is None or active_floor_id not in floor_id_set:
+        active_floor_id = floors[0]["id"]
+
     raw_bg = raw.get("background")
     if raw_bg is None:
         background = {"path": "", "opacity": 0.35, "fit": "contain"}
@@ -2228,7 +2305,7 @@ def validate_floorplan(raw):
         hue_id = b.get("hue_id")
         if hue_id is None or hue_id == "":
             hue_id = None
-        elif not valid_uuid(hue_id):
+        elif not _valid_fp_resource_id(hue_id):
             return None
 
         raw_name = b.get("name")
@@ -2246,11 +2323,26 @@ def validate_floorplan(raw):
         elif not isinstance(arch, str) or arch not in HUE_ARCHETYPES:
             return None
 
-        bx = _strict_finite(b.get("x"), 0.0, 4000.0)
-        by = _strict_finite(b.get("y"), 0.0, 3000.0)
+        bx = _strict_finite(b.get("x"), -200.0, 4000.0)
+        by = _strict_finite(b.get("y"), -200.0, 3000.0)
         bw = _strict_finite(b.get("w"), 60.0, 4000.0)
         bh = _strict_finite(b.get("h"), 60.0, 3000.0)
         if bx is None or by is None or bw is None or bh is None:
+            return None
+
+        pts = _validate_polygon_points(b.get("points"))
+        if pts is None:
+            return None
+        if len(pts) >= 3:
+            xs = [p["x"] for p in pts]
+            ys = [p["y"] for p in pts]
+            bx = min(xs)
+            by = min(ys)
+            bw = max(60.0, max(xs) - bx)
+            bh = max(60.0, max(ys) - by)
+
+        bfid = _validate_floor_id(b.get("floor_id"), floors[0]["id"])
+        if bfid is None:
             return None
 
         ent_area_id = b.get("entertainment_area_id")
@@ -2270,6 +2362,8 @@ def validate_floorplan(raw):
             "w": round(bw, 1),
             "h": round(bh, 1),
             "entertainment_area_id": ent_area_id,
+            "points": pts,
+            "floor_id": bfid,
         })
 
     raw_stamps = raw.get("stamps", [])
@@ -2297,7 +2391,8 @@ def validate_floorplan(raw):
         sw = _strict_finite(s.get("w"), 10.0, 1000.0)
         sh = _strict_finite(s.get("h"), 10.0, 1000.0)
         rot = s.get("rot", 0)
-        if (sx is None or sy is None or sw is None or sh is None
+        sfid = _validate_floor_id(s.get("floor_id"), floors[0]["id"])
+        if (sx is None or sy is None or sw is None or sh is None or sfid is None
                 or isinstance(rot, bool) or not isinstance(rot, int) or rot not in FLOORPLAN_STAMP_ROTS):
             return None
         stamps.append({
@@ -2308,6 +2403,7 @@ def validate_floorplan(raw):
             "w": round(sw, 1),
             "h": round(sh, 1),
             "rot": rot,
+            "floor_id": sfid,
         })
 
     raw_lamps = raw.get("lamps", {})
@@ -2315,12 +2411,13 @@ def validate_floorplan(raw):
         return None
     lamps = {}
     for lid, lpos in raw_lamps.items():
-        if not valid_uuid(lid) or not isinstance(lpos, dict):
+        if not _valid_fp_resource_id(lid) or not isinstance(lpos, dict):
             return None
         lx = _strict_finite(lpos.get("x"), 0.0, 4000.0)
         ly = _strict_finite(lpos.get("y"), 0.0, 3000.0)
         lz = _strict_finite(lpos.get("z", 0.0), -1.0, 1.0)
-        if lx is None or ly is None or lz is None:
+        lfid = _validate_floor_id(lpos.get("floor_id"), floors[0]["id"])
+        if lx is None or ly is None or lz is None or lfid is None:
             return None
         icon = lpos.get("icon", "bulb")
         if icon is None or icon == "":
@@ -2336,6 +2433,7 @@ def validate_floorplan(raw):
             "y": round(ly, 1),
             "z": round(lz, 3),
             "icon": icon,
+            "floor_id": lfid,
         }
 
     raw_sensors = raw.get("sensors", {})
@@ -2345,19 +2443,89 @@ def validate_floorplan(raw):
         return None
     sensors = {}
     for sid, spos in raw_sensors.items():
-        if not valid_uuid(sid) or not isinstance(spos, dict):
+        if not _valid_fp_resource_id(sid) or not isinstance(spos, dict):
             return None
         sx = _strict_finite(spos.get("x"), 0.0, 4000.0)
         sy = _strict_finite(spos.get("y"), 0.0, 3000.0)
-        if sx is None or sy is None:
+        sfid = _validate_floor_id(spos.get("floor_id"), floors[0]["id"])
+        if sx is None or sy is None or sfid is None:
             return None
         sensors[sid] = {
             "x": round(sx, 1),
             "y": round(sy, 1),
+            "floor_id": sfid,
         }
 
+    raw_planned = raw.get("planned_lights", [])
+    if raw_planned is None:
+        raw_planned = []
+    if not isinstance(raw_planned, list) or len(raw_planned) > MAX_FLOORPLAN_PLANNED:
+        return None
+    planned_lights = []
+    seen_pids = set()
+    for pl in raw_planned:
+        if not isinstance(pl, dict):
+            return None
+        pid = pl.get("id")
+        if pid is None or pid == "":
+            pid = str(uuid.uuid4())
+        elif not isinstance(pid, str) or FLOORPLAN_ID_RE.match(pid) is None:
+            return None
+        if pid in seen_pids:
+            return None
+        seen_pids.add(pid)
+        pfid = _validate_floor_id(pl.get("floor_id"), floors[0]["id"])
+        if pfid is None:
+            return None
+        pname_raw = pl.get("name", "Planned Light")
+        if not isinstance(pname_raw, str) or any(ch in pname_raw for ch in "<>&"):
+            return None
+        pname = clean(pname_raw, 40) or "Planned Light"
+        picon = pl.get("icon", "bulb")
+        if not isinstance(picon, str):
+            return None
+        picon = _LAMP_ICON_ALIASES.get(picon, picon)
+        if picon not in LAMP_ICONS:
+            picon = "bulb"
+        px = _strict_finite(pl.get("x"), 0.0, 4000.0)
+        py = _strict_finite(pl.get("y"), 0.0, 3000.0)
+        if px is None or py is None:
+            return None
+        spts = _validate_polygon_points(pl.get("strip_points"), min_pts=2, max_pts=24)
+        if spts is None:
+            return None
+        plumens = _strict_finite(pl.get("lumens", 800), 50.0, 12000.0)
+        pradius = _strict_finite(pl.get("beam_radius", 2.6), 0.8, 8.0)
+        pkelvin = _strict_finite(pl.get("kelvin", 2700), 1800.0, 6500.0)
+        pprice = _strict_finite(pl.get("price", 0.0), 0.0, 100000.0)
+        pon = pl.get("on", True)
+        if plumens is None or pradius is None or pkelvin is None or pprice is None or not isinstance(pon, bool):
+            return None
+        pcol = pl.get("color", "#ffd27a")
+        if not isinstance(pcol, str) or not re.match(r"^#[0-9a-fA-F]{6}$", pcol):
+            pcol = "#ffd27a"
+        pnote_raw = pl.get("model_note", "")
+        if not isinstance(pnote_raw, str) or any(ch in pnote_raw for ch in "<>&"):
+            return None
+        planned_lights.append({
+            "id": pid,
+            "floor_id": pfid,
+            "name": pname,
+            "icon": picon,
+            "x": round(px, 1),
+            "y": round(py, 1),
+            "strip_points": spts,
+            "lumens": int(round(plumens)),
+            "beam_radius": round(pradius, 2),
+            "kelvin": int(round(pkelvin)),
+            "color": pcol.lower(),
+            "on": pon,
+            "model_note": clean(pnote_raw, 80),
+            "price": round(pprice, 2),
+        })
+
     return {
-        "version": FLOORPLAN_VERSION,
+        "version": version,
         "bridge_id": bridge_id,
         "template_id": template_id,
         "entertainment_id": entertainment_id,
@@ -2368,10 +2536,14 @@ def validate_floorplan(raw):
         "auto_sync": auto_sync,
         "auto_sync_rooms": auto_sync_rooms,
         "background": background,
+        "px_per_meter": round(px_per_meter, 2),
+        "floors": floors,
+        "active_floor_id": active_floor_id,
         "boxes": boxes,
         "stamps": stamps,
         "lamps": lamps,
         "sensors": sensors,
+        "planned_lights": planned_lights,
     }
 
 
@@ -2405,8 +2577,8 @@ _ARCHETYPE_KEYWORDS = {
 
 
 def _place_lamps_in_box(box, lights, lamps_out):
-    """Distribute `lights` neatly inside `box` (strictly inside walls) into `lamps_out`."""
-    valid_lights = [l for l in (lights or []) if isinstance(l, dict) and valid_uuid(l.get("id"))]
+    """Distribute `lights` neatly inside `box` (strictly inside polygon walls) into `lamps_out`."""
+    valid_lights = [l for l in (lights or []) if isinstance(l, dict) and _valid_fp_resource_id(l.get("id"))]
     if not valid_lights:
         return
     n = len(valid_lights)
@@ -2416,6 +2588,10 @@ def _place_lamps_in_box(box, lights, lamps_out):
     pad_y = min(56.0, box["h"] * 0.22)
     inner_w = max(20.0, box["w"] - 2.0 * pad_x)
     inner_h = max(20.0, box["h"] - 2.0 * pad_y)
+    fid = box.get("floor_id", "eg")
+    pts = box.get("points") or []
+    cx = sum(p["x"] for p in pts) / len(pts) if len(pts) >= 3 else (box["x"] + box["w"] * 0.5)
+    cy = sum(p["y"] for p in pts) / len(pts) if len(pts) >= 3 else (box["y"] + box["h"] * 0.5)
     for idx, light in enumerate(valid_lights):
         lid = light["id"]
         if lid in lamps_out or len(lamps_out) >= MAX_FLOORPLAN_LAMPS:
@@ -2426,111 +2602,184 @@ def _place_lamps_in_box(box, lights, lamps_out):
         fy = 0.5 if rows == 1 else (row / float(rows - 1))
         lx = box["x"] + pad_x + fx * inner_w
         ly = box["y"] + pad_y + fy * inner_h
+        if not _point_in_box(lx, ly, box):
+            lx = cx + ((idx % 3) - 1) * 24.0
+            ly = cy + (idx // 3) * 24.0
+            if not _point_in_box(lx, ly, box):
+                lx, ly = cx, cy
         lamps_out[lid] = {
             "x": round(clamp(lx, 0.0, 4000.0), 1),
             "y": round(clamp(ly, 0.0, 3000.0), 1),
             "z": 0.0,
             "icon": "bulb",
+            "floor_id": fid,
         }
 
 
 def _template_blueprints():
-    """Return static pure-vector architectural starter blueprints (boxes + stamps)."""
+    """Return static pure-vector architectural starter blueprints (polygon rooms, multi-floor & stamps)."""
     return {
         "studio_loft": {
             "canvas": {"width": 1200.0, "height": 820.0},
+            "floors": [{"id": "eg", "name": "Ground Floor", "level": 0}],
             "boxes": [
-                {"id": "box-living", "kind": "room", "hue_id": None, "name": "Living / Sleeping", "archetype": "living_room", "x": 80.0, "y": 80.0, "w": 660.0, "h": 440.0, "entertainment_area_id": None},
-                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchenette", "archetype": "kitchen", "x": 740.0, "y": 80.0, "w": 340.0, "h": 240.0, "entertainment_area_id": None},
-                {"id": "box-bath", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 740.0, "y": 320.0, "w": 340.0, "h": 200.0, "entertainment_area_id": None},
-                {"id": "box-balcony", "kind": "room", "hue_id": None, "name": "Balcony", "archetype": "balcony", "x": 80.0, "y": 520.0, "w": 660.0, "h": 180.0, "entertainment_area_id": None},
+                {
+                    "id": "box-living", "kind": "room", "hue_id": None, "name": "Living / Sleeping", "archetype": "living_room",
+                    "x": 80.0, "y": 80.0, "w": 660.0, "h": 440.0, "entertainment_area_id": None, "floor_id": "eg",
+                    "points": [{"x": 80.0, "y": 80.0}, {"x": 740.0, "y": 80.0}, {"x": 740.0, "y": 320.0}, {"x": 540.0, "y": 320.0}, {"x": 540.0, "y": 520.0}, {"x": 80.0, "y": 520.0}],
+                },
+                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchenette", "archetype": "kitchen", "x": 740.0, "y": 80.0, "w": 340.0, "h": 240.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-bath", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 540.0, "y": 320.0, "w": 540.0, "h": 200.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-balcony", "kind": "zone", "hue_id": None, "name": "Balcony", "archetype": "balcony", "x": 80.0, "y": 520.0, "w": 460.0, "h": 170.0, "entertainment_area_id": None, "floor_id": "eg"},
             ],
             "stamps": [
-                {"id": "st-1", "kind": "tv", "x": 160.0, "y": 95.0, "w": 160.0, "h": 18.0, "rot": 0},
-                {"id": "st-2", "kind": "sofa", "x": 150.0, "y": 240.0, "w": 180.0, "h": 72.0, "rot": 0},
-                {"id": "st-3", "kind": "bed", "x": 490.0, "y": 110.0, "w": 190.0, "h": 150.0, "rot": 0},
-                {"id": "st-4", "kind": "desk", "x": 490.0, "y": 350.0, "w": 150.0, "h": 68.0, "rot": 0},
-                {"id": "st-5", "kind": "kitchen", "x": 760.0, "y": 96.0, "w": 280.0, "h": 54.0, "rot": 0},
-                {"id": "st-6", "kind": "dining", "x": 800.0, "y": 190.0, "w": 130.0, "h": 80.0, "rot": 0},
-                {"id": "st-7", "kind": "door", "x": 740.0, "y": 390.0, "w": 52.0, "h": 52.0, "rot": 90},
-                {"id": "st-8", "kind": "window", "x": 220.0, "y": 514.0, "w": 220.0, "h": 12.0, "rot": 0},
+                {"id": "st-1", "kind": "tv", "x": 160.0, "y": 95.0, "w": 160.0, "h": 18.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-2", "kind": "sofa", "x": 150.0, "y": 240.0, "w": 180.0, "h": 72.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-3", "kind": "bed", "x": 490.0, "y": 110.0, "w": 190.0, "h": 150.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-4", "kind": "desk", "x": 160.0, "y": 400.0, "w": 150.0, "h": 68.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-5", "kind": "kitchen", "x": 760.0, "y": 96.0, "w": 280.0, "h": 54.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-6", "kind": "dining", "x": 800.0, "y": 190.0, "w": 130.0, "h": 80.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-7", "kind": "door", "x": 740.0, "y": 390.0, "w": 52.0, "h": 52.0, "rot": 90, "floor_id": "eg"},
+                {"id": "st-8", "kind": "window", "x": 180.0, "y": 514.0, "w": 220.0, "h": 12.0, "rot": 0, "floor_id": "eg"},
             ],
         },
         "one_bed_apt": {
             "canvas": {"width": 1400.0, "height": 820.0},
+            "floors": [{"id": "eg", "name": "Ground Floor", "level": 0}],
             "boxes": [
-                {"id": "box-living", "kind": "room", "hue_id": None, "name": "Living Room", "archetype": "living_room", "x": 80.0, "y": 80.0, "w": 460.0, "h": 360.0, "entertainment_area_id": None},
-                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchen", "archetype": "kitchen", "x": 540.0, "y": 80.0, "w": 320.0, "h": 240.0, "entertainment_area_id": None},
-                {"id": "box-hall", "kind": "room", "hue_id": None, "name": "Hallway", "archetype": "hallway", "x": 540.0, "y": 320.0, "w": 320.0, "h": 120.0, "entertainment_area_id": None},
-                {"id": "box-bedroom", "kind": "room", "hue_id": None, "name": "Bedroom", "archetype": "bedroom", "x": 860.0, "y": 80.0, "w": 420.0, "h": 360.0, "entertainment_area_id": None},
-                {"id": "box-bath", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 540.0, "y": 440.0, "w": 320.0, "h": 220.0, "entertainment_area_id": None},
-                {"id": "box-balcony", "kind": "room", "hue_id": None, "name": "Balcony", "archetype": "balcony", "x": 80.0, "y": 440.0, "w": 460.0, "h": 160.0, "entertainment_area_id": None},
+                {
+                    "id": "box-living", "kind": "room", "hue_id": None, "name": "Living Room", "archetype": "living_room",
+                    "x": 80.0, "y": 80.0, "w": 460.0, "h": 360.0, "entertainment_area_id": None, "floor_id": "eg",
+                    "points": [{"x": 80.0, "y": 80.0}, {"x": 540.0, "y": 80.0}, {"x": 540.0, "y": 320.0}, {"x": 420.0, "y": 320.0}, {"x": 420.0, "y": 440.0}, {"x": 80.0, "y": 440.0}],
+                },
+                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchen", "archetype": "kitchen", "x": 540.0, "y": 80.0, "w": 320.0, "h": 240.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-hall", "kind": "room", "hue_id": None, "name": "Hallway", "archetype": "hallway", "x": 420.0, "y": 320.0, "w": 440.0, "h": 120.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-bedroom", "kind": "room", "hue_id": None, "name": "Bedroom", "archetype": "bedroom", "x": 860.0, "y": 80.0, "w": 420.0, "h": 360.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-bath", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 540.0, "y": 440.0, "w": 320.0, "h": 220.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-balcony", "kind": "zone", "hue_id": None, "name": "Balcony", "archetype": "balcony", "x": 80.0, "y": 440.0, "w": 460.0, "h": 160.0, "entertainment_area_id": None, "floor_id": "eg"},
             ],
             "stamps": [
-                {"id": "st-1", "kind": "tv", "x": 180.0, "y": 94.0, "w": 160.0, "h": 18.0, "rot": 0},
-                {"id": "st-2", "kind": "sofa", "x": 170.0, "y": 240.0, "w": 180.0, "h": 74.0, "rot": 0},
-                {"id": "st-3", "kind": "kitchen", "x": 560.0, "y": 94.0, "w": 270.0, "h": 54.0, "rot": 0},
-                {"id": "st-4", "kind": "dining", "x": 600.0, "y": 190.0, "w": 140.0, "h": 84.0, "rot": 0},
-                {"id": "st-5", "kind": "bed", "x": 960.0, "y": 120.0, "w": 200.0, "h": 170.0, "rot": 0},
-                {"id": "st-6", "kind": "door", "x": 540.0, "y": 350.0, "w": 52.0, "h": 52.0, "rot": 90},
-                {"id": "st-7", "kind": "door", "x": 860.0, "y": 350.0, "w": 52.0, "h": 52.0, "rot": 270},
-                {"id": "st-8", "kind": "window", "x": 180.0, "y": 434.0, "w": 200.0, "h": 12.0, "rot": 0},
+                {"id": "st-1", "kind": "tv", "x": 180.0, "y": 94.0, "w": 160.0, "h": 18.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-2", "kind": "sofa", "x": 170.0, "y": 240.0, "w": 180.0, "h": 74.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-3", "kind": "kitchen", "x": 560.0, "y": 94.0, "w": 270.0, "h": 54.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-4", "kind": "dining", "x": 600.0, "y": 190.0, "w": 140.0, "h": 84.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-5", "kind": "bed", "x": 960.0, "y": 120.0, "w": 200.0, "h": 170.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-6", "kind": "door", "x": 540.0, "y": 350.0, "w": 52.0, "h": 52.0, "rot": 90, "floor_id": "eg"},
+                {"id": "st-7", "kind": "door", "x": 860.0, "y": 350.0, "w": 52.0, "h": 52.0, "rot": 270, "floor_id": "eg"},
+                {"id": "st-8", "kind": "window", "x": 180.0, "y": 434.0, "w": 200.0, "h": 12.0, "rot": 0, "floor_id": "eg"},
             ],
         },
         "three_room_apt": {
             "canvas": {"width": 1500.0, "height": 880.0},
+            "floors": [{"id": "eg", "name": "Ground Floor", "level": 0}],
             "boxes": [
-                {"id": "box-living", "kind": "room", "hue_id": None, "name": "Living / Dining", "archetype": "living_room", "x": 80.0, "y": 80.0, "w": 520.0, "h": 360.0, "entertainment_area_id": None},
-                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchen", "archetype": "kitchen", "x": 600.0, "y": 80.0, "w": 300.0, "h": 240.0, "entertainment_area_id": None},
-                {"id": "box-hall", "kind": "room", "hue_id": None, "name": "Hallway", "archetype": "hallway", "x": 600.0, "y": 320.0, "w": 300.0, "h": 120.0, "entertainment_area_id": None},
-                {"id": "box-master", "kind": "room", "hue_id": None, "name": "Master Bedroom", "archetype": "bedroom", "x": 900.0, "y": 80.0, "w": 460.0, "h": 360.0, "entertainment_area_id": None},
-                {"id": "box-office", "kind": "room", "hue_id": None, "name": "Office / Studio", "archetype": "office", "x": 80.0, "y": 440.0, "w": 380.0, "h": 300.0, "entertainment_area_id": None},
-                {"id": "box-bath", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 460.0, "y": 440.0, "w": 280.0, "h": 300.0, "entertainment_area_id": None},
-                {"id": "box-second", "kind": "room", "hue_id": None, "name": "Second Bedroom", "archetype": "kids_bedroom", "x": 740.0, "y": 440.0, "w": 620.0, "h": 300.0, "entertainment_area_id": None},
+                {
+                    "id": "box-living", "kind": "room", "hue_id": None, "name": "Living / Dining", "archetype": "living_room",
+                    "x": 80.0, "y": 50.0, "w": 520.0, "h": 390.0, "entertainment_area_id": None, "floor_id": "eg",
+                    "points": [
+                        {"x": 80.0, "y": 110.0}, {"x": 200.0, "y": 110.0}, {"x": 245.0, "y": 50.0},
+                        {"x": 435.0, "y": 50.0}, {"x": 480.0, "y": 110.0}, {"x": 600.0, "y": 110.0},
+                        {"x": 600.0, "y": 440.0}, {"x": 80.0, "y": 440.0},
+                    ],
+                },
+                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchen", "archetype": "kitchen", "x": 600.0, "y": 110.0, "w": 300.0, "h": 210.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {
+                    "id": "box-hall", "kind": "room", "hue_id": None, "name": "Hallway", "archetype": "hallway",
+                    "x": 600.0, "y": 320.0, "w": 420.0, "h": 120.0, "entertainment_area_id": None, "floor_id": "eg",
+                    "points": [
+                        {"x": 600.0, "y": 320.0}, {"x": 900.0, "y": 320.0}, {"x": 900.0, "y": 370.0},
+                        {"x": 1020.0, "y": 370.0}, {"x": 1020.0, "y": 440.0}, {"x": 600.0, "y": 440.0},
+                    ],
+                },
+                {"id": "box-master", "kind": "room", "hue_id": None, "name": "Master Bedroom", "archetype": "bedroom", "x": 900.0, "y": 110.0, "w": 460.0, "h": 260.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-office", "kind": "room", "hue_id": None, "name": "Office / Studio", "archetype": "office", "x": 80.0, "y": 440.0, "w": 380.0, "h": 300.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-bath", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 460.0, "y": 440.0, "w": 280.0, "h": 300.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-second", "kind": "room", "hue_id": None, "name": "Second Bedroom", "archetype": "kids_bedroom", "x": 740.0, "y": 440.0, "w": 620.0, "h": 300.0, "entertainment_area_id": None, "floor_id": "eg"},
             ],
             "stamps": [
-                {"id": "st-1", "kind": "tv", "x": 140.0, "y": 94.0, "w": 160.0, "h": 18.0, "rot": 0},
-                {"id": "st-2", "kind": "sofa", "x": 130.0, "y": 230.0, "w": 180.0, "h": 72.0, "rot": 0},
-                {"id": "st-3", "kind": "dining", "x": 380.0, "y": 180.0, "w": 160.0, "h": 95.0, "rot": 0},
-                {"id": "st-4", "kind": "kitchen", "x": 620.0, "y": 94.0, "w": 250.0, "h": 52.0, "rot": 0},
-                {"id": "st-5", "kind": "bed", "x": 1020.0, "y": 120.0, "w": 200.0, "h": 170.0, "rot": 0},
-                {"id": "st-6", "kind": "desk", "x": 150.0, "y": 510.0, "w": 170.0, "h": 74.0, "rot": 0},
-                {"id": "st-7", "kind": "bed", "x": 960.0, "y": 510.0, "w": 170.0, "h": 140.0, "rot": 0},
-                {"id": "st-8", "kind": "door", "x": 600.0, "y": 350.0, "w": 52.0, "h": 52.0, "rot": 90},
-                {"id": "st-9", "kind": "window", "x": 200.0, "y": 74.0, "w": 200.0, "h": 12.0, "rot": 0},
+                {"id": "st-1", "kind": "tv", "x": 120.0, "y": 124.0, "w": 160.0, "h": 18.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-2", "kind": "sofa", "x": 120.0, "y": 245.0, "w": 180.0, "h": 72.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-3", "kind": "dining", "x": 380.0, "y": 200.0, "w": 160.0, "h": 95.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-4", "kind": "kitchen", "x": 620.0, "y": 124.0, "w": 250.0, "h": 52.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-5", "kind": "bed", "x": 1020.0, "y": 135.0, "w": 200.0, "h": 165.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-6", "kind": "desk", "x": 150.0, "y": 510.0, "w": 170.0, "h": 74.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-7", "kind": "bed", "x": 960.0, "y": 510.0, "w": 170.0, "h": 140.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-8", "kind": "door", "x": 600.0, "y": 350.0, "w": 52.0, "h": 52.0, "rot": 90, "floor_id": "eg"},
+                {"id": "st-9", "kind": "window", "x": 250.0, "y": 46.0, "w": 180.0, "h": 12.0, "rot": 0, "floor_id": "eg"},
             ],
         },
         "family_house": {
             "canvas": {"width": 1600.0, "height": 900.0},
+            "floors": [
+                {"id": "eg", "name": "Ground Floor", "level": 0},
+                {"id": "og", "name": "Upper Floor", "level": 1},
+            ],
             "boxes": [
-                {"id": "box-living", "kind": "room", "hue_id": None, "name": "Living / Dining", "archetype": "living_room", "x": 80.0, "y": 80.0, "w": 540.0, "h": 380.0, "entertainment_area_id": None},
-                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchen", "archetype": "kitchen", "x": 620.0, "y": 80.0, "w": 360.0, "h": 260.0, "entertainment_area_id": None},
-                {"id": "box-hall", "kind": "room", "hue_id": None, "name": "Hallway", "archetype": "hallway", "x": 620.0, "y": 340.0, "w": 360.0, "h": 120.0, "entertainment_area_id": None},
-                {"id": "box-office", "kind": "room", "hue_id": None, "name": "Home Office", "archetype": "office", "x": 980.0, "y": 80.0, "w": 420.0, "h": 260.0, "entertainment_area_id": None},
-                {"id": "box-wc", "kind": "room", "hue_id": None, "name": "Guest WC", "archetype": "toilet", "x": 980.0, "y": 340.0, "w": 240.0, "h": 120.0, "entertainment_area_id": None},
-                {"id": "box-terrace", "kind": "room", "hue_id": None, "name": "Terrace / Garden", "archetype": "terrace", "x": 80.0, "y": 460.0, "w": 900.0, "h": 280.0, "entertainment_area_id": None},
+                {
+                    "id": "box-living", "kind": "room", "hue_id": None, "name": "Living / Dining", "archetype": "living_room",
+                    "x": 80.0, "y": 80.0, "w": 540.0, "h": 380.0, "entertainment_area_id": None, "floor_id": "eg",
+                    "points": [{"x": 80.0, "y": 80.0}, {"x": 620.0, "y": 80.0}, {"x": 620.0, "y": 340.0}, {"x": 480.0, "y": 340.0}, {"x": 480.0, "y": 460.0}, {"x": 80.0, "y": 460.0}],
+                },
+                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchen", "archetype": "kitchen", "x": 620.0, "y": 80.0, "w": 360.0, "h": 260.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-hall", "kind": "room", "hue_id": None, "name": "Hallway", "archetype": "hallway", "x": 480.0, "y": 340.0, "w": 500.0, "h": 120.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-office", "kind": "room", "hue_id": None, "name": "Home Office", "archetype": "office", "x": 980.0, "y": 80.0, "w": 420.0, "h": 260.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-wc", "kind": "room", "hue_id": None, "name": "Guest WC", "archetype": "toilet", "x": 980.0, "y": 340.0, "w": 240.0, "h": 120.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-terrace", "kind": "zone", "hue_id": None, "name": "Terrace / Garden", "archetype": "terrace", "x": 80.0, "y": 460.0, "w": 900.0, "h": 260.0, "entertainment_area_id": None, "floor_id": "eg"},
+                # Upper Floor (OG)
+                {"id": "box-bed-og", "kind": "room", "hue_id": None, "name": "Master Bedroom", "archetype": "bedroom", "x": 80.0, "y": 80.0, "w": 460.0, "h": 340.0, "entertainment_area_id": None, "floor_id": "og"},
+                {"id": "box-bath-og", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 540.0, "y": 80.0, "w": 320.0, "h": 240.0, "entertainment_area_id": None, "floor_id": "og"},
+                {"id": "box-hall-og", "kind": "room", "hue_id": None, "name": "Gallery Hall", "archetype": "hallway", "x": 540.0, "y": 320.0, "w": 320.0, "h": 140.0, "entertainment_area_id": None, "floor_id": "og"},
+                {"id": "box-kids-og", "kind": "room", "hue_id": None, "name": "Guest Room", "archetype": "kids_bedroom", "x": 860.0, "y": 80.0, "w": 440.0, "h": 380.0, "entertainment_area_id": None, "floor_id": "og"},
             ],
             "stamps": [
-                {"id": "st-1", "kind": "tv", "x": 150.0, "y": 94.0, "w": 170.0, "h": 18.0, "rot": 0},
-                {"id": "st-2", "kind": "sofa", "x": 140.0, "y": 240.0, "w": 190.0, "h": 74.0, "rot": 0},
-                {"id": "st-3", "kind": "dining", "x": 390.0, "y": 190.0, "w": 170.0, "h": 100.0, "rot": 0},
-                {"id": "st-4", "kind": "kitchen", "x": 640.0, "y": 94.0, "w": 310.0, "h": 54.0, "rot": 0},
-                {"id": "st-5", "kind": "desk", "x": 1090.0, "y": 140.0, "w": 180.0, "h": 76.0, "rot": 0},
-                {"id": "st-6", "kind": "door", "x": 760.0, "y": 410.0, "w": 52.0, "h": 52.0, "rot": 0},
-                {"id": "st-7", "kind": "window", "x": 180.0, "y": 454.0, "w": 300.0, "h": 12.0, "rot": 0},
+                {"id": "st-1", "kind": "tv", "x": 150.0, "y": 94.0, "w": 170.0, "h": 18.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-2", "kind": "sofa", "x": 140.0, "y": 240.0, "w": 190.0, "h": 74.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-3", "kind": "dining", "x": 390.0, "y": 175.0, "w": 170.0, "h": 100.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-4", "kind": "kitchen", "x": 640.0, "y": 94.0, "w": 310.0, "h": 54.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-5", "kind": "desk", "x": 1090.0, "y": 140.0, "w": 180.0, "h": 76.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-stairs-eg", "kind": "stairs", "x": 840.0, "y": 345.0, "w": 90.0, "h": 110.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-6", "kind": "door", "x": 760.0, "y": 410.0, "w": 52.0, "h": 52.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-7", "kind": "window", "x": 160.0, "y": 454.0, "w": 260.0, "h": 12.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-bed-og", "kind": "bed", "x": 140.0, "y": 140.0, "w": 200.0, "h": 170.0, "rot": 0, "floor_id": "og"},
+                {"id": "st-stairs-og", "kind": "stairs", "x": 650.0, "y": 335.0, "w": 90.0, "h": 110.0, "rot": 0, "floor_id": "og"},
+                {"id": "st-bed2-og", "kind": "bed", "x": 960.0, "y": 150.0, "w": 180.0, "h": 150.0, "rot": 0, "floor_id": "og"},
+            ],
+        },
+        "bungalow_l_shape": {
+            "canvas": {"width": 1440.0, "height": 840.0},
+            "floors": [{"id": "eg", "name": "Ground Floor", "level": 0}],
+            "boxes": [
+                {
+                    "id": "box-living", "kind": "room", "hue_id": None, "name": "Living / Dining", "archetype": "living_room",
+                    "x": 80.0, "y": 80.0, "w": 600.0, "h": 560.0, "entertainment_area_id": None, "floor_id": "eg",
+                    "points": [{"x": 80.0, "y": 80.0}, {"x": 680.0, "y": 80.0}, {"x": 680.0, "y": 400.0}, {"x": 420.0, "y": 400.0}, {"x": 420.0, "y": 640.0}, {"x": 80.0, "y": 640.0}],
+                },
+                {"id": "box-kitchen", "kind": "room", "hue_id": None, "name": "Kitchen", "archetype": "kitchen", "x": 680.0, "y": 80.0, "w": 280.0, "h": 320.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-bedroom", "kind": "room", "hue_id": None, "name": "Bedroom", "archetype": "bedroom", "x": 960.0, "y": 80.0, "w": 360.0, "h": 320.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-bath", "kind": "room", "hue_id": None, "name": "Bathroom", "archetype": "bathroom", "x": 960.0, "y": 400.0, "w": 360.0, "h": 240.0, "entertainment_area_id": None, "floor_id": "eg"},
+                {"id": "box-terrace", "kind": "zone", "hue_id": None, "name": "Courtyard Terrace", "archetype": "terrace", "x": 420.0, "y": 400.0, "w": 540.0, "h": 240.0, "entertainment_area_id": None, "floor_id": "eg"},
+            ],
+            "stamps": [
+                {"id": "st-1", "kind": "tv", "x": 150.0, "y": 95.0, "w": 170.0, "h": 18.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-2", "kind": "sofa", "x": 145.0, "y": 230.0, "w": 185.0, "h": 72.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-3", "kind": "dining", "x": 155.0, "y": 470.0, "w": 165.0, "h": 95.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-4", "kind": "kitchen", "x": 700.0, "y": 96.0, "w": 230.0, "h": 54.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-5", "kind": "bed", "x": 1040.0, "y": 130.0, "w": 190.0, "h": 165.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-6", "kind": "dining", "x": 600.0, "y": 470.0, "w": 160.0, "h": 92.0, "rot": 0, "floor_id": "eg"},
             ],
         },
         "desk_studio": {
             "canvas": {"width": 1280.0, "height": 840.0},
+            "floors": [{"id": "eg", "name": "Ground Floor", "level": 0}],
             "boxes": [
-                {"id": "box-studio", "kind": "room", "hue_id": None, "name": "Desk / Gaming Studio", "archetype": "office", "x": 140.0, "y": 90.0, "w": 980.0, "h": 640.0, "entertainment_area_id": None},
+                {"id": "box-studio", "kind": "room", "hue_id": None, "name": "Desk / Gaming Studio", "archetype": "office", "x": 140.0, "y": 90.0, "w": 980.0, "h": 640.0, "entertainment_area_id": None, "floor_id": "eg"},
             ],
             "stamps": [
-                {"id": "st-1", "kind": "desk", "x": 440.0, "y": 150.0, "w": 360.0, "h": 110.0, "rot": 0},
-                {"id": "st-2", "kind": "tv", "x": 490.0, "y": 110.0, "w": 260.0, "h": 20.0, "rot": 0},
-                {"id": "st-3", "kind": "sofa", "x": 470.0, "y": 540.0, "w": 280.0, "h": 95.0, "rot": 0},
-                {"id": "st-4", "kind": "window", "x": 134.0, "y": 240.0, "w": 12.0, "h": 220.0, "rot": 90},
-                {"id": "st-5", "kind": "door", "x": 1068.0, "y": 560.0, "w": 56.0, "h": 56.0, "rot": 180},
+                {"id": "st-1", "kind": "desk", "x": 440.0, "y": 150.0, "w": 360.0, "h": 110.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-2", "kind": "tv", "x": 490.0, "y": 110.0, "w": 260.0, "h": 20.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-3", "kind": "sofa", "x": 470.0, "y": 540.0, "w": 280.0, "h": 95.0, "rot": 0, "floor_id": "eg"},
+                {"id": "st-4", "kind": "window", "x": 134.0, "y": 240.0, "w": 12.0, "h": 220.0, "rot": 90, "floor_id": "eg"},
+                {"id": "st-5", "kind": "door", "x": 1068.0, "y": 560.0, "w": 56.0, "h": 56.0, "rot": 180, "floor_id": "eg"},
             ],
         },
     }
@@ -2544,18 +2793,78 @@ def _room_matches_archetype_keyword(room_name, box_archetype):
     return False
 
 
-def build_floorplan_template(template_id, rooms, bridge_id=""):
-    """Build one of the 6 editable starter floorplan prototypes, auto-matching existing Hue rooms."""
+def _sample_planned_lights_for_boxes(boxes):
+    out = []
+    for idx, b in enumerate(boxes):
+        if b.get("kind") != "room":
+            continue
+        cx = round(b["x"] + b["w"] * 0.5, 1)
+        cy = round(b["y"] + b["h"] * 0.5, 1)
+        if not _point_in_box(cx, cy, b):
+            pts = b.get("points") or []
+            if len(pts) >= 3:
+                cx = round(sum(p["x"] for p in pts) / len(pts), 1)
+                cy = round(sum(p["y"] for p in pts) / len(pts), 1)
+        fid = b.get("floor_id", "eg")
+        arch = b.get("archetype", "other")
+        if arch == "living_room":
+            out.append({
+                "id": f"plan-pendant-{idx}", "floor_id": fid, "name": f"{b['name']} Pendant",
+                "icon": "pendant", "x": cx, "y": cy, "strip_points": [],
+                "lumens": 1400, "beam_radius": 3.0, "kelvin": 2700, "color": "#ffd27a",
+                "on": True, "model_note": "Dimmable Warm Pendant", "price": 179.0,
+            })
+            out.append({
+                "id": f"plan-strip-{idx}", "floor_id": fid, "name": f"{b['name']} Cove Strip",
+                "icon": "strip", "x": round(b["x"] + 60.0, 1), "y": round(b["y"] + 42.0, 1),
+                "strip_points": [
+                    {"x": round(b["x"] + 40.0, 1), "y": round(b["y"] + 42.0, 1)},
+                    {"x": round(min(b["x"] + b["w"] - 40.0, b["x"] + 260.0), 1), "y": round(b["y"] + 42.0, 1)},
+                ],
+                "lumens": 1600, "beam_radius": 2.2, "kelvin": 2700, "color": "#ffd27a",
+                "on": True, "model_note": "WLED / Hue Gradient Strip 3m", "price": 79.0,
+            })
+        elif arch == "kitchen":
+            out.append({
+                "id": f"plan-kit-{idx}", "floor_id": fid, "name": "Counter Lightstrip",
+                "icon": "strip", "x": cx, "y": round(b["y"] + 46.0, 1),
+                "strip_points": [
+                    {"x": round(b["x"] + 36.0, 1), "y": round(b["y"] + 46.0, 1)},
+                    {"x": round(b["x"] + b["w"] - 36.0, 1), "y": round(b["y"] + 46.0, 1)},
+                ],
+                "lumens": 1800, "beam_radius": 2.2, "kelvin": 3500, "color": "#ffe8b8",
+                "on": True, "model_note": "Under-Cabinet LED 2m", "price": 69.0,
+            })
+        elif arch == "office":
+            out.append({
+                "id": f"plan-desk-{idx}", "floor_id": fid, "name": "Desk Task Light",
+                "icon": "desk", "x": cx, "y": cy, "strip_points": [],
+                "lumens": 1100, "beam_radius": 2.4, "kelvin": 4000, "color": "#ffe8b8",
+                "on": True, "model_note": "High-CRI Desk Bar", "price": 99.0,
+            })
+        else:
+            out.append({
+                "id": f"plan-ceil-{idx}", "floor_id": fid, "name": f"{b['name']} Ceiling",
+                "icon": "ceiling", "x": cx, "y": cy, "strip_points": [],
+                "lumens": 1200, "beam_radius": 2.8, "kelvin": 2700, "color": "#ffd27a",
+                "on": True, "model_note": "Flush Ceiling Light", "price": 99.0,
+            })
+    return out
+
+
+def build_floorplan_template(template_id, rooms, bridge_id="", include_plan=False):
+    """Build one of the editable starter floorplan prototypes, auto-matching existing rooms."""
     if template_id not in FLOORPLAN_TEMPLATES:
         return None
     rooms_list = [r for r in (rooms or []) if isinstance(r, dict)]
-    bridge_rooms = [r for r in rooms_list if r.get("kind") == "room" and valid_uuid(r.get("id"))]
+    bridge_rooms = [r for r in rooms_list if r.get("kind") == "room" and _valid_fp_resource_id(r.get("id"))]
     other_group = next((r for r in rooms_list if r.get("kind") == "other"), None)
     clean_bid = bridge_id.upper() if isinstance(bridge_id, str) and BRIDGE_ID_RE.match(bridge_id.upper()) else ""
 
     boxes = []
     stamps = []
     lamps = {}
+    floors = [{"id": "eg", "name": "Ground Floor", "level": 0}]
 
     if template_id == "auto_bridge":
         if not bridge_rooms:
@@ -2617,6 +2926,7 @@ def build_floorplan_template(template_id, rooms, bridge_id=""):
         bp = _template_blueprints()[template_id]
         c_w = float(bp["canvas"]["width"])
         c_h = float(bp["canvas"]["height"])
+        floors = [dict(f) for f in bp.get("floors", [{"id": "eg", "name": "Ground Floor", "level": 0}])]
         boxes = [dict(b) for b in bp["boxes"]]
         stamps = [dict(s) for s in bp["stamps"]]
 
@@ -2736,16 +3046,53 @@ def build_floorplan_template(template_id, rooms, bridge_id=""):
         "auto_sync": False,
         "auto_sync_rooms": False,
         "background": {"path": "", "opacity": 0.35, "fit": "contain"},
+        "px_per_meter": 50.0,
+        "floors": floors,
+        "active_floor_id": floors[0]["id"],
         "boxes": boxes,
         "stamps": stamps,
         "lamps": lamps,
         "sensors": {},
+        "planned_lights": _sample_planned_lights_for_boxes(boxes) if include_plan else [],
     }
     return validate_floorplan(fp)
 
 
 def _point_in_box(lx, ly, box):
-    return (box["x"] <= lx <= box["x"] + box["w"]) and (box["y"] <= ly <= box["y"] + box["h"])
+    if not ((box["x"] - 0.5 <= lx <= box["x"] + box["w"] + 0.5) and (box["y"] - 0.5 <= ly <= box["y"] + box["h"] + 0.5)):
+        return False
+    pts = box.get("points")
+    if not isinstance(pts, list) or len(pts) < 3:
+        return (box["x"] <= lx <= box["x"] + box["w"]) and (box["y"] <= ly <= box["y"] + box["h"])
+    n = len(pts)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = pts[i]["x"], pts[i]["y"]
+        xj, yj = pts[j]["x"], pts[j]["y"]
+        # Inclusive edge check
+        dx, dy = xj - xi, yj - yi
+        l2 = dx * dx + dy * dy
+        t = 0.0 if l2 < 1e-9 else max(0.0, min(1.0, ((lx - xi) * dx + (ly - yi) * dy) / l2))
+        if math.hypot(lx - (xi + t * dx), ly - (yi + t * dy)) <= 1.5:
+            return True
+        if ((yi > ly) != (yj > ly)) and (lx < (xj - xi) * (ly - yi) / ((yj - yi) or 1e-9) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _box_area(box):
+    pts = box.get("points")
+    if not isinstance(pts, list) or len(pts) < 3:
+        return max(1.0, float(box["w"]) * float(box["h"]))
+    s = 0.0
+    n = len(pts)
+    for i in range(n):
+        a = pts[i]
+        b = pts[(i + 1) % n]
+        s += a["x"] * b["y"] - b["x"] * a["y"]
+    return max(1.0, abs(s) * 0.5)
 
 
 def compute_room_membership_diffs(floorplan, rooms):
@@ -2780,12 +3127,16 @@ def compute_room_membership_diffs(floorplan, rooms):
         lx, ly = lpos.get("x"), lpos.get("y")
         if lx is None or ly is None:
             continue
-        containing = [b for b in room_boxes if _point_in_box(lx, ly, b)]
+        lfloor = lpos.get("floor_id") or "eg"
+        containing = [
+            b for b in room_boxes
+            if (b.get("floor_id") or "eg") == lfloor and _point_in_box(lx, ly, b)
+        ]
         if not containing:
             continue
         # Prefer smallest-area containing box; on shared-wall tie keep current Hue room
         device_id, from_room_id = light_info[lid]
-        target_box = min(containing, key=lambda b: (b["w"] * b["h"], 0 if b.get("hue_id") == from_room_id else 1))
+        target_box = min(containing, key=lambda b: (_box_area(b), 0 if b.get("hue_id") == from_room_id else 1))
         to_room_id = target_box.get("hue_id") or ""
         if to_room_id != from_room_id:
             diffs.append({
@@ -4499,6 +4850,8 @@ class SynthController:
 # Lazy loader for optional local Ask AI engine (sibling hue-ai.py, works under python3 -I)
 _AI_MOD_LOCK = threading.Lock()
 _AI_MOD = None
+_PROVIDERS_MOD_LOCK = threading.Lock()
+_PROVIDERS_MOD = None
 
 
 def _load_ai_module():
@@ -4514,6 +4867,37 @@ def _load_ai_module():
         spec.loader.exec_module(mod)
         _AI_MOD = mod
         return _AI_MOD
+
+
+def _load_providers_module():
+    global _PROVIDERS_MOD
+    with _PROVIDERS_MOD_LOCK:
+        if _PROVIDERS_MOD is not None:
+            return _PROVIDERS_MOD
+        prov_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hue_providers.py")
+        if not os.path.isfile(prov_path):
+            return None
+        spec = importlib.util.spec_from_file_location("hue_providers", prov_path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _PROVIDERS_MOD = mod
+        return _PROVIDERS_MOD
+
+
+def valid_resource_id(value):
+    if valid_uuid(value):
+        return True
+    mod = _load_providers_module()
+    return bool(mod and mod.valid_resource_id(value))
+
+
+def is_extra_resource(value):
+    if valid_uuid(value):
+        return False
+    mod = _load_providers_module()
+    return bool(mod and mod.is_extra_resource(value))
 
 
 # Main state machine
@@ -4585,6 +4969,11 @@ class Hue:
         self.last_sent = {"light": 0.0, "grouped_light": 0.0, "scene": 0.0}
         self.last_refresh = 0.0
         self.refresh_hold_until = 0.0
+        self._providers_mod = _load_providers_module()
+        self.providers_mgr = self._providers_mod.ProviderManager(CONFIG_DIR) if self._providers_mod else None
+        self._last_extra_refresh = 0.0
+        if not self.config and self.providers_mgr and self.providers_mgr.has_enabled():
+            self.phase = "connecting"
 
     def _reset_sse(self):
         """Close any active SSE socket and wake the SSE listener thread."""
@@ -4616,10 +5005,71 @@ class Hue:
 
     def redact(self, text):
         text = str(text)
-        for secret in self.secrets | {self.config.get("app_key") or ""}:
+        extra_secrets = self.providers_mgr.secrets() if getattr(self, "providers_mgr", None) else set()
+        for secret in self.secrets | extra_secrets | {self.config.get("app_key") or ""}:
             if len(secret) >= 6:
                 text = text.replace(secret, "***")
         return text
+
+    def _has_extra_providers(self):
+        mgr = getattr(self, "providers_mgr", None)
+        return bool(mgr and mgr.has_enabled())
+
+    def _all_rooms(self):
+        rooms = list(self.rooms)
+        mgr = getattr(self, "providers_mgr", None)
+        if mgr:
+            extra_rooms, _, _, _, _ = mgr.snapshot_parts()
+            rooms.extend(extra_rooms)
+        return rooms
+
+    def _apply_extra_optimistic(self, rid, body):
+        mgr = getattr(self, "providers_mgr", None)
+        if not mgr:
+            return
+        on = body.get("on", {}).get("on") if "on" in body else None
+        bri = body.get("dimming", {}).get("brightness") if "dimming" in body else None
+        mirek = body.get("color_temperature", {}).get("mirek") if "color_temperature" in body else None
+        xy = body.get("color", {}).get("xy") if "color" in body else None
+        effect = body.get("effects", {}).get("effect") if "effects" in body else None
+        with mgr.lock:
+            for res in mgr.results.values():
+                changed = False
+                for room in res.get("rooms", []):
+                    for light in room.get("lights", []):
+                        if light.get("id") == rid:
+                            changed = True
+                            if on is not None:
+                                light["on"] = on
+                            if bri is not None:
+                                light["bri"], light["on"] = bri, True
+                            if mirek is not None:
+                                light["mirek"] = mirek
+                                light["color"] = mirek_to_hex(mirek)
+                                light["on"] = True
+                            if xy is not None:
+                                light["color"] = xy_to_hex(xy.get("x"), xy.get("y"))
+                                light["mirek"] = None
+                                light["on"] = True
+                            if effect is not None:
+                                light["effect"] = effect
+                                if effect != "no_effect":
+                                    light["on"] = True
+                    if changed:
+                        lit = [l for l in room.get("lights", []) if l.get("on")]
+                        room["on"], room["on_count"] = bool(lit), len(lit)
+                        room["color"] = blend_colors([l["color"] for l in lit])
+                        if lit:
+                            room["bri"] = round(sum(l["bri"] for l in lit) / len(lit), 1)
+                if changed:
+                    res["on_count"] = sum(1 for r in res.get("rooms", []) for l in r.get("lights", []) if l.get("on"))
+
+    def refresh_extra_providers(self):
+        mgr = getattr(self, "providers_mgr", None)
+        if not mgr or not mgr.has_enabled():
+            return
+        mgr.refresh_all()
+        self._last_extra_refresh = time.time()
 
     def safe(self, exc, limit):
         """An exception's text for the panel: keys removed first, then cleaned and cut."""
@@ -4658,14 +5108,46 @@ class Hue:
                     "motion_area_candidates": int(getattr(self, "motion_area_candidates", 0)),
                     "motion_area_candidate_rooms": list(getattr(self, "motion_area_candidate_rooms", [])),
                 }
+            mgr = getattr(self, "providers_mgr", None)
+            extra_rooms, extra_sensors, extra_lights, extra_on, providers_list = (
+                mgr.snapshot_parts() if mgr else ([], [], 0, 0, [])
+            )
+            all_rooms = list(self.rooms) + list(extra_rooms)
+            all_sensors = list(sensors) + list(extra_sensors)
+            total_lights = int(self.light_count) + int(extra_lights)
+            total_on = int(self.on_count) + int(extra_on)
+            phase = self.phase
+            error_text = self.error
+            if not self.config and not self.pair_ip and mgr and mgr.has_enabled():
+                enabled_p = [p for p in providers_list if p.get("enabled")]
+                any_loaded = any(p.get("connected") or p.get("light_count", 0) > 0 for p in enabled_p)
+                all_errored = bool(enabled_p) and all(bool(p.get("error")) for p in enabled_p)
+                if any_loaded:
+                    phase = "ok"
+                elif all_errored:
+                    phase = "error"
+                    if not error_text:
+                        error_text = enabled_p[0].get("error", "")
+                else:
+                    phase = "connecting"
+                badges = sorted({(self._providers_mod.PROVIDER_KINDS.get(p["kind"], {}).get("badge") or p["kind"]) for p in enabled_p}) if getattr(self, "_providers_mod", None) else []
+                bridge = {
+                    "ip": enabled_p[0]["host"] if len(enabled_p) == 1 else ", ".join(badges),
+                    "name": enabled_p[0]["name"] if len(enabled_p) == 1 else f"{len(enabled_p)} Devices",
+                    "model": ", ".join(badges),
+                    "model_id": "",
+                    "is_pro": False,
+                    "motion_area_candidates": 0,
+                    "motion_area_candidate_rooms": [],
+                }
             fp = getattr(self, "floorplan", None)
-            if fp is None and self.rooms:
-                fp = build_floorplan_template("auto_bridge", self.rooms, bridge_id=self.config.get("bridge_id", "") if self.config else "")
+            if fp is None and all_rooms:
+                fp = build_floorplan_template("auto_bridge", all_rooms, bridge_id=self.config.get("bridge_id", "") if self.config else "")
                 self.floorplan = fp
             return {
-                "phase": self.phase, "error": self.error, "bridge": bridge,
+                "phase": phase, "error": error_text, "bridge": bridge, "hue_paired": bool(self.config),
                 "error_code": self.error_code if self.error else "", "error_args": self.error_args if self.error else [],
-                "rooms": self.rooms, "light_count": self.light_count, "on_count": self.on_count,
+                "rooms": all_rooms, "light_count": total_lights, "on_count": total_on,
                 "candidates": self.candidates, "discovering": self.discovering,
                 "pair_ip": self.pair_ip,
                 "pair_remaining": max(0, int(self.pair_until - time.time())) if self.pair_ip else 0,
@@ -4682,7 +5164,11 @@ class Hue:
                 "rule_log": getattr(self, "rule_log", []),
                 "entertainment_areas": getattr(self, "entertainment_areas", []),
                 "motion_areas": motion_areas,
-                "sensors": sensors,
+                "sensors": all_sensors,
+                "providers": providers_list,
+                "discovered_providers": list(mgr.discovered) if mgr else [],
+                "discovering_providers": bool(mgr.discovering) if mgr else False,
+                "provider_action": dict(mgr.last_action) if mgr else {"running": False, "kind": "", "ok": False, "message": "", "pair_id": ""},
                 "floorplan": fp,
                 "ai": {
                     "running": bool(self.ai_state.get("running", False)),
@@ -4725,7 +5211,7 @@ class Hue:
         """A light, grouped light or scene of the current model (call with the lock held)."""
         if kind == "grouped_light" and rid and rid == getattr(self, "bridge_home_gl", ""):
             return True
-        for room in self.rooms:
+        for room in self._all_rooms():
             if kind == "grouped_light" and room["grouped_light"] == rid:
                 return True
             if kind == "light" and any(light["id"] == rid for light in room["lights"]):
@@ -4735,13 +5221,13 @@ class Hue:
         return False
 
     def known_target(self, target_kind, target_id):
-        """A light, room or zone UUID of the current model (call with the lock held)."""
-        if not valid_uuid(target_id):
+        """A light, room or zone ID of the current model (call with the lock held)."""
+        if not valid_resource_id(target_id):
             return False
         if target_kind == "light":
             return self.known("light", target_id)
         if target_kind in ("room", "zone"):
-            return any(r["kind"] == target_kind and r["id"] == target_id for r in self.rooms)
+            return any(r["kind"] == target_kind and r["id"] == target_id for r in self._all_rooms())
         return False
 
     def may_queue(self, kind, rid):
@@ -4990,6 +5476,19 @@ class Hue:
         return transitions
 
     def queue(self, kind, rid, body, from_rule=False):
+        if kind == "light" and is_extra_resource(rid):
+            mgr = getattr(self, "providers_mgr", None)
+            if not mgr:
+                return False
+            with self.lock:
+                if not self.known("light", rid):
+                    return False
+                self._apply_extra_optimistic(rid, body)
+                if not mgr.queue_command("light", rid, body):
+                    return False
+            if not from_rule:
+                self.emit()
+            return True
         with self.lock:
             if not self.may_queue(kind, rid):
                 return False
@@ -5282,11 +5781,15 @@ class Hue:
         if tkind == "light":
             return self.queue("light", tid, body, from_rule=True)
         if tkind == "room":
-            if recall_scene and target.get("scene_id") and self.may_queue("scene", target["scene_id"]):
-                self.pending[("scene", target["scene_id"])] = {"recall": {"action": "active"}}
-                self.refresh_hold_until = 0
-                return True
-            for room in self.rooms:
+            if recall_scene and target.get("scene_id"):
+                sid = target["scene_id"]
+                if is_extra_resource(sid) and getattr(self, "providers_mgr", None):
+                    return self.providers_mgr.queue_command("scene", sid, {})
+                if self.may_queue("scene", sid):
+                    self.pending[("scene", sid)] = {"recall": {"action": "active"}}
+                    self.refresh_hold_until = 0
+                    return True
+            for room in self._all_rooms():
                 if room["id"] == tid and room["kind"] == "room":
                     if valid_uuid(room.get("grouped_light")):
                         return self.queue("grouped_light", room["grouped_light"], body, from_rule=True)
@@ -5758,6 +6261,8 @@ class Hue:
             self.panel_open = False
         elif name == "refresh":
             self.last_refresh = 0
+            if getattr(self, "providers_mgr", None):
+                self.providers_mgr.trigger_refresh()
             self.wake.set()
         elif name == "discover":
             self.start_discovery()
@@ -5814,10 +6319,12 @@ class Hue:
             self._reset_sse()
             self.emit()
             self.start_discovery()
-        elif name in ("light", "group") and self.config:
+        elif name in ("light", "group") and (self.config or self._has_extra_providers()):
             kind = "light" if name == "light" else "grouped_light"
             rid = cmd.get("id")
-            if not valid_uuid(rid):
+            if not valid_resource_id(rid):
+                return
+            if kind == "grouped_light" and not valid_uuid(rid):
                 return
             body = {}
             if isinstance(cmd.get("on"), bool):
@@ -5851,20 +6358,42 @@ class Hue:
                 body["on"] = {"on": True}
             if "effect" in cmd and cmd["effect"] is not None:
                 eff = cmd["effect"]
-                if not isinstance(eff, str) or EFFECT_RE.match(eff) is None:
+                if not isinstance(eff, str) or (not is_extra_resource(rid) and EFFECT_RE.match(eff) is None) or len(eff) > 48:
                     return
                 body["effects"] = {"effect": eff}
                 if eff != "no_effect":
                     body["on"] = {"on": True}
             if body:
                 self.queue(kind, rid, body)
-        elif name == "all_off" and self.config:
-            self.all_off()
-        elif name == "all_on" and self.config:
-            self.all_on(cmd.get("exclude_rooms"))
-        elif name == "scene" and self.config:
+        elif name == "all_off" and (self.config or self._has_extra_providers()):
+            if self.config:
+                self.all_off()
+            if self._has_extra_providers():
+                extra_rooms, _, _, _, _ = self.providers_mgr.snapshot_parts()
+                for r in extra_rooms:
+                    for l in r.get("lights", []):
+                        if l.get("on"):
+                            self.queue("light", l["id"], {"on": {"on": False}}, from_rule=True)
+                self.emit()
+        elif name == "all_on" and (self.config or self._has_extra_providers()):
+            if self.config:
+                self.all_on(cmd.get("exclude_rooms"))
+            if self._has_extra_providers():
+                excluded = set(cmd.get("exclude_rooms") or []) if isinstance(cmd.get("exclude_rooms"), list) else set()
+                extra_rooms, _, _, _, _ = self.providers_mgr.snapshot_parts()
+                for r in extra_rooms:
+                    if r["id"] not in excluded:
+                        for l in r.get("lights", []):
+                            self.queue("light", l["id"], {"on": {"on": True}}, from_rule=True)
+                self.emit()
+        elif name == "scene" and (self.config or self._has_extra_providers()):
             rid = cmd.get("id")
-            if valid_uuid(rid):
+            if is_extra_resource(rid) and self.providers_mgr:
+                with self.lock:
+                    if not self.known("scene", rid):
+                        return
+                self.providers_mgr.queue_command("scene", rid, {})
+            elif valid_uuid(rid) and self.config:
                 with self.lock:
                     if not self.may_queue("scene", rid):
                         return
@@ -5896,16 +6425,16 @@ class Hue:
                 save_themes(new_themes)
                 self.custom_themes = new_themes
             self.emit()
-        elif name == "theme_apply" and self.config:
+        elif name == "theme_apply" and (self.config or self._has_extra_providers()):
             theme_id = cmd.get("theme_id")
             light_id = cmd.get("light_id")
-            if not isinstance(theme_id, str) or not valid_uuid(light_id):
+            if not isinstance(theme_id, str) or not valid_resource_id(light_id):
                 return
             body = None
             with self.lock:
                 if not self.known("light", light_id):
                     return
-                light = self._find_light(light_id)
+                light = next((l for r in self._all_rooms() for l in r["lights"] if l["id"] == light_id), None)
                 theme = next((t for t in (BUILTIN_THEMES + self.custom_themes) if t["id"] == theme_id), None)
                 if light is None or theme is None:
                     return
@@ -5940,8 +6469,10 @@ class Hue:
                 self.local_schedules = merged["schedules"]
                 self._rebuild_schedules()
             self.emit()
-        elif name == "schedule_create" and self.config:
+        elif name == "schedule_create" and (self.config or self._has_extra_providers()):
             source = cmd.get("source") if cmd.get("source") in SCHEDULE_MODES else self.schedule_mode
+            if not self.config or is_extra_resource(cmd.get("target_id")) or is_extra_resource(cmd.get("scene_id")):
+                source = "local"
             if source == "local":
                 with self.lock:
                     if not self.known_target(cmd.get("target_kind"), cmd.get("target_id")):
@@ -6157,9 +6688,10 @@ class Hue:
             tid = cmd.get("template_id")
             if tid not in FLOORPLAN_TEMPLATES:
                 return
+            include_plan = bool(cmd.get("include_plan", False))
             with self.lock:
                 bid = self.config.get("bridge_id", "") if self.config else ""
-                fp = build_floorplan_template(tid, self.rooms, bridge_id=bid)
+                fp = build_floorplan_template(tid, self._all_rooms(), bridge_id=bid, include_plan=include_plan)
                 if fp is None:
                     return
                 fp = save_floorplan(fp)
@@ -6676,6 +7208,80 @@ class Hue:
                 self.emit()
 
             threading.Thread(target=_run_ai, daemon=True).start()
+        elif name == "save_provider" and self.providers_mgr:
+            raw_prov = cmd.get("provider")
+            try:
+                self.providers_mgr.save_connection(raw_prov)
+                self.providers_mgr.last_action = {"running": False, "kind": "save", "ok": True, "message": "Saved", "pair_id": ""}
+            except Exception as exc:  # noqa: BLE001
+                self.providers_mgr.last_action = {"running": False, "kind": "save", "ok": False, "message": self.redact(str(exc))[:160], "pair_id": ""}
+                self.emit()
+                return
+            self.emit()
+        elif name == "remove_provider" and self.providers_mgr:
+            cid = str(cmd.get("id") or "")
+            if cid:
+                try:
+                    self.providers_mgr.remove_connection(cid)
+                except Exception:
+                    pass
+                self.emit()
+        elif name == "toggle_provider" and self.providers_mgr:
+            cid = str(cmd.get("id") or "")
+            enabled = bool(cmd.get("enabled", True))
+            if cid:
+                try:
+                    self.providers_mgr.toggle_connection(cid, enabled)
+                except Exception:
+                    pass
+                self.emit()
+        elif name == "discover_providers" and self.providers_mgr and self._providers_mod:
+            if not self.providers_mgr.discovering:
+                self.providers_mgr.discovering = True
+                self.emit()
+                def _disc_providers():
+                    try:
+                        found = self._providers_mod.discover_providers(run_bounded=run_bounded)
+                    except Exception:
+                        found = []
+                    self.providers_mgr.discovered = found
+                    self.providers_mgr.discovering = False
+                    self.emit()
+                threading.Thread(target=_disc_providers, daemon=True).start()
+        elif name == "test_provider" and self.providers_mgr:
+            raw_prov = cmd.get("provider")
+            self.providers_mgr.last_action = {"running": True, "kind": "test", "ok": False, "message": "", "pair_id": ""}
+            self.emit()
+            def _test_prov():
+                try:
+                    summary = self.providers_mgr.test_connection(raw_prov)
+                    self.providers_mgr.last_action = {"running": False, "kind": "test", "ok": True, "message": self.redact(summary)[:160], "pair_id": ""}
+                except Exception as exc:  # noqa: BLE001
+                    self.providers_mgr.last_action = {"running": False, "kind": "test", "ok": False, "message": self.redact(str(exc))[:160], "pair_id": ""}
+                self.emit()
+            threading.Thread(target=_test_prov, daemon=True).start()
+        elif name == "pair_provider" and self.providers_mgr and self._providers_mod:
+            pkind = str(cmd.get("kind") or "").lower()
+            phost = str(cmd.get("host") or "").strip()
+            pport = cmd.get("port")
+            if pkind not in ("nanoleaf", "dirigera"):
+                return
+            eff_port = int(pport or (16021 if pkind == "nanoleaf" else 8443))
+            self.providers_mgr.last_action = {"running": True, "kind": f"pair_{pkind}", "ok": False, "message": "", "pair_id": ""}
+            self.emit()
+            def _pair_prov():
+                try:
+                    if pkind == "nanoleaf":
+                        tok, fp = self._providers_mod.pair_nanoleaf(phost, eff_port)
+                    else:
+                        tok, fp = self._providers_mod.pair_dirigera(phost, eff_port)
+                    # Never emit the raw token in snapshots — keep it server-side under a one-time pair_id!
+                    pair_id = self.providers_mgr.store_paired_token(pkind, phost, eff_port, tok, fp)
+                    self.providers_mgr.last_action = {"running": False, "kind": f"pair_{pkind}", "ok": True, "message": "Paired", "pair_id": pair_id}
+                except Exception as exc:  # noqa: BLE001
+                    self.providers_mgr.last_action = {"running": False, "kind": f"pair_{pkind}", "ok": False, "message": self.redact(str(exc))[:160], "pair_id": ""}
+                self.emit()
+            threading.Thread(target=_pair_prov, daemon=True).start()
 
     # -- loops
     def worker(self):
@@ -6748,6 +7354,8 @@ class Hue:
         self.emit()
         threading.Thread(target=self.worker, daemon=True).start()
         threading.Thread(target=self.sse_loop, daemon=True).start()
+        if getattr(self, "providers_mgr", None):
+            self.providers_mgr.start_worker(on_change=self.emit, is_panel_open_fn=lambda: self.panel_open)
         try:
             for cmd in read_commands(sys.stdin.buffer):
                 try:
@@ -6758,6 +7366,8 @@ class Hue:
                     self.emit()
         finally:
             self._stop.set()
+            if getattr(self, "providers_mgr", None):
+                self.providers_mgr.stop_worker()
             if hasattr(self, "synth"):
                 self.synth.stop(emit=False)
             self._reset_sse()

@@ -71,6 +71,9 @@ Terminal=false
 OnlyShowIn=KDE;Hyprland;
 EOF
 install -Dm644 scripts/hue-lights.py "$data/maprisma-hue-lights/scripts/hue-lights.py"
+if [[ -f scripts/hue_providers.py ]]; then
+    install -Dm644 scripts/hue_providers.py "$data/maprisma-hue-lights/scripts/hue_providers.py"
+fi
 if [[ -f scripts/hue-ai.py ]]; then
     install -Dm644 scripts/hue-ai.py "$data/maprisma-hue-lights/scripts/hue-ai.py"
 fi

@@ -35,14 +35,16 @@ use maprisma_hue_lights::i18n::{tr, trf};
 use serde_json::{Value, json};
 
 use crate::model::{
-    BridgeLightInfo, EntertainmentArea, FLOORPLAN_ARCHETYPES, FLOORPLAN_STAMP_KINDS,
-    FLOORPLAN_TEMPLATES, FloorplanBox, FloorplanDocument, FloorplanStamp, HueSensor, LAMP_ICONS,
-    MotionArea, archetype_glyph, archetype_label, default_trigger_state, extract_bridge_lights,
-    is_light_or_room_trigger, j_bool, j_list, j_str, lamp_icon_label, lamp_icon_svg,
-    motion_aware_eligible_rooms, normalize_lamp_icon, normalize_trigger_state,
+    BridgeLightInfo, EntertainmentArea, FLOORPLAN_ARCHETYPES, FLOORPLAN_ROOM_SHAPES,
+    FLOORPLAN_STAMP_KINDS, FLOORPLAN_TEMPLATES, FloorplanBox, FloorplanDocument, FloorplanPoint,
+    FloorplanStamp, HueSensor, LAMP_ICONS, MotionArea, PLANNED_LIGHT_PRESETS,
+    archetype_glyph, archetype_label, default_trigger_state, extract_bridge_lights,
+    is_light_or_room_trigger, j_bool, j_list, j_str, lamp_icon_label,
+    lamp_icon_svg, motion_aware_eligible_rooms, normalize_lamp_icon, normalize_trigger_state,
     parse_entertainment_areas, parse_motion_areas, parse_sensors, resolve_name,
     room_active_schedule_badge, should_show_motion_aware_hint, skin_style, stamp_kind_label,
-    synth_target_lights, template_label, trigger_state_options, valid_hhmm,
+    synth_target_lights, target_lux_for_archetype, template_label, trigger_state_options,
+    valid_hhmm,
 };
 
 // ------------------------------------------------------------------------- Visual constants
@@ -70,7 +72,33 @@ const MIN_BOX_DIM: f64 = 60.0;
 pub enum CanvasMode {
     #[default]
     Select,
+    Plan,
     Wire,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AmbientMode {
+    #[default]
+    Day,
+    Dusk,
+    Night,
+}
+
+impl AmbientMode {
+    pub fn dim_alpha(self) -> f32 {
+        match self {
+            AmbientMode::Day => 0.0,
+            AmbientMode::Dusk => 0.28,
+            AmbientMode::Night => 0.56,
+        }
+    }
+    pub fn glow_boost(self) -> f32 {
+        match self {
+            AmbientMode::Day => 1.0,
+            AmbientMode::Dusk => 1.22,
+            AmbientMode::Night => 1.48,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -170,6 +198,7 @@ pub enum Selection {
     Sensor(String),
     Box(String),
     Stamp(String),
+    Planned(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,10 +438,39 @@ pub enum MapMsg {
     ToggleAddMenu,
     ToggleViewMenu,
     ToggleTemplatesMenu,
+    ToggleGalleryIncludePlan(bool),
     ApplyTemplate(String),
     AddBox(String), // "room" | "zone"
+    AddBoxWithShape(String, String), // (kind, shape)
     AddStamp(String),
     SetMode(CanvasMode),
+    SetAmbient(AmbientMode),
+    // Multi-floor
+    SelectFloor(String),
+    AddFloor,
+    DeleteFloor(String),
+    BoxSetFloor(String, String),
+    // Polygon reshaping
+    BoxApplyShape(String, String),
+    MoveBoxVertex { box_id: String, index: usize, x: f64, y: f64, commit: bool },
+    InsertBoxVertex { box_id: String, after_edge: usize, x: f64, y: f64 },
+    RemoveBoxVertex { box_id: String, index: usize },
+    // Future Lighting Planner (Plan mode)
+    TogglePlanAddMenu,
+    TogglePlanList,
+    AddPlannedLight(String), // preset id
+    MovePlannedLight { id: String, x: f64, y: f64, commit: bool },
+    MovePlannedStripVertex { id: String, index: usize, x: f64, y: f64, commit: bool },
+    TogglePlannedLight(String),
+    PlannedSetLumens(String, u32),
+    PlannedSetKelvin(String, u32),
+    PlannedSetBeam(String, f64),
+    PlannedNameInput(String),
+    PlannedNameSave(String),
+    PlannedPriceInput(String),
+    PlannedPriceSave(String),
+    BindPlannedToReal { planned_id: String, real_light_id: String },
+    DeletePlannedLight(String),
     ToggleGlows,
     ToggleFurniture,
     ToggleWires,
@@ -509,6 +567,12 @@ pub struct FloorplanState {
     pub sidebar_open: bool,
     pub search: String,
     pub mode: CanvasMode,
+    pub ambient: AmbientMode,
+    pub gallery_include_plan: bool,
+    pub plan_add_open: bool,
+    pub plan_list_open: bool,
+    pub planned_name_draft: String,
+    pub planned_price_draft: String,
     pub wire_kind: WireKind,
     pub selection: Option<Selection>,
     pub armed_place_lamp: Option<String>,
@@ -546,6 +610,12 @@ impl Default for FloorplanState {
             sidebar_open: true,
             search: String::new(),
             mode: CanvasMode::Select,
+            ambient: AmbientMode::Day,
+            gallery_include_plan: false,
+            plan_add_open: false,
+            plan_list_open: false,
+            planned_name_draft: String::new(),
+            planned_price_draft: String::new(),
             wire_kind: WireKind::Follow,
             selection: None,
             armed_place_lamp: None,
@@ -578,6 +648,8 @@ impl FloorplanState {
         self.add_menu_open
             || self.view_menu_open
             || self.templates_open
+            || self.plan_add_open
+            || self.plan_list_open
             || self.stamps_open
             || self.bg_open
             || self.ent_menu_open
@@ -591,6 +663,8 @@ impl FloorplanState {
         self.add_menu_open = false;
         self.view_menu_open = false;
         self.templates_open = false;
+        self.plan_add_open = false;
+        self.plan_list_open = false;
         self.stamps_open = false;
         self.bg_open = false;
         self.ent_menu_open = false;
@@ -705,6 +779,16 @@ impl FloorplanState {
                 self.box_rename_draft = name;
                 self.new_scene_name.clear();
             }
+            Some(Selection::Planned(ref pid)) => {
+                if let Some(pl) = self.doc.planned_lights.iter().find(|p| p.id == *pid) {
+                    self.planned_name_draft = pl.name.clone();
+                    self.planned_price_draft = if pl.price > 0.0 {
+                        format!("{:.0}", pl.price)
+                    } else {
+                        String::new()
+                    };
+                }
+            }
             _ => {}
         }
     }
@@ -725,7 +809,7 @@ impl FloorplanState {
 // ------------------------------------------------------------------------- Geometry, Containment & Diff Detection
 
 pub fn point_in_box(x: f64, y: f64, b: &FloorplanBox) -> bool {
-    x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h
+    b.contains_point(x, y)
 }
 
 pub fn snap_coord(val: f64, grid: i32, snap: bool) -> f64 {
@@ -749,7 +833,7 @@ pub fn containing_room_box<'a>(
         if b.kind != "room" || !point_in_box(x, y, b) {
             continue;
         }
-        let area = b.w * b.h;
+        let area = b.area_px();
         let tie = if b.hue_id.as_deref() == Some(current_room_id) && !current_room_id.is_empty() {
             0u8
         } else {
@@ -758,7 +842,7 @@ pub fn containing_room_box<'a>(
         let replace = match best {
             None => true,
             Some(prev) => {
-                let prev_area = prev.w * prev.h;
+                let prev_area = prev.area_px();
                 let prev_tie = if prev.hue_id.as_deref() == Some(current_room_id) && !current_room_id.is_empty() {
                     0u8
                 } else {
@@ -966,6 +1050,8 @@ pub fn compute_pending_sync_count(doc: &FloorplanDocument, stats: &Value) -> usi
             y: 0.0,
             w: doc.canvas.width.max(400.0),
             h: doc.canvas.height.max(300.0),
+            points: Vec::new(),
+            floor_id: doc.active_floor_id.clone(),
             entertainment_area_id: None,
         };
         let ref_box = if doc.boxes.len() == 1 { &doc.boxes[0] } else { &fallback_box };
@@ -1125,6 +1211,9 @@ enum DragOp {
     Sensor { id: String, grab_dx: f64, grab_dy: f64, preview: Option<(f64, f64)> },
     BoxMove { id: String, grab_dx: f64, grab_dy: f64, preview: Option<(f64, f64)> },
     BoxResize { id: String, handle: ResizeHandle, orig: FloorplanBox, preview: Option<(f64, f64, f64, f64)> },
+    BoxVertex { box_id: String, index: usize, preview: Option<(f64, f64)> },
+    PlannedMove { id: String, grab_dx: f64, grab_dy: f64, preview: Option<(f64, f64)> },
+    PlannedStripVertex { id: String, index: usize, preview: Option<(f64, f64)> },
     Stamp { id: String, grab_dx: f64, grab_dy: f64, preview: Option<(f64, f64)> },
     Wire { from_kind: String, from_id: String, cursor: Point },
 }
@@ -1151,6 +1240,7 @@ struct FloorplanCanvasProgram<'a> {
     synth_running: bool,
     synth_lights: HashSet<String>,
     mode: CanvasMode,
+    ambient: AmbientMode,
     wire_kind: WireKind,
     selection: Option<Selection>,
     armed_place_lamp: Option<String>,
@@ -1262,6 +1352,7 @@ impl<'a> FloorplanCanvasProgram<'a> {
             synth_running,
             synth_lights,
             mode: state.mode,
+            ambient: state.ambient,
             wire_kind: state.wire_kind,
             selection: state.selection.clone(),
             armed_place_lamp: state.armed_place_lamp.clone(),
@@ -1331,10 +1422,117 @@ impl<'a> FloorplanCanvasProgram<'a> {
         }
     }
 
+    fn active_floor(&self) -> &str {
+        if self.doc.active_floor_id.is_empty() { "eg" } else { &self.doc.active_floor_id }
+    }
+
+    fn effective_box_points(&self, b: &FloorplanBox, drag: Option<&DragOp>) -> Vec<FloorplanPoint> {
+        let mut pts = b.effective_points();
+        match drag {
+            Some(DragOp::BoxMove { id, preview: Some((px, py)), .. }) if id == &b.id => {
+                let dx = *px - b.x;
+                let dy = *py - b.y;
+                for p in &mut pts {
+                    p.x += dx;
+                    p.y += dy;
+                }
+            }
+            Some(DragOp::BoxResize { id, preview: Some((nx, ny, nw, nh)), .. }) if id == &b.id => {
+                let ow = b.w.max(1.0);
+                let oh = b.h.max(1.0);
+                for p in &mut pts {
+                    p.x = *nx + ((p.x - b.x) / ow) * *nw;
+                    p.y = *ny + ((p.y - b.y) / oh) * *nh;
+                }
+            }
+            Some(DragOp::BoxVertex { box_id, index, preview: Some((vx, vy)) }) if box_id == &b.id => {
+                if let Some(p) = pts.get_mut(*index) {
+                    p.x = *vx;
+                    p.y = *vy;
+                }
+            }
+            _ => {}
+        }
+        pts
+    }
+
+    fn hit_selected_box_vertex(&self, pt: Point, tf: CanvasTransform) -> Option<(String, usize)> {
+        let Some(Selection::Box(ref bid)) = self.selection else { return None };
+        let b = self.doc.boxes.iter().find(|b| b.id == *bid && b.floor_id == self.active_floor())?;
+        if !b.is_polygon() {
+            return None;
+        }
+        for (idx, p) in b.points.iter().enumerate() {
+            let sp = tf.to_screen(p.x, p.y);
+            if ((pt.x - sp.x).powi(2) + (pt.y - sp.y).powi(2)).sqrt() <= 9.5 {
+                return Some((b.id.clone(), idx));
+            }
+        }
+        None
+    }
+
+    fn hit_selected_box_midpoint(&self, pt: Point, tf: CanvasTransform) -> Option<(String, usize, f64, f64)> {
+        let Some(Selection::Box(ref bid)) = self.selection else { return None };
+        let b = self.doc.boxes.iter().find(|b| b.id == *bid && b.floor_id == self.active_floor())?;
+        let pts = b.effective_points();
+        let n = pts.len();
+        if n < 3 || n >= 32 {
+            return None;
+        }
+        for i in 0..n {
+            let a = &pts[i];
+            let c = &pts[(i + 1) % n];
+            let mx = (a.x + c.x) * 0.5;
+            let my = (a.y + c.y) * 0.5;
+            let sp = tf.to_screen(mx, my);
+            if ((pt.x - sp.x).powi(2) + (pt.y - sp.y).powi(2)).sqrt() <= 8.5 {
+                return Some((b.id.clone(), i, mx, my));
+            }
+        }
+        None
+    }
+
+    fn hit_planned_strip_vertex(&self, pt: Point, tf: CanvasTransform) -> Option<(String, usize)> {
+        let floor = self.active_floor();
+        for pl in &self.doc.planned_lights {
+            if pl.floor_id != floor || pl.strip_points.len() < 2 {
+                continue;
+            }
+            for (idx, p) in pl.strip_points.iter().enumerate() {
+                let sp = tf.to_screen(p.x, p.y);
+                if ((pt.x - sp.x).powi(2) + (pt.y - sp.y).powi(2)).sqrt() <= 8.5 {
+                    return Some((pl.id.clone(), idx));
+                }
+            }
+        }
+        None
+    }
+
+    fn hit_planned_light(&self, pt: Point, tf: CanvasTransform) -> Option<String> {
+        let floor = self.active_floor();
+        let mut best: Option<(f32, String)> = None;
+        for pl in &self.doc.planned_lights {
+            if pl.floor_id != floor {
+                continue;
+            }
+            let (ax, ay) = pl.anchor();
+            let sp = tf.to_screen(ax, ay);
+            let d = ((pt.x - sp.x).powi(2) + (pt.y - sp.y).powi(2)).sqrt();
+            if d <= LAMP_RADIUS_PX + 5.0 && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                best = Some((d, pl.id.clone()));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
     fn hit_lamp(&self, pt: Point, tf: CanvasTransform) -> Option<String> {
+        let floor = self.active_floor();
         let hit_r = LAMP_RADIUS_PX + 6.0;
         let mut best: Option<(f32, String)> = None;
         for (lid, pos) in &self.doc.lamps {
+            if pos.floor_id != floor {
+                continue;
+            }
             let sp = tf.to_screen(pos.x, pos.y);
             let d = ((pt.x - sp.x).powi(2) + (pt.y - sp.y).powi(2)).sqrt();
             if d <= hit_r && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
@@ -1345,9 +1543,13 @@ impl<'a> FloorplanCanvasProgram<'a> {
     }
 
     fn hit_sensor(&self, pt: Point, tf: CanvasTransform) -> Option<String> {
+        let floor = self.active_floor();
         let hit_r = SENSOR_HALF_PX + 5.0;
         let mut best: Option<(f32, String)> = None;
         for (sid, pos) in &self.doc.sensors {
+            if pos.floor_id != floor {
+                continue;
+            }
             let sp = tf.to_screen(pos.x, pos.y);
             if (pt.x - sp.x).abs() <= hit_r && (pt.y - sp.y).abs() <= hit_r {
                 let d = ((pt.x - sp.x).powi(2) + (pt.y - sp.y).powi(2)).sqrt();
@@ -1369,7 +1571,10 @@ impl<'a> FloorplanCanvasProgram<'a> {
 
     fn hit_selected_box_handle(&self, pt: Point, tf: CanvasTransform) -> Option<(FloorplanBox, ResizeHandle)> {
         let Some(Selection::Box(ref bid)) = self.selection else { return None };
-        let b = self.doc.boxes.iter().find(|b| b.id == *bid)?;
+        let b = self.doc.boxes.iter().find(|b| b.id == *bid && b.floor_id == self.active_floor())?;
+        if b.is_polygon() {
+            return None;
+        }
         for h in ResizeHandle::ALL {
             let (wx, wy) = h.world_point(b);
             let sp = tf.to_screen(wx, wy);
@@ -1384,8 +1589,12 @@ impl<'a> FloorplanCanvasProgram<'a> {
         if !self.doc.show_furniture {
             return None;
         }
+        let floor = self.active_floor();
         let (wx, wy) = tf.to_world(pt);
         for st in self.doc.stamps.iter().rev() {
+            if st.floor_id != floor {
+                continue;
+            }
             if wx >= st.x - 6.0 && wx <= st.x + st.w + 6.0 && wy >= st.y - 6.0 && wy <= st.y + st.h + 6.0 {
                 return Some(st.id.clone());
             }
@@ -1411,11 +1620,15 @@ impl<'a> FloorplanCanvasProgram<'a> {
     }
 
     fn hit_box(&self, pt: Point, tf: CanvasTransform) -> Option<String> {
+        let floor = self.active_floor();
         let (wx, wy) = tf.to_world(pt);
         let mut best: Option<(f64, String)> = None;
         for b in &self.doc.boxes {
+            if b.floor_id != floor {
+                continue;
+            }
             if point_in_box(wx, wy, b) {
-                let area = b.w * b.h;
+                let area = b.area_px();
                 if best.as_ref().is_none_or(|(ba, _)| area < *ba) {
                     best = Some((area, b.id.clone()));
                 }
@@ -1446,6 +1659,13 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
                 let pos = cursor.position_in(bounds)?;
+                // Right-click a polygon corner vertex to delete it (when >3 corners)
+                if let Some((box_id, index)) = self.hit_selected_box_vertex(pos, tf) {
+                    return Some(Action::publish(MapMsg::RemoveBoxVertex { box_id, index }).and_capture());
+                }
+                if let Some(pid) = self.hit_planned_light(pos, tf) {
+                    return Some(Action::publish(MapMsg::TogglePlannedLight(pid)).and_capture());
+                }
                 if let Some(lid) = self.hit_lamp(pos, tf) {
                     let is_on = self.lights.get(&lid).is_some_and(|i| i.on);
                     return Some(Action::publish(MapMsg::LampToggle(lid, !is_on)).and_capture());
@@ -1522,11 +1742,38 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                     return Some(Action::publish(MapMsg::Select(None)).and_capture());
                 }
 
-                // Select/Move mode: priority = resize handle > lamp > sensor > wire > stamp > box
+                // Select/Plan mode: priority = polygon vertex > wall midpoint '+' > resize handle > planned strip vertex > planned light > lamp > sensor > wire > stamp > box
+                if let Some((box_id, index)) = self.hit_selected_box_vertex(pos, tf) {
+                    state.hovered = None;
+                    state.drag = Some(DragOp::BoxVertex { box_id, index, preview: None });
+                    return Some(Action::capture());
+                }
+                if let Some((box_id, after_edge, mx, my)) = self.hit_selected_box_midpoint(pos, tf) {
+                    return Some(Action::publish(MapMsg::InsertBoxVertex { box_id, after_edge, x: mx, y: my }).and_capture());
+                }
                 if let Some((orig, handle)) = self.hit_selected_box_handle(pos, tf) {
                     state.hovered = None;
                     state.drag = Some(DragOp::BoxResize { id: orig.id.clone(), handle, orig, preview: None });
                     return Some(Action::capture());
+                }
+                if let Some((pid, index)) = self.hit_planned_strip_vertex(pos, tf) {
+                    state.hovered = None;
+                    state.drag = Some(DragOp::PlannedStripVertex { id: pid.clone(), index, preview: None });
+                    return Some(Action::publish(MapMsg::Select(Some(Selection::Planned(pid)))).and_capture());
+                }
+                if let Some(pid) = self.hit_planned_light(pos, tf) {
+                    if let Some(pl) = self.doc.planned_lights.iter().find(|p| p.id == pid) {
+                        let (wx, wy) = tf.to_world(pos);
+                        let (ax, ay) = pl.anchor();
+                        state.hovered = None;
+                        state.drag = Some(DragOp::PlannedMove {
+                            id: pid.clone(),
+                            grab_dx: ax - wx,
+                            grab_dy: ay - wy,
+                            preview: None,
+                        });
+                    }
+                    return Some(Action::publish(MapMsg::Select(Some(Selection::Planned(pid)))).and_capture());
                 }
                 if let Some(lid) = self.hit_lamp(pos, tf) {
                     if let Some(lpos) = self.doc.lamps.get(&lid) {
@@ -1654,6 +1901,39 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                             Some(Action::capture())
                         }
                     }
+                    DragOp::BoxVertex { preview, .. } => {
+                        let x = snap_coord(wx, grid, snap).clamp(0.0, max_w);
+                        let y = snap_coord(wy, grid, snap).clamp(0.0, max_h);
+                        let next = Some((x, y));
+                        if *preview != next {
+                            *preview = next;
+                            Some(Action::request_redraw().and_capture())
+                        } else {
+                            Some(Action::capture())
+                        }
+                    }
+                    DragOp::PlannedMove { grab_dx, grab_dy, preview, .. } => {
+                        let x = snap_coord(wx + *grab_dx, grid, snap).clamp(12.0, max_w - 12.0);
+                        let y = snap_coord(wy + *grab_dy, grid, snap).clamp(12.0, max_h - 12.0);
+                        let next = Some((x, y));
+                        if *preview != next {
+                            *preview = next;
+                            Some(Action::request_redraw().and_capture())
+                        } else {
+                            Some(Action::capture())
+                        }
+                    }
+                    DragOp::PlannedStripVertex { preview, .. } => {
+                        let x = snap_coord(wx, grid, snap).clamp(12.0, max_w - 12.0);
+                        let y = snap_coord(wy, grid, snap).clamp(12.0, max_h - 12.0);
+                        let next = Some((x, y));
+                        if *preview != next {
+                            *preview = next;
+                            Some(Action::request_redraw().and_capture())
+                        } else {
+                            Some(Action::capture())
+                        }
+                    }
                     DragOp::Stamp { grab_dx, grab_dy, preview, .. } => {
                         let x = snap_coord(wx + *grab_dx, grid, snap).clamp(0.0, max_w - 16.0);
                         let y = snap_coord(wy + *grab_dy, grid, snap).clamp(0.0, max_h - 16.0);
@@ -1746,6 +2026,42 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                         };
                         Some(Action::publish(MapMsg::ResizeBox { id, x, y, w, h, commit: true }).and_capture())
                     }
+                    DragOp::BoxVertex { box_id, index, preview } => {
+                        let (x, y) = if let Some(pos) = maybe_pos {
+                            let (wx, wy) = tf.to_world(pos);
+                            (snap_coord(wx, grid, snap).clamp(0.0, max_w), snap_coord(wy, grid, snap).clamp(0.0, max_h))
+                        } else if let Some(p) = preview {
+                            p
+                        } else {
+                            return Some(Action::request_redraw().and_capture());
+                        };
+                        Some(Action::publish(MapMsg::MoveBoxVertex { box_id, index, x, y, commit: true }).and_capture())
+                    }
+                    DragOp::PlannedMove { id, grab_dx, grab_dy, preview } => {
+                        let (x, y) = if let Some(pos) = maybe_pos {
+                            let (wx, wy) = tf.to_world(pos);
+                            (
+                                snap_coord(wx + grab_dx, grid, snap).clamp(12.0, max_w - 12.0),
+                                snap_coord(wy + grab_dy, grid, snap).clamp(12.0, max_h - 12.0),
+                            )
+                        } else if let Some(p) = preview {
+                            p
+                        } else {
+                            return Some(Action::request_redraw().and_capture());
+                        };
+                        Some(Action::publish(MapMsg::MovePlannedLight { id, x, y, commit: true }).and_capture())
+                    }
+                    DragOp::PlannedStripVertex { id, index, preview } => {
+                        let (x, y) = if let Some(pos) = maybe_pos {
+                            let (wx, wy) = tf.to_world(pos);
+                            (snap_coord(wx, grid, snap).clamp(12.0, max_w - 12.0), snap_coord(wy, grid, snap).clamp(12.0, max_h - 12.0))
+                        } else if let Some(p) = preview {
+                            p
+                        } else {
+                            return Some(Action::request_redraw().and_capture());
+                        };
+                        Some(Action::publish(MapMsg::MovePlannedStripVertex { id, index, x, y, commit: true }).and_capture())
+                    }
                     DragOp::Stamp { id, grab_dx, grab_dy, preview } => {
                         let (x, y) = if let Some(pos) = maybe_pos {
                             let (wx, wy) = tf.to_world(pos);
@@ -1808,6 +2124,13 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
         let on_bg = Color::from(theme.cosmic().on_bg_color());
         let accent: Color = theme.cosmic().accent_color().into();
         let drag = state.drag.as_ref();
+        let floor = self.active_floor();
+
+        // 0. Optional Day/Dusk/Night ambient dim simulation
+        let dim = self.ambient.dim_alpha();
+        if dim > 0.0 {
+            frame.fill_rectangle(Point::ORIGIN, bounds.size(), with_alpha(Color::BLACK, dim));
+        }
 
         // 1. Subtle architectural canvas surface & batched dot grid
         if !self.has_bg_image {
@@ -1834,25 +2157,30 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
             frame.fill(&dots, with_alpha(on_bg, 0.14));
         }
 
-        // 2. Room & Zone boxes
+        // 2. Polygon & Rectangular Room / Zone boxes on active floor
         for b in &self.doc.boxes {
+            if b.floor_id != floor {
+                continue;
+            }
             let (bx, by, bw, bh) = self.effective_box_rect(b, drag);
+            let pts = self.effective_box_points(b, drag);
             let tl = tf.to_screen(bx, by);
             let sz = Size::new((bw as f32) * tf.scale, (bh as f32) * tf.scale);
             let is_zone = b.kind == "zone";
             let selected = matches!(&self.selection, Some(Selection::Box(id)) if id == &b.id);
 
-            // Ambient room tint from active lights inside box (uses live drag preview coords)
+            // Ambient room tint + Lux calculation from active real + planned lights inside box
             let mut r_sum = 0.0f32;
             let mut g_sum = 0.0f32;
             let mut b_sum = 0.0f32;
             let mut lit_count = 0u32;
+            let mut total_lumens = 0.0f64;
             for (lid, lpos) in &self.doc.lamps {
+                if lpos.floor_id != floor {
+                    continue;
+                }
                 let (lx, ly) = self.effective_lamp_pos(lid, (lpos.x, lpos.y), drag);
-                if lx >= bx
-                    && lx <= bx + bw
-                    && ly >= by
-                    && ly <= by + bh
+                if b.contains_point(lx, ly)
                     && let Some(info) = self.lights.get(lid)
                     && info.on
                 {
@@ -1861,6 +2189,21 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                     g_sum += c.g;
                     b_sum += c.b;
                     lit_count += 1;
+                    total_lumens += 800.0 * (info.bri / 100.0).clamp(0.05, 1.0);
+                }
+            }
+            for pl in &self.doc.planned_lights {
+                if pl.floor_id != floor || !pl.on {
+                    continue;
+                }
+                let (px, py) = pl.anchor();
+                if b.contains_point(px, py) {
+                    let c = parse_hex_color(&pl.color);
+                    r_sum += c.r;
+                    g_sum += c.g;
+                    b_sum += c.b;
+                    lit_count += 1;
+                    total_lumens += pl.lumens as f64;
                 }
             }
             let fill_color = if lit_count > 0 {
@@ -1876,25 +2219,29 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                 with_alpha(on_bg, 0.05)
             };
 
-            let rect_path = CanvasPath::rounded_rectangle(tl, sz, 6.0.into());
-            frame.fill(&rect_path, fill_color);
+            let room_path = if b.is_polygon() {
+                CanvasPath::new(|builder| {
+                    for (i, p) in pts.iter().enumerate() {
+                        let sp = tf.to_screen(p.x, p.y);
+                        if i == 0 { builder.move_to(sp); } else { builder.line_to(sp); }
+                    }
+                    builder.close();
+                })
+            } else {
+                CanvasPath::rounded_rectangle(tl, sz, 6.0.into())
+            };
+            frame.fill(&room_path, fill_color);
 
             let room_motion_area = b.hue_id.as_deref().and_then(|hid| {
                 self.motion_areas.iter().find(|a| a.room_id == hid)
             });
             let motion_active = room_motion_area.is_some_and(|a| a.enabled && a.motion);
             if motion_active {
-                // Subtle emerald outer presence ring when MotionAware detects motion in this room
-                let ring_path = CanvasPath::rounded_rectangle(
-                    Point::new(tl.x - 2.0, tl.y - 2.0),
-                    Size::new(sz.width + 4.0, sz.height + 4.0),
-                    8.0.into(),
-                );
                 frame.stroke(
-                    &ring_path,
+                    &room_path,
                     Stroke::default()
                         .with_color(with_alpha(MOTION_ACTIVE_COLOR, 0.45))
-                        .with_width(2.5),
+                        .with_width(4.0),
                 );
             }
 
@@ -1905,7 +2252,7 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
             } else if is_zone {
                 with_alpha(accent, 0.55)
             } else {
-                with_alpha(on_bg, 0.34)
+                with_alpha(on_bg, 0.36)
             };
             let stroke = if is_zone {
                 Stroke {
@@ -1917,12 +2264,18 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
             } else {
                 Stroke::default()
                     .with_color(border_color)
-                    .with_width(if selected || motion_active { 2.4 } else { 1.5 })
+                    .with_width(if selected || motion_active { 2.4 } else { 1.6 })
             };
-            frame.stroke(&rect_path, stroke);
+            frame.stroke(&room_path, stroke);
 
-            // Header label (archetype glyph + name + indicators + MotionAware + active schedule badge)
-            let mut label = format!("{} {}", archetype_glyph(&b.archetype), b.name);
+            // Header label (archetype glyph + name + m² + Plan-mode lx + badges)
+            let area_m2 = b.area_m2(self.doc.px_per_meter).max(0.5);
+            let mut label = format!("{} {} · {:.0} m²", archetype_glyph(&b.archetype), b.name, area_m2);
+            if self.mode == CanvasMode::Plan {
+                let lux = (total_lumens / area_m2).round() as u32;
+                let target = target_lux_for_archetype(&b.archetype);
+                label.push_str(&format!(" · {lux}/{target} lx"));
+            }
             if b.hue_id.is_none() {
                 label.push_str(" •");
             }
@@ -1939,41 +2292,94 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
             if let Some(badge) = self.schedule_badges.get(&b.id) {
                 label.push_str(&format!("  {badge}"));
             }
+            // Place label inside the first visible upper edge
+            let label_pos = if b.is_polygon() {
+                let top_pt = pts.iter().min_by(|a, c| a.y.partial_cmp(&c.y).unwrap_or(std::cmp::Ordering::Equal));
+                let lp = top_pt.map(|p| tf.to_screen(p.x, p.y)).unwrap_or(tl);
+                Point::new((lp.x + 8.0).max(tl.x + 8.0), lp.y + 8.0)
+            } else {
+                Point::new(tl.x + 8.0, tl.y + 6.0)
+            };
             frame.fill_text(CanvasText {
                 content: label,
-                position: Point::new(tl.x + 8.0, tl.y + 6.0),
-                color: with_alpha(on_bg, if selected { 0.98 } else { 0.80 }),
-                size: Pixels(11.5),
+                position: label_pos,
+                color: with_alpha(on_bg, if selected { 0.98 } else { 0.82 }),
+                size: Pixels(11.0),
                 ..Default::default()
             });
 
-            // 8 resize handles on selected box (track live drag/resize preview)
+            // Selected room handles: polygon corner circles + wall midpoint '+' split handles + wall lengths
             if selected {
-                for h in ResizeHandle::ALL {
-                    let (hx, hy) = h.world_point_rect(bx, by, bw, bh);
-                    let hp = tf.to_screen(hx, hy);
-                    let hrect = CanvasPath::rectangle(
-                        Point::new(hp.x - HANDLE_SIZE_PX * 0.5, hp.y - HANDLE_SIZE_PX * 0.5),
-                        Size::new(HANDLE_SIZE_PX, HANDLE_SIZE_PX),
-                    );
-                    frame.fill(&hrect, Color::WHITE);
-                    frame.stroke(&hrect, Stroke::default().with_color(accent).with_width(1.6));
+                let n = pts.len();
+                for i in 0..n {
+                    let a = &pts[i];
+                    let c = &pts[(i + 1) % n];
+                    let seg_px = ((c.x - a.x).powi(2) + (c.y - a.y).powi(2)).sqrt();
+                    let mid = tf.to_screen((a.x + c.x) * 0.5, (a.y + c.y) * 0.5);
+                    if seg_px * (tf.scale as f64) >= 42.0 {
+                        // Wall midpoint '+' split handle
+                        let mp = CanvasPath::circle(mid, 6.0);
+                        frame.fill(&mp, accent);
+                        frame.stroke(&mp, Stroke::default().with_color(Color::WHITE).with_width(1.1));
+                        frame.fill_text(CanvasText {
+                            content: "+".into(),
+                            position: Point::new(mid.x - 3.3, mid.y - 6.0),
+                            color: Color::WHITE,
+                            size: Pixels(10.0),
+                            ..Default::default()
+                        });
+                        // Wall length in meters
+                        let len_m = seg_px / self.doc.px_per_meter.max(10.0);
+                        frame.fill_text(CanvasText {
+                            content: format!("{len_m:.1}m"),
+                            position: Point::new(mid.x + 8.0, mid.y - 5.0),
+                            color: with_alpha(on_bg, 0.72),
+                            size: Pixels(9.5),
+                            ..Default::default()
+                        });
+                    }
+                }
+                if b.is_polygon() {
+                    for p in &pts {
+                        let hp = tf.to_screen(p.x, p.y);
+                        let circ = CanvasPath::circle(hp, 5.5);
+                        frame.fill(&circ, accent);
+                        frame.stroke(&circ, Stroke::default().with_color(Color::WHITE).with_width(1.5));
+                    }
+                } else {
+                    for h in ResizeHandle::ALL {
+                        let (hx, hy) = h.world_point_rect(bx, by, bw, bh);
+                        let hp = tf.to_screen(hx, hy);
+                        let hrect = CanvasPath::rectangle(
+                            Point::new(hp.x - HANDLE_SIZE_PX * 0.5, hp.y - HANDLE_SIZE_PX * 0.5),
+                            Size::new(HANDLE_SIZE_PX, HANDLE_SIZE_PX),
+                        );
+                        frame.fill(&hrect, Color::WHITE);
+                        frame.stroke(&hrect, Stroke::default().with_color(accent).with_width(1.6));
+                    }
                 }
             }
         }
 
-        // 3. Minimalist architectural furniture stamps
+        // 3. Minimalist architectural furniture stamps on active floor
         if self.doc.show_furniture {
             for st in &self.doc.stamps {
+                if st.floor_id != floor {
+                    continue;
+                }
                 let (sx, sy) = self.effective_stamp_pos(st, drag);
                 let selected = matches!(&self.selection, Some(Selection::Stamp(id)) if id == &st.id);
                 draw_stamp(&mut frame, st, sx, sy, tf, on_bg, accent, selected);
             }
         }
 
-        // 4. Live radial color/brightness halos around placed lamps (3-step tessellation)
-        if self.doc.show_glows {
+        // 4. Live radial color/brightness halos around placed real & planned lamps
+        let boost = self.ambient.glow_boost();
+        if self.doc.show_glows || self.mode == CanvasMode::Plan {
             for (lid, lpos) in &self.doc.lamps {
+                if lpos.floor_id != floor {
+                    continue;
+                }
                 let Some(info) = self.lights.get(lid) else { continue };
                 if !info.on {
                     continue;
@@ -1986,8 +2392,85 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                 for step_i in (1..=3).rev() {
                     let frac = step_i as f32 / 3.0;
                     let r = max_r * frac;
-                    let alpha = (1.0 - frac * 0.72) * 0.22 * bri_norm;
+                    let alpha = ((1.0 - frac * 0.72) * 0.22 * bri_norm * boost).min(0.85);
                     frame.fill(&CanvasPath::circle(center, r), with_alpha(c, alpha));
+                }
+            }
+
+            // Planned lights & bendable LED lightstrips glow + ribbons
+            for pl in &self.doc.planned_lights {
+                if pl.floor_id != floor {
+                    continue;
+                }
+                let c = parse_hex_color(&pl.color);
+                let lumen_f = ((pl.lumens as f32) / 1400.0).clamp(0.35, 1.25);
+                let max_r = ((pl.beam_radius * self.doc.px_per_meter) as f32 * tf.scale).clamp(24.0, 260.0);
+
+                if pl.strip_points.len() >= 2 {
+                    let pts: Vec<Point> = pl.strip_points.iter().enumerate().map(|(i, p)| {
+                        if let Some(DragOp::PlannedStripVertex { id, index, preview: Some((vx, vy)) }) = drag
+                            && id == &pl.id && *index == i
+                        {
+                            tf.to_screen(*vx, *vy)
+                        } else if let Some(DragOp::PlannedMove { id, preview: Some((mx, my)), .. }) = drag
+                            && id == &pl.id
+                        {
+                            let (ax, ay) = pl.anchor();
+                            tf.to_screen(p.x + (*mx - ax), p.y + (*my - ay))
+                        } else {
+                            tf.to_screen(p.x, p.y)
+                        }
+                    }).collect();
+                    let strip_path = CanvasPath::new(|builder| {
+                        for (i, sp) in pts.iter().enumerate() {
+                            if i == 0 { builder.move_to(*sp); } else { builder.line_to(*sp); }
+                        }
+                    });
+                    if pl.on {
+                        frame.stroke(
+                            &strip_path,
+                            Stroke::default()
+                                .with_color(with_alpha(c, (0.22 * lumen_f * boost).min(0.65)))
+                                .with_width((max_r * 0.36).max(16.0))
+                                .with_line_cap(LineCap::Round)
+                                .with_line_join(LineJoin::Round),
+                        );
+                        frame.stroke(
+                            &strip_path,
+                            Stroke::default()
+                                .with_color(with_alpha(c, (0.55 * lumen_f * boost).min(0.9)))
+                                .with_width(8.0)
+                                .with_line_cap(LineCap::Round)
+                                .with_line_join(LineJoin::Round),
+                        );
+                    }
+                    frame.stroke(
+                        &strip_path,
+                        Stroke {
+                            style: Style::Solid(if pl.on { c } else { with_alpha(on_bg, 0.5) }),
+                            width: 2.6,
+                            line_dash: LineDash { segments: &[6.0, 4.0], offset: 0 },
+                            line_cap: LineCap::Round,
+                            line_join: LineJoin::Round,
+                        },
+                    );
+                    for sp in &pts {
+                        let dot = CanvasPath::circle(*sp, 4.5);
+                        frame.fill(&dot, accent);
+                        frame.stroke(&dot, Stroke::default().with_color(Color::WHITE).with_width(1.2));
+                    }
+                } else if pl.on {
+                    let (ax, ay) = match drag {
+                        Some(DragOp::PlannedMove { id, preview: Some(p), .. }) if id == &pl.id => *p,
+                        _ => (pl.x, pl.y),
+                    };
+                    let center = tf.to_screen(ax, ay);
+                    for step_i in (1..=3).rev() {
+                        let frac = step_i as f32 / 3.0;
+                        let r = max_r * frac;
+                        let alpha = ((1.0 - frac * 0.72) * 0.24 * lumen_f * boost).min(0.85);
+                        frame.fill(&CanvasPath::circle(center, r), with_alpha(c, alpha));
+                    }
                 }
             }
         }
@@ -2016,8 +2499,11 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
             draw_wire(&mut frame, a, cur, self.wire_kind, true, false);
         }
 
-        // 6. Placed lamp nodes with selectable vector icons (+ Bridge Pro MotionAware badge)
+        // 6. Placed lamp nodes with selectable vector icons (+ Bridge Pro MotionAware badge) on active floor
         for (lid, lpos) in &self.doc.lamps {
+            if lpos.floor_id != floor {
+                continue;
+            }
             let (lx, ly) = self.effective_lamp_pos(lid, (lpos.x, lpos.y), drag);
             let center = tf.to_screen(lx, ly);
             let info = self.lights.get(lid);
@@ -2114,8 +2600,11 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
             }
         }
 
-        // 6b. Placed physical Hue sensors & switches (28x28 rounded-square nodes)
+        // 6b. Placed physical Hue sensors & switches (28x28 rounded-square nodes) on active floor
         for (sid, spos) in &self.doc.sensors {
+            if spos.floor_id != floor {
+                continue;
+            }
             let (sx, sy) = self.effective_sensor_pos(sid, (spos.x, spos.y), drag);
             let center = tf.to_screen(sx, sy);
             let sensor = self.sensors.get(sid);
@@ -2189,6 +2678,100 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
                     .with_width(if is_active || kind == "button" { 1.6 } else { 1.3 }),
             );
             draw_sensor_icon(&mut frame, center, 8.5, kind, ink, is_active);
+        }
+
+        // 6c. Planned Future Lighting fixtures (dashed blueprint nodes + lumen tags) on active floor
+        let plan_accent = Color::from_rgb8(0x38, 0xBD, 0xF8);
+        for pl in &self.doc.planned_lights {
+            if pl.floor_id != floor {
+                continue;
+            }
+            let selected = matches!(&self.selection, Some(Selection::Planned(id)) if id == &pl.id);
+            let col = parse_hex_color(&pl.color);
+            if pl.is_strip() {
+                // Draw draggable strip anchor badge at midpoint of strip
+                let pts: Vec<FloorplanPoint> = if let Some(DragOp::PlannedStripVertex {
+                    id,
+                    index,
+                    preview: Some((curr_x, curr_y)),
+                }) = drag
+                    && id == &pl.id
+                {
+                    let mut p = pl.strip_points.clone();
+                    if *index < p.len() {
+                        p[*index] = FloorplanPoint { x: *curr_x, y: *curr_y };
+                    }
+                    p
+                } else {
+                    pl.strip_points.clone()
+                };
+                if pts.len() >= 2 {
+                    let mid = &pts[pts.len() / 2];
+                    let mc = tf.to_screen(mid.x, mid.y);
+                    let tag = format!("{} lm", pl.lumens);
+                    frame.fill_text(CanvasText {
+                        content: tag,
+                        position: Point::new(mc.x, mc.y - 12.0),
+                        color: if selected { accent } else { plan_accent },
+                        size: Pixels(10.0),
+                        align_x: alignment::Horizontal::Center.into(),
+                        align_y: alignment::Vertical::Bottom.into(),
+                        ..Default::default()
+                    });
+                }
+                continue;
+            }
+
+            let (px, py) = if let Some(DragOp::PlannedMove {
+                id,
+                preview: Some((curr_x, curr_y)),
+                ..
+            }) = drag
+                && id == &pl.id
+            {
+                (*curr_x, *curr_y)
+            } else {
+                (pl.x, pl.y)
+            };
+            let center = tf.to_screen(px, py);
+
+            if selected {
+                frame.stroke(
+                    &CanvasPath::circle(center, LAMP_RADIUS_PX + 5.0),
+                    Stroke::default().with_color(accent).with_width(2.2),
+                );
+            }
+
+            let node_path = CanvasPath::circle(center, LAMP_RADIUS_PX);
+            let fill = if pl.on {
+                with_alpha(col, 0.85)
+            } else {
+                with_alpha(on_bg, 0.14)
+            };
+            frame.fill(&node_path, fill);
+            frame.stroke(
+                &node_path,
+                Stroke {
+                    style: Style::Solid(if selected { accent } else { plan_accent }),
+                    width: if selected { 2.2 } else { 1.8 },
+                    line_dash: LineDash { segments: &[4.0, 3.0], offset: 0 },
+                    ..Default::default()
+                },
+            );
+
+            let ink = if pl.on { contrast_ink(col) } else { with_alpha(on_bg, 0.90) };
+            draw_lamp_icon(&mut frame, center, LAMP_RADIUS_PX * 0.62, &pl.icon, ink);
+
+            // Blueprint lumen label underneath node
+            frame.fill_text(CanvasText {
+                content: format!("{} lm", pl.lumens),
+                position: Point::new(center.x, center.y + LAMP_RADIUS_PX + 3.0),
+                color: if selected { accent } else { with_alpha(plan_accent, 0.92) },
+                size: Pixels(10.0),
+                align_x: alignment::Horizontal::Center.into(),
+                align_y: alignment::Vertical::Top.into(),
+                ..Default::default()
+            });
         }
 
         // 7. Hover tooltip pill (lamp or sensor name only, floats on top of everything)
@@ -2277,10 +2860,19 @@ impl<'a> Program<MapMsg, cosmic::Theme, cosmic::Renderer> for FloorplanCanvasPro
             }
             return mouse::Interaction::Crosshair;
         }
+        if self.hit_selected_box_vertex(pos, tf).is_some()
+            || self.hit_planned_strip_vertex(pos, tf).is_some()
+        {
+            return mouse::Interaction::Grab;
+        }
+        if self.hit_selected_box_midpoint(pos, tf).is_some() {
+            return mouse::Interaction::Pointer;
+        }
         if let Some((_, handle)) = self.hit_selected_box_handle(pos, tf) {
             return handle.cursor();
         }
-        if self.hit_lamp(pos, tf).is_some()
+        if self.hit_planned_light(pos, tf).is_some()
+            || self.hit_lamp(pos, tf).is_some()
             || self.hit_sensor(pos, tf).is_some()
             || self.hit_stamp(pos, tf).is_some()
         {
@@ -2521,6 +3113,18 @@ fn draw_stamp(
                 for (ox, oy) in [(0.16, -0.18), (0.32, -0.18), (0.16, 0.18), (0.32, 0.18)] {
                     f.stroke(&CanvasPath::circle(Point::new(w * ox, h * oy), r), stroke);
                 }
+            }
+            "stairs" => {
+                let outer = CanvasPath::rectangle(Point::new(-hw, -hh), Size::new(w, h));
+                f.fill(&outer, fill_col);
+                f.stroke(&outer, stroke);
+                for i in 1..7 {
+                    let sy = -hh + (h * (i as f32) / 7.0);
+                    f.stroke(&CanvasPath::line(Point::new(-hw, sy), Point::new(hw, sy)), stroke);
+                }
+                f.stroke(&CanvasPath::line(Point::new(0.0, hh - 5.0), Point::new(0.0, -hh + 5.0)), stroke);
+                f.stroke(&CanvasPath::line(Point::new(0.0, -hh + 5.0), Point::new(-5.0, -hh + 11.0)), stroke);
+                f.stroke(&CanvasPath::line(Point::new(0.0, -hh + 5.0), Point::new(5.0, -hh + 11.0)), stroke);
             }
             _ => {
                 let rect = CanvasPath::rectangle(Point::new(-hw, -hh), Size::new(w, h));
@@ -3009,6 +3613,18 @@ pub fn view_map_tab<'a>(
     }
     .on_press(MapMsg::SetMode(CanvasMode::Select));
 
+    let plan_tab_label = if !state.doc.planned_lights.is_empty() {
+        format!("{} ({})", tr("Plan"), state.doc.planned_lights.len())
+    } else {
+        tr("Plan")
+    };
+    let plan_tab_btn = if state.mode == CanvasMode::Plan {
+        button::suggested(plan_tab_label)
+    } else {
+        button::standard(plan_tab_label)
+    }
+    .on_press(MapMsg::SetMode(CanvasMode::Plan));
+
     let rules_tab_label = if wire_count > 0 {
         format!("{} ({wire_count})", tr("Rules"))
     } else {
@@ -3021,7 +3637,7 @@ pub fn view_map_tab<'a>(
     }
     .on_press(MapMsg::SetMode(CanvasMode::Wire));
 
-    let mode_switcher: Element<MapMsg> = row![map_tab_btn, rules_tab_btn]
+    let mode_switcher: Element<MapMsg> = row![map_tab_btn, plan_tab_btn, rules_tab_btn]
         .spacing(2)
         .align_y(Alignment::Center)
         .into();
@@ -3035,6 +3651,35 @@ pub fn view_map_tab<'a>(
 
     let toolbar: Vec<Element<MapMsg>> = if state.mode == CanvasMode::Wire {
         vec![mode_switcher, sidebar_btn.into()]
+    } else if state.mode == CanvasMode::Plan {
+        let add_fix_label = format!("{} ▾", tr("+ Fixture"));
+        let add_fix_btn = if state.plan_add_open {
+            button::suggested(add_fix_label)
+        } else {
+            button::standard(add_fix_label)
+        }
+        .on_press(MapMsg::TogglePlanAddMenu);
+
+        let list_label = if !state.doc.planned_lights.is_empty() {
+            format!("{} ({})", tr("Plan List"), state.doc.planned_lights.len())
+        } else {
+            tr("Plan List")
+        };
+        let list_btn = if state.plan_list_open {
+            button::suggested(list_label)
+        } else {
+            button::standard(list_label)
+        }
+        .on_press(MapMsg::TogglePlanList);
+
+        let gallery_btn = if state.templates_open {
+            button::suggested(tr("Gallery…"))
+        } else {
+            button::standard(tr("Gallery…"))
+        }
+        .on_press(MapMsg::ToggleTemplatesMenu);
+
+        vec![mode_switcher, sidebar_btn.into(), add_fix_btn.into(), list_btn.into(), gallery_btn.into()]
     } else {
         let add_label = format!("{} ▾", tr("+ Add"));
         let add_btn = if state.add_menu_open {
@@ -3044,7 +3689,7 @@ pub fn view_map_tab<'a>(
         }
         .on_press(MapMsg::ToggleAddMenu);
 
-        let tpl_label = format!("{} ▾", template_label(&state.doc.template_id));
+        let tpl_label = format!("{} ▾", tr("Gallery…"));
         let tpl_btn = if state.templates_open {
             button::suggested(tpl_label)
         } else {
@@ -3089,14 +3734,73 @@ pub fn view_map_tab<'a>(
             .class(studio_card(skin)),
     );
 
-    // ----------------------------------------------------------------- Dropdown Popovers (Map sub-tab)
+    // ----------------------------------------------------------------- Multi-Floor Tabs + Day/Dusk/Night Ambient Bar
+    let mut floor_items: Vec<Element<MapMsg>> = state
+        .doc
+        .floors
+        .iter()
+        .map(|fl| {
+            let active = state.doc.active_floor_id == fl.id;
+            let lit_on_floor = state
+                .doc
+                .lamps
+                .iter()
+                .filter(|(lid, p)| p.floor_id == fl.id && lights.iter().any(|l| l.id == **lid && l.on))
+                .count();
+            let lbl = if lit_on_floor > 0 {
+                format!("{} · {lit_on_floor}", fl.name)
+            } else {
+                fl.name.clone()
+            };
+            let b = if active { button::suggested(lbl) } else { button::standard(lbl) };
+            b.on_press(MapMsg::SelectFloor(fl.id.clone())).into()
+        })
+        .collect();
+    floor_items.push(button::standard(tr("+ Floor")).on_press(MapMsg::AddFloor).into());
+    if state.doc.floors.len() > 1 {
+        floor_items.push(
+            button::destructive(tr("Delete Floor"))
+                .on_press(MapMsg::DeleteFloor(state.doc.active_floor_id.clone()))
+                .into(),
+        );
+    }
+
+    let ambient_row = row![
+        (if state.ambient == AmbientMode::Day { button::suggested(tr("Day")) } else { button::standard(tr("Day")) })
+            .on_press(MapMsg::SetAmbient(AmbientMode::Day)),
+        (if state.ambient == AmbientMode::Dusk { button::suggested(tr("Dusk")) } else { button::standard(tr("Dusk")) })
+            .on_press(MapMsg::SetAmbient(AmbientMode::Dusk)),
+        (if state.ambient == AmbientMode::Night { button::suggested(tr("Night")) } else { button::standard(tr("Night")) })
+            .on_press(MapMsg::SetAmbient(AmbientMode::Night)),
+    ]
+    .spacing(2)
+    .align_y(Alignment::Center);
+
+    root = root.push(
+        container(
+            row![
+                flex_row(floor_items).row_spacing(4).column_spacing(4),
+                space::horizontal(),
+                ambient_row,
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .padding([5, 8])
+        .width(Length::Fill)
+        .class(studio_card(skin)),
+    );
+
+    // ----------------------------------------------------------------- Dropdown Popovers (Map & Plan sub-tabs)
     if state.mode == CanvasMode::Select && state.add_menu_open {
-        let box_row = row![
-            button::standard(tr("+ Room")).on_press(MapMsg::AddBox("room".into())),
-            button::standard(tr("+ Zone")).on_press(MapMsg::AddBox("zone".into())),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center);
+        let box_row = flex_row(vec![
+            button::standard(tr("+ Room")).on_press(MapMsg::AddBox("room".into())).into(),
+            button::standard(tr("Add L-Shape Room")).on_press(MapMsg::AddBoxWithShape("room".into(), "l_shape".into())).into(),
+            button::standard(tr("Add Bay Window Room")).on_press(MapMsg::AddBoxWithShape("room".into(), "bay_window".into())).into(),
+            button::standard(tr("+ Zone")).on_press(MapMsg::AddBox("zone".into())).into(),
+        ])
+        .row_spacing(6)
+        .column_spacing(6);
         let stamp_btns: Vec<Element<MapMsg>> = FLOORPLAN_STAMP_KINDS
             .iter()
             .map(|sk| {
@@ -3115,8 +3819,20 @@ pub fn view_map_tab<'a>(
         root = root.push(container(opts).padding(8).width(Length::Fill).class(studio_card(skin)));
     }
 
-    if state.mode == CanvasMode::Select && state.templates_open {
-        let mut opts = column![dim_caption(tr("Choose Floorplan Prototype"))].spacing(4);
+    if (state.mode == CanvasMode::Select || state.mode == CanvasMode::Plan) && state.templates_open {
+        let mut opts = column![
+            row![
+                text::body(tr("Floorplan Gallery")),
+                space::horizontal(),
+                checkbox(state.gallery_include_plan)
+                    .label(tr("Include starter lighting plan"))
+                    .on_toggle(MapMsg::ToggleGalleryIncludePlan),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            dim_caption(tr("Pick a realistic apartment or house drawing — every wall & corner is editable.")),
+        ]
+        .spacing(6);
         let btns: Vec<Element<MapMsg>> = FLOORPLAN_TEMPLATES
             .iter()
             .map(|tid| {
@@ -3131,7 +3847,60 @@ pub fn view_map_tab<'a>(
             })
             .collect();
         opts = opts.push(flex_row(btns).row_spacing(6).column_spacing(6));
+        root = root.push(container(opts).padding(10).width(Length::Fill).class(studio_card(skin)));
+    }
+
+    if state.mode == CanvasMode::Plan && state.plan_add_open {
+        let preset_btns: Vec<Element<MapMsg>> = PLANNED_LIGHT_PRESETS
+            .iter()
+            .map(|p| {
+                button::standard(format!("{} ({} lm)", tr(p.label), p.lumens))
+                    .on_press(MapMsg::AddPlannedLight(p.id.to_string()))
+                    .into()
+            })
+            .collect();
+        let opts = column![
+            dim_caption(tr("Add virtual future fixture or bendable LED lightstrip")),
+            flex_row(preset_btns).row_spacing(6).column_spacing(6),
+        ]
+        .spacing(6);
         root = root.push(container(opts).padding(8).width(Length::Fill).class(studio_card(skin)));
+    }
+
+    if state.mode == CanvasMode::Plan && state.plan_list_open {
+        let total_lm: u32 = state.doc.planned_lights.iter().map(|p| p.lumens).sum();
+        let total_price: f64 = state.doc.planned_lights.iter().map(|p| p.price).sum();
+        let mut list_col = column![
+            row![
+                text::body(tr("Lighting Plan & Shopping List")),
+                space::horizontal(),
+                dim_caption(format!("{} · {} lm · {:.0}", state.doc.planned_lights.len(), total_lm, total_price)),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(6);
+        if state.doc.planned_lights.is_empty() {
+            list_col = list_col.push(dim_caption(tr("No planned fixtures yet. Click + Fixture to add virtual lights or LED strips.")));
+        } else {
+            for pl in &state.doc.planned_lights {
+                let pid_t = pl.id.clone();
+                let pid_d = pl.id.clone();
+                list_col = list_col.push(
+                    row![
+                        text::caption(format!("{} · {} lm · {} K", pl.name, pl.lumens, pl.kelvin)),
+                        space::horizontal(),
+                        dim_caption(if pl.price > 0.0 { format!("{:.0}", pl.price) } else { String::new() }),
+                        (if pl.on { button::suggested(tr("On")) } else { button::standard(tr("Off")) })
+                            .on_press(MapMsg::TogglePlannedLight(pid_t)),
+                        button::destructive("×").on_press(MapMsg::DeletePlannedLight(pid_d)),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                );
+            }
+        }
+        root = root.push(container(list_col).padding(10).width(Length::Fill).class(studio_card(skin)));
     }
 
     if state.mode == CanvasMode::Select && state.stamps_open && !state.add_menu_open {
@@ -4092,6 +4861,33 @@ fn view_inspector<'a>(
                 col = col.push(flex_row(arch_btns).row_spacing(4).column_spacing(4));
             }
 
+            // Room Shape starters (convert to L-Shape, Bay Window, T-Shape, Hallway, Angled Wall, or Rectangle)
+            let shape_btns: Vec<Element<MapMsg>> = FLOORPLAN_ROOM_SHAPES
+                .iter()
+                .map(|(sid, slbl)| {
+                    button::standard(tr(slbl))
+                        .on_press(MapMsg::BoxApplyShape(bid.clone(), (*sid).to_string()))
+                        .into()
+                })
+                .collect();
+            col = col.push(dim_caption(tr("Room Shape")));
+            col = col.push(flex_row(shape_btns).row_spacing(4).column_spacing(4));
+
+            if state.doc.floors.len() > 1 {
+                let fl_btns: Vec<Element<MapMsg>> = state
+                    .doc
+                    .floors
+                    .iter()
+                    .map(|fl| {
+                        let active = b.floor_id == fl.id;
+                        let btn = if active { button::suggested(fl.name.clone()) } else { button::standard(fl.name.clone()) };
+                        btn.on_press(MapMsg::BoxSetFloor(bid.clone(), fl.id.clone())).into()
+                    })
+                    .collect();
+                col = col.push(dim_caption(tr("Floor")));
+                col = col.push(flex_row(fl_btns).row_spacing(4).column_spacing(4));
+            }
+
             // Optional per-box Entertainment area linker
             if !ent_areas.is_empty() {
                 let linked_name = b
@@ -4267,6 +5063,79 @@ fn view_inspector<'a>(
             .align_y(Alignment::Center)
             .into()
         }
+
+        Selection::Planned(pid) => {
+            let pl = state.doc.planned_lights.iter().find(|p| p.id == *pid)?;
+            let pid_name = pid.clone();
+            let pid_price = pid.clone();
+            let real_lights = extract_bridge_lights(stats);
+            let mut pcol = column![
+                row![
+                    text::heading(format!("✦ {} ({} lm · {} K)", pl.name, pl.lumens, pl.kelvin)),
+                    space::horizontal(),
+                    (if pl.on { button::suggested(tr("On")) } else { button::standard(tr("Off")) })
+                        .on_press(MapMsg::TogglePlannedLight(pid.clone())),
+                    button::destructive(tr("Delete")).on_press(MapMsg::DeletePlannedLight(pid.clone())),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                row![
+                    text_input(tr("Planned Light"), &state.planned_name_draft)
+                        .on_input(MapMsg::PlannedNameInput)
+                        .on_submit(move |_| MapMsg::PlannedNameSave(pid_name.clone()))
+                        .width(Length::Fill),
+                    button::suggested(tr("Rename")).on_press(MapMsg::PlannedNameSave(pid.clone())),
+                    text_input(tr("Est. Price"), &state.planned_price_draft)
+                        .on_input(MapMsg::PlannedPriceInput)
+                        .on_submit(move |_| MapMsg::PlannedPriceSave(pid_price.clone()))
+                        .width(Length::Fixed(78.0)),
+                    button::standard(tr("Save")).on_press(MapMsg::PlannedPriceSave(pid.clone())),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                row![
+                    dim_caption(tr("Brightness (Lumens)")),
+                    button::standard("−").on_press(MapMsg::PlannedSetLumens(pid.clone(), pl.lumens.saturating_sub(150).max(150))),
+                    text::caption(format!("{} lm", pl.lumens)),
+                    button::standard("+").on_press(MapMsg::PlannedSetLumens(pid.clone(), (pl.lumens + 150).min(6000))),
+                    space::horizontal(),
+                    dim_caption(tr("Color Temperature")),
+                    button::standard("−").on_press(MapMsg::PlannedSetKelvin(pid.clone(), pl.kelvin.saturating_sub(300).max(2000))),
+                    text::caption(format!("{} K", pl.kelvin)),
+                    button::standard("+").on_press(MapMsg::PlannedSetKelvin(pid.clone(), (pl.kelvin + 300).min(6500))),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                row![
+                    dim_caption(tr("Beam Spread")),
+                    button::standard("−").on_press(MapMsg::PlannedSetBeam(pid.clone(), (pl.beam_radius - 0.4).max(1.0))),
+                    text::caption(format!("{:.1} m", pl.beam_radius)),
+                    button::standard("+").on_press(MapMsg::PlannedSetBeam(pid.clone(), (pl.beam_radius + 0.4).min(6.0))),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(8);
+
+            if !real_lights.is_empty() {
+                pcol = pcol.push(divider::horizontal::light());
+                pcol = pcol.push(dim_caption(tr("Replace with real paired light")));
+                let bind_btns: Vec<Element<MapMsg>> = real_lights
+                    .iter()
+                    .take(12)
+                    .map(|l| {
+                        button::standard(l.name.clone())
+                            .on_press(MapMsg::BindPlannedToReal {
+                                planned_id: pid.clone(),
+                                real_light_id: l.id.clone(),
+                            })
+                            .into()
+                    })
+                    .collect();
+                pcol = pcol.push(flex_row(bind_btns).row_spacing(4).column_spacing(4));
+            }
+            pcol.into()
+        }
     };
 
     Some(container(inner).padding(10).width(Length::Fill).class(studio_card(skin)).into())
@@ -4291,6 +5160,8 @@ mod tests {
             w,
             h,
             entertainment_area_id: None,
+            points: Vec::new(),
+            floor_id: "eg".into(),
         }
     }
 
@@ -4354,6 +5225,9 @@ mod tests {
             template_id: "auto_bridge".into(),
             entertainment_id: None,
             canvas: FloorplanCanvas::default(),
+            px_per_meter: 80.0,
+            floors: FloorplanDocument::default().floors,
+            active_floor_id: "eg".into(),
             show_wires: true,
             show_glows: true,
             show_furniture: true,
@@ -4369,12 +5243,13 @@ mod tests {
             ],
             stamps: vec![],
             lamps: [
-                ("l1".to_string(), FloorplanLamp { x: 180.0, y: 180.0, z: 0.0, icon: "floor".into() }),
-                ("l2".to_string(), FloorplanLamp { x: 520.0, y: 180.0, z: 0.0, icon: "desk".into() }),
+                ("l1".to_string(), FloorplanLamp { x: 180.0, y: 180.0, z: 0.0, icon: "floor".into(), floor_id: "eg".into() }),
+                ("l2".to_string(), FloorplanLamp { x: 520.0, y: 180.0, z: 0.0, icon: "desk".into(), floor_id: "eg".into() }),
             ]
             .into_iter()
             .collect(),
             sensors: std::collections::BTreeMap::new(),
+            planned_lights: Vec::new(),
         };
 
         // Initially in sync -> 0 pending
@@ -4691,5 +5566,91 @@ mod tests {
         let parsed = MapRuleDialog::from_existing_rule(&existing_json, &stats).expect("existing motion rule");
         assert_eq!(parsed.trigger_name, "Hall Motion");
         assert_eq!(parsed.trigger_state, "clear");
+    }
+
+    #[test]
+    fn floorplan_v2_polygons_multifloor_and_planned_lights() {
+        use crate::model::{FloorplanFloor, FloorplanPoint, PlannedLight, kelvin_to_hex, parse_floorplan};
+
+        // 1. L-shape polygon containment excludes the bottom-right notch & computes exact Shoelace area
+        let mut lbox = sample_box("b-l", "room", None, "Hallway", 100.0, 100.0, 400.0, 400.0);
+        lbox.apply_shape("l_shape");
+        assert!(lbox.is_polygon());
+        assert_eq!(lbox.points.len(), 6);
+        assert!(lbox.contains_point(150.0, 150.0), "top-left inside L");
+        assert!(lbox.contains_point(450.0, 150.0), "top-right arm inside L");
+        assert!(lbox.contains_point(150.0, 450.0), "bottom-left arm inside L");
+        assert!(!lbox.contains_point(450.0, 450.0), "bottom-right notch must be outside L");
+
+        let area_px = lbox.area_px();
+        assert!(area_px < 400.0 * 400.0 && area_px > 400.0 * 400.0 * 0.5, "L area={area_px}");
+        let area_m2 = lbox.area_m2(80.0);
+        assert!((area_m2 - area_px / 6400.0).abs() < 1e-6);
+
+        // 2. Vertex insert, move, translate, remove
+        let orig_len = lbox.points.len();
+        lbox.insert_vertex(0, 200.0, 100.0);
+        assert_eq!(lbox.points.len(), orig_len + 1);
+        lbox.move_vertex(1, 220.0, 80.0);
+        assert_eq!(lbox.points[1], FloorplanPoint { x: 220.0, y: 80.0 });
+        assert!(lbox.y <= 80.0);
+        let old_x = lbox.x;
+        lbox.translate(50.0, 25.0);
+        assert!((lbox.x - (old_x + 50.0)).abs() < 1e-6);
+        lbox.remove_vertex(1);
+        assert_eq!(lbox.points.len(), orig_len);
+
+        // 3. v1 backward compatibility defaults to 1 floor ("eg") and empty planned_lights
+        let v1_stats = json!({
+            "floorplan": {
+                "version": 1,
+                "canvas": {"width": 1200, "height": 800, "grid": 20, "snap": true},
+                "boxes": [{"id": "b1", "kind": "room", "name": "Living", "x": 40, "y": 40, "w": 300, "h": 200}],
+                "stamps": [],
+                "lamps": {"l1": {"x": 120, "y": 120, "z": 0, "icon": "bulb"}},
+                "sensors": {}
+            }
+        });
+        let v1_doc = parse_floorplan(&v1_stats).expect("v1 floorplan parses");
+        assert_eq!(v1_doc.active_floor_id, "eg");
+        assert_eq!(v1_doc.floors.len(), 1);
+        assert_eq!(v1_doc.boxes[0].floor_id, "eg");
+        assert!(v1_doc.boxes[0].points.is_empty());
+        assert!(v1_doc.planned_lights.is_empty());
+
+        // 4. v2 multi-floor + PlannedLight (point & bendable strip) round-trip
+        let strip = PlannedLight {
+            id: "plan-1".into(),
+            floor_id: "og".into(),
+            name: "Cove Strip".into(),
+            icon: "strip".into(),
+            x: 200.0,
+            y: 120.0,
+            strip_points: vec![
+                FloorplanPoint { x: 100.0, y: 120.0 },
+                FloorplanPoint { x: 200.0, y: 120.0 },
+                FloorplanPoint { x: 300.0, y: 180.0 },
+            ],
+            lumens: 1600,
+            beam_radius: 140.0,
+            kelvin: 2700,
+            color: kelvin_to_hex(2700),
+            on: true,
+            price: 89.0,
+            model_note: String::new(),
+        };
+        assert!(strip.is_strip());
+        let mut v2_doc = FloorplanDocument::default();
+        v2_doc.floors.push(FloorplanFloor { id: "og".into(), name: "Upper Floor (OG)".into(), level: 1 });
+        v2_doc.active_floor_id = "og".into();
+        v2_doc.boxes.push(lbox);
+        v2_doc.planned_lights.push(strip);
+        let serialized = json!({"floorplan": v2_doc});
+        let parsed = parse_floorplan(&serialized).expect("v2 floorplan round-trips");
+        assert_eq!(parsed.floors.len(), 2);
+        assert_eq!(parsed.active_floor_id, "og");
+        assert_eq!(parsed.planned_lights.len(), 1);
+        assert_eq!(parsed.planned_lights[0].strip_points.len(), 3);
+        assert_eq!(parsed.planned_lights[0].lumens, 1600);
     }
 }

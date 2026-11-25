@@ -1433,7 +1433,7 @@ class FloorplanAndBridgeSyncTests(Base):
 
         hostile_cases = [
             None, "nope", [],
-            mutated(version=2),
+            mutated(version=99),
             mutated(version=True),
             mutated(bridge_id="NOT_A_BRIDGE"),
             mutated(template_id="<script>"),
@@ -1804,6 +1804,64 @@ class FloorplanAndBridgeSyncTests(Base):
             capture_output=True, text=True, env=cli_env, check=False,
         )
         self.assertNotEqual(r_bad.returncode, 0)
+
+    def test_floorplan_v2_polygons_multifloor_and_planned_lights(self):
+        # 1. Polygon L-shape containment excludes notch & computes exact Shoelace area
+        l_box = {
+            "id": "b-l", "kind": "room", "name": "Hallway", "archetype": "hallway",
+            "x": 100.0, "y": 100.0, "w": 400.0, "h": 400.0, "floor_id": "eg",
+            "points": [
+                {"x": 100.0, "y": 100.0},
+                {"x": 260.0, "y": 100.0},
+                {"x": 260.0, "y": 320.0},
+                {"x": 500.0, "y": 320.0},
+                {"x": 500.0, "y": 500.0},
+                {"x": 100.0, "y": 500.0},
+            ],
+        }
+        self.assertTrue(hue._point_in_box(150.0, 150.0, l_box))
+        self.assertTrue(hue._point_in_box(420.0, 420.0, l_box))
+        self.assertFalse(hue._point_in_box(420.0, 150.0, l_box))
+        # Area = 160*400 + 240*180 = 64000 + 43200 = 107200
+        self.assertAlmostEqual(hue._box_area(l_box), 107200.0, places=1)
+
+        # 2. Multi-floor family_house template & bungalow_l_shape with include_plan=True
+        h = self.make_hue()
+        h.handle({"cmd": "floorplan_template", "template_id": "family_house", "include_plan": True})
+        fp = h.floorplan
+        self.assertIn(fp["version"], (1, 2))
+        self.assertEqual([f["id"] for f in fp["floors"]], ["eg", "og"])
+        self.assertTrue(any(b["floor_id"] == "og" for b in fp["boxes"]))
+        self.assertTrue(any(s["kind"] == "stairs" for s in fp["stamps"]))
+        self.assertGreater(len(fp["planned_lights"]), 0)
+
+        h.handle({"cmd": "floorplan_template", "template_id": "bungalow_l_shape", "include_plan": True})
+        fp2 = h.floorplan
+        self.assertTrue(any(len(b.get("points") or []) >= 5 for b in fp2["boxes"]))
+        self.assertGreater(len(fp2["planned_lights"]), 0)
+
+        # 3. compute_room_membership_diffs respects floor_id & polygon boundaries
+        multi_fp = {
+            "version": 2,
+            "floors": [{"id": "eg", "name": "EG", "level": 0}, {"id": "og", "name": "OG", "level": 1}],
+            "active_floor_id": "eg",
+            "boxes": [
+                {**l_box, "hue_id": R2},
+                {"id": "b-og", "kind": "room", "hue_id": R1, "name": "OG Office",
+                 "x": 100.0, "y": 100.0, "w": 400.0, "h": 400.0, "floor_id": "og"},
+            ],
+            "lamps": {
+                # Inside L-shape on EG -> differs from R1 (should move to R2)
+                L1: {"x": 150.0, "y": 150.0, "z": 0.0, "icon": "bulb", "floor_id": "eg"},
+                # In the notch of L-shape on EG -> outside b-l, no diff!
+                L2: {"x": 420.0, "y": 150.0, "z": 0.0, "icon": "bulb", "floor_id": "eg"},
+                # On OG inside b-og (R1) while L3 belongs to R2 -> differs to R1
+                L3: {"x": 420.0, "y": 150.0, "z": 0.0, "icon": "bulb", "floor_id": "og"},
+            },
+            "stamps": [], "sensors": {}, "planned_lights": [],
+        }
+        diffs = {d["light_id"]: d["to_room_id"] for d in hue.compute_room_membership_diffs(multi_fp, h.rooms)}
+        self.assertEqual(diffs, {L1: R2, L3: R1})
 
 
 if __name__ == "__main__":

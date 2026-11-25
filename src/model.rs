@@ -1142,17 +1142,18 @@ pub fn synth_target_lights(stats: &Value, room_id: &str) -> Vec<(String, String)
 
 // ------------------------------------------------------------------------- Floorplan Studio & Bridge Sync Model
 
-pub const FLOORPLAN_TEMPLATES: [&str; 6] = [
+pub const FLOORPLAN_TEMPLATES: [&str; 7] = [
     "auto_bridge",
     "studio_loft",
     "one_bed_apt",
     "three_room_apt",
     "family_house",
+    "bungalow_l_shape",
     "desk_studio",
 ];
 
-pub const FLOORPLAN_STAMP_KINDS: [&str; 8] = [
-    "door", "window", "sofa", "tv", "desk", "bed", "dining", "kitchen",
+pub const FLOORPLAN_STAMP_KINDS: [&str; 9] = [
+    "door", "window", "sofa", "tv", "desk", "bed", "dining", "kitchen", "stairs",
 ];
 
 pub const LAMP_ICONS: [&str; 12] = [
@@ -1243,6 +1244,121 @@ impl Default for FloorplanBackground {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FloorplanPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FloorplanFloor {
+    #[serde(default = "default_floor_id")]
+    pub id: String,
+    #[serde(default = "default_floor_name")]
+    pub name: String,
+    #[serde(default)]
+    pub level: i32,
+}
+
+impl Default for FloorplanFloor {
+    fn default() -> Self {
+        Self { id: "eg".into(), name: "Ground Floor".into(), level: 0 }
+    }
+}
+
+fn default_floor_id() -> String { "eg".into() }
+fn default_floor_name() -> String { "Ground Floor".into() }
+fn default_px_per_meter() -> f64 { 50.0 }
+fn default_floors() -> Vec<FloorplanFloor> { vec![FloorplanFloor::default()] }
+fn default_lumens() -> u32 { 800 }
+fn default_beam_radius() -> f64 { 2.6 }
+fn default_kelvin() -> u32 { 2700 }
+fn default_planned_color() -> String { "#ffd27a".into() }
+
+pub const FLOORPLAN_ROOM_SHAPES: &[(&str, &str)] = &[
+    ("rectangle", "Rectangle"),
+    ("l_shape", "L-Shape"),
+    ("bay_window", "Bay Window"),
+    ("t_shape", "T-Shape"),
+    ("corridor", "Hallway"),
+    ("trapezoid", "Angled Wall"),
+];
+
+pub struct PlannedLightPreset {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub icon: &'static str,
+    pub lumens: u32,
+    pub beam_radius: f64,
+    pub kelvin: u32,
+    pub price: f64,
+    pub is_strip: bool,
+}
+
+pub const PLANNED_LIGHT_PRESETS: &[PlannedLightPreset] = &[
+    PlannedLightPreset { id: "ceiling", label: "Ceiling Light", icon: "ceiling", lumens: 2400, beam_radius: 3.6, kelvin: 3000, price: 129.0, is_strip: false },
+    PlannedLightPreset { id: "pendant", label: "Pendant", icon: "pendant", lumens: 1200, beam_radius: 2.6, kelvin: 2700, price: 179.0, is_strip: false },
+    PlannedLightPreset { id: "spot", label: "Recessed Spot", icon: "spot", lumens: 450, beam_radius: 1.8, kelvin: 3000, price: 39.0, is_strip: false },
+    PlannedLightPreset { id: "floor", label: "Floor Lamp", icon: "floor", lumens: 1050, beam_radius: 2.8, kelvin: 2700, price: 149.0, is_strip: false },
+    PlannedLightPreset { id: "table", label: "Table Lamp", icon: "table", lumens: 550, beam_radius: 2.0, kelvin: 2400, price: 69.0, is_strip: false },
+    PlannedLightPreset { id: "strip", label: "LED Lightstrip", icon: "strip", lumens: 1600, beam_radius: 2.2, kelvin: 2700, price: 79.0, is_strip: true },
+    PlannedLightPreset { id: "wall", label: "Wall Sconce", icon: "wall", lumens: 650, beam_radius: 2.1, kelvin: 2700, price: 89.0, is_strip: false },
+    PlannedLightPreset { id: "outdoor", label: "Outdoor Light", icon: "outdoor", lumens: 1400, beam_radius: 3.8, kelvin: 3000, price: 119.0, is_strip: false },
+];
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlannedLight {
+    pub id: String,
+    #[serde(default = "default_floor_id")]
+    pub floor_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_lamp_icon")]
+    pub icon: String,
+    pub x: f64,
+    pub y: f64,
+    #[serde(default)]
+    pub strip_points: Vec<FloorplanPoint>,
+    #[serde(default = "default_lumens")]
+    pub lumens: u32,
+    #[serde(default = "default_beam_radius")]
+    pub beam_radius: f64,
+    #[serde(default = "default_kelvin")]
+    pub kelvin: u32,
+    #[serde(default = "default_planned_color")]
+    pub color: String,
+    #[serde(default = "default_true")]
+    pub on: bool,
+    #[serde(default)]
+    pub model_note: String,
+    #[serde(default)]
+    pub price: f64,
+}
+
+impl PlannedLight {
+    pub fn is_strip(&self) -> bool { self.strip_points.len() >= 2 }
+
+    pub fn anchor(&self) -> (f64, f64) {
+        if self.strip_points.len() >= 2 {
+            let n = self.strip_points.len() as f64;
+            let sx: f64 = self.strip_points.iter().map(|p| p.x).sum();
+            let sy: f64 = self.strip_points.iter().map(|p| p.y).sum();
+            (sx / n, sy / n)
+        } else {
+            (self.x, self.y)
+        }
+    }
+
+    pub fn translate(&mut self, dx: f64, dy: f64) {
+        self.x += dx;
+        self.y += dy;
+        for p in &mut self.strip_points {
+            p.x += dx;
+            p.y += dy;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FloorplanBox {
     pub id: String,
     #[serde(default = "default_box_kind")]
@@ -1258,6 +1374,205 @@ pub struct FloorplanBox {
     pub h: f64,
     #[serde(default)]
     pub entertainment_area_id: Option<String>,
+    #[serde(default)]
+    pub points: Vec<FloorplanPoint>,
+    #[serde(default = "default_floor_id")]
+    pub floor_id: String,
+}
+
+impl FloorplanBox {
+    pub fn is_polygon(&self) -> bool {
+        self.points.len() >= 3
+    }
+
+    pub fn effective_points(&self) -> Vec<FloorplanPoint> {
+        if self.points.len() >= 3 {
+            self.points.clone()
+        } else {
+            vec![
+                FloorplanPoint { x: self.x, y: self.y },
+                FloorplanPoint { x: self.x + self.w, y: self.y },
+                FloorplanPoint { x: self.x + self.w, y: self.y + self.h },
+                FloorplanPoint { x: self.x, y: self.y + self.h },
+            ]
+        }
+    }
+
+    pub fn area_px(&self) -> f64 {
+        if self.points.len() < 3 {
+            return (self.w * self.h).max(1.0);
+        }
+        let n = self.points.len();
+        let mut sum = 0.0;
+        for i in 0..n {
+            let a = &self.points[i];
+            let b = &self.points[(i + 1) % n];
+            sum += a.x * b.y - b.x * a.y;
+        }
+        (sum.abs() * 0.5).max(1.0)
+    }
+
+    pub fn area_m2(&self, px_per_meter: f64) -> f64 {
+        let s = px_per_meter.max(10.0);
+        self.area_px() / (s * s)
+    }
+
+    pub fn contains_point(&self, px: f64, py: f64) -> bool {
+        if px < self.x - 0.5 || px > self.x + self.w + 0.5 || py < self.y - 0.5 || py > self.y + self.h + 0.5 {
+            return false;
+        }
+        if self.points.len() < 3 {
+            return px >= self.x && px <= self.x + self.w && py >= self.y && py <= self.y + self.h;
+        }
+        let n = self.points.len();
+        for i in 0..n {
+            let a = &self.points[i];
+            let b = &self.points[(i + 1) % n];
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            let len_sq = dx * dx + dy * dy;
+            let t = if len_sq < 1e-9 { 0.0 } else { (((px - a.x) * dx + (py - a.y) * dy) / len_sq).clamp(0.0, 1.0) };
+            let dist = ((px - (a.x + t * dx)).powi(2) + (py - (a.y + t * dy)).powi(2)).sqrt();
+            if dist <= 1.5 {
+                return true;
+            }
+        }
+        let mut inside = false;
+        let mut j = n - 1;
+        for i in 0..n {
+            let (xi, yi) = (self.points[i].x, self.points[i].y);
+            let (xj, yj) = (self.points[j].x, self.points[j].y);
+            let denom = if (yj - yi).abs() < 1e-9 { 1e-9 } else { yj - yi };
+            if ((yi > py) != (yj > py)) && (px < (xj - xi) * (py - yi) / denom + xi) {
+                inside = !inside;
+            }
+            j = i;
+        }
+        inside
+    }
+
+    pub fn sync_bounds(&mut self) {
+        if self.points.len() < 3 {
+            return;
+        }
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        for p in &self.points {
+            min_x = min_x.min(p.x);
+            min_y = min_y.min(p.y);
+            max_x = max_x.max(p.x);
+            max_y = max_y.max(p.y);
+        }
+        self.x = min_x;
+        self.y = min_y;
+        self.w = (max_x - min_x).max(60.0);
+        self.h = (max_y - min_y).max(60.0);
+    }
+
+    pub fn translate(&mut self, dx: f64, dy: f64) {
+        self.x += dx;
+        self.y += dy;
+        for p in &mut self.points {
+            p.x += dx;
+            p.y += dy;
+        }
+    }
+
+    pub fn scale_to(&mut self, new_x: f64, new_y: f64, new_w: f64, new_h: f64) {
+        let old_x = self.x;
+        let old_y = self.y;
+        let old_w = self.w.max(1.0);
+        let old_h = self.h.max(1.0);
+        for p in &mut self.points {
+            let fx = (p.x - old_x) / old_w;
+            let fy = (p.y - old_y) / old_h;
+            p.x = new_x + fx * new_w;
+            p.y = new_y + fy * new_h;
+        }
+        self.x = new_x;
+        self.y = new_y;
+        self.w = new_w.max(60.0);
+        self.h = new_h.max(60.0);
+    }
+
+    pub fn apply_shape(&mut self, shape: &str) {
+        let (x, y, w, h) = (self.x, self.y, self.w, self.h);
+        self.points = match shape {
+            "l_shape" => vec![
+                FloorplanPoint { x, y },
+                FloorplanPoint { x: x + w, y },
+                FloorplanPoint { x: x + w, y: y + h * 0.56 },
+                FloorplanPoint { x: x + w * 0.56, y: y + h * 0.56 },
+                FloorplanPoint { x: x + w * 0.56, y: y + h },
+                FloorplanPoint { x, y: y + h },
+            ],
+            "bay_window" => vec![
+                FloorplanPoint { x, y: y + h * 0.16 },
+                FloorplanPoint { x: x + w * 0.24, y: y + h * 0.16 },
+                FloorplanPoint { x: x + w * 0.34, y },
+                FloorplanPoint { x: x + w * 0.66, y },
+                FloorplanPoint { x: x + w * 0.76, y: y + h * 0.16 },
+                FloorplanPoint { x: x + w, y: y + h * 0.16 },
+                FloorplanPoint { x: x + w, y: y + h },
+                FloorplanPoint { x, y: y + h },
+            ],
+            "t_shape" => vec![
+                FloorplanPoint { x, y },
+                FloorplanPoint { x: x + w, y },
+                FloorplanPoint { x: x + w, y: y + h * 0.45 },
+                FloorplanPoint { x: x + w * 0.72, y: y + h * 0.45 },
+                FloorplanPoint { x: x + w * 0.72, y: y + h },
+                FloorplanPoint { x: x + w * 0.28, y: y + h },
+                FloorplanPoint { x: x + w * 0.28, y: y + h * 0.45 },
+                FloorplanPoint { x, y: y + h * 0.45 },
+            ],
+            "corridor" => vec![
+                FloorplanPoint { x, y },
+                FloorplanPoint { x: x + w * 0.42, y },
+                FloorplanPoint { x: x + w * 0.42, y: y + h * 0.62 },
+                FloorplanPoint { x: x + w, y: y + h * 0.62 },
+                FloorplanPoint { x: x + w, y: y + h },
+                FloorplanPoint { x, y: y + h },
+            ],
+            "trapezoid" => vec![
+                FloorplanPoint { x: x + w * 0.14, y },
+                FloorplanPoint { x: x + w, y },
+                FloorplanPoint { x: x + w, y: y + h },
+                FloorplanPoint { x, y: y + h },
+            ],
+            _ => Vec::new(),
+        };
+        self.sync_bounds();
+    }
+
+    pub fn move_vertex(&mut self, index: usize, nx: f64, ny: f64) {
+        if self.points.len() < 3 {
+            self.points = self.effective_points();
+        }
+        if index < self.points.len() {
+            self.points[index] = FloorplanPoint { x: nx, y: ny };
+            self.sync_bounds();
+        }
+    }
+
+    pub fn insert_vertex(&mut self, after_edge: usize, nx: f64, ny: f64) {
+        if self.points.len() < 3 {
+            self.points = self.effective_points();
+        }
+        if self.points.len() < 32 && after_edge < self.points.len() {
+            self.points.insert(after_edge + 1, FloorplanPoint { x: nx, y: ny });
+            self.sync_bounds();
+        }
+    }
+
+    pub fn remove_vertex(&mut self, index: usize) {
+        if self.points.len() > 3 && index < self.points.len() {
+            self.points.remove(index);
+            self.sync_bounds();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1270,6 +1585,8 @@ pub struct FloorplanStamp {
     pub h: f64,
     #[serde(default)]
     pub rot: i32,
+    #[serde(default = "default_floor_id")]
+    pub floor_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1280,12 +1597,22 @@ pub struct FloorplanLamp {
     pub z: f64,
     #[serde(default = "default_lamp_icon")]
     pub icon: String,
+    #[serde(default = "default_floor_id")]
+    pub floor_id: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FloorplanSensor {
     pub x: f64,
     pub y: f64,
+    #[serde(default = "default_floor_id")]
+    pub floor_id: String,
+}
+
+impl Default for FloorplanSensor {
+    fn default() -> Self {
+        Self { x: 0.0, y: 0.0, floor_id: "eg".into() }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1312,6 +1639,12 @@ pub struct FloorplanDocument {
     pub auto_sync_rooms: bool,
     #[serde(default)]
     pub background: FloorplanBackground,
+    #[serde(default = "default_px_per_meter")]
+    pub px_per_meter: f64,
+    #[serde(default = "default_floors")]
+    pub floors: Vec<FloorplanFloor>,
+    #[serde(default = "default_floor_id")]
+    pub active_floor_id: String,
     #[serde(default)]
     pub boxes: Vec<FloorplanBox>,
     #[serde(default)]
@@ -1320,12 +1653,14 @@ pub struct FloorplanDocument {
     pub lamps: BTreeMap<String, FloorplanLamp>,
     #[serde(default)]
     pub sensors: BTreeMap<String, FloorplanSensor>,
+    #[serde(default)]
+    pub planned_lights: Vec<PlannedLight>,
 }
 
 impl Default for FloorplanDocument {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             bridge_id: String::new(),
             template_id: "auto_bridge".to_string(),
             entertainment_id: None,
@@ -1336,11 +1671,44 @@ impl Default for FloorplanDocument {
             auto_sync: false,
             auto_sync_rooms: false,
             background: FloorplanBackground::default(),
+            px_per_meter: 50.0,
+            floors: vec![FloorplanFloor::default()],
+            active_floor_id: "eg".to_string(),
             boxes: Vec::new(),
             stamps: Vec::new(),
             lamps: BTreeMap::new(),
             sensors: BTreeMap::new(),
+            planned_lights: Vec::new(),
         }
+    }
+}
+
+pub fn target_lux_for_archetype(archetype: &str) -> u32 {
+    match archetype {
+        "office" | "computer" | "studio" => 400,
+        "kitchen" => 300,
+        "bathroom" | "toilet" => 250,
+        "dining" => 200,
+        "living_room" | "lounge" | "tv" => 150,
+        "bedroom" | "guest_room" | "kids_bedroom" => 120,
+        "hallway" | "staircase" => 100,
+        "terrace" | "balcony" | "garden" => 60,
+        _ => 150,
+    }
+}
+
+pub fn kelvin_to_hex(kelvin: u32) -> String {
+    let k = kelvin.clamp(1800, 6500) as f64;
+    if k <= 2400.0 {
+        "#ffb454".into()
+    } else if k <= 3000.0 {
+        "#ffd27a".into()
+    } else if k <= 4000.0 {
+        "#ffe8b8".into()
+    } else if k <= 5200.0 {
+        "#f7f9ff".into()
+    } else {
+        "#dbeeff".into()
     }
 }
 
@@ -1641,6 +2009,10 @@ pub fn cmd_floorplan_template(template_id: &str) -> Value {
     json!({ "cmd": "floorplan_template", "template_id": template_id })
 }
 
+pub fn cmd_floorplan_template_with_plan(template_id: &str, include_plan: bool) -> Value {
+    json!({ "cmd": "floorplan_template", "template_id": template_id, "include_plan": include_plan })
+}
+
 pub fn cmd_floorplan_bg_set(path: &str, opacity: f64, fit: &str) -> Value {
     json!({
         "cmd": "floorplan_bg_set",
@@ -1753,12 +2125,13 @@ pub fn cmd_motion_area_update(id: &str, enabled: Option<bool>, sensitivity: Opti
 
 pub fn template_label(id: &str) -> String {
     match id {
-        "studio_loft" => tr("Studio / Loft"),
-        "one_bed_apt" => tr("1-Bedroom Apartment"),
-        "three_room_apt" => tr("3-Room Apartment"),
-        "family_house" => tr("Family House + Terrace"),
+        "studio_loft" => tr("Open-Plan Loft"),
+        "one_bed_apt" => tr("2-Room Apartment"),
+        "three_room_apt" => tr("Altbau 3-Room Apartment"),
+        "family_house" => tr("2-Story Family House"),
+        "bungalow_l_shape" => tr("L-Shaped Bungalow"),
         "desk_studio" => tr("Desk / Gaming Studio"),
-        _ => tr("Auto from Hue Bridge"),
+        _ => tr("Auto from My Lights"),
     }
 }
 
@@ -1772,6 +2145,7 @@ pub fn stamp_kind_label(kind: &str) -> String {
         "bed" => tr("Bed"),
         "dining" => tr("Dining table"),
         "kitchen" => tr("Kitchen counter"),
+        "stairs" => tr("Stairs"),
         other => other.to_string(),
     }
 }
@@ -2367,7 +2741,7 @@ mod tests {
 
         // FloorplanDocument.sensors round-trip
         let doc = parse_floorplan(&stats).expect("floorplan with sensors should parse");
-        assert_eq!(doc.sensors.get("s-mot"), Some(&FloorplanSensor { x: 220.0, y: 140.0 }));
+        assert_eq!(doc.sensors.get("s-mot"), Some(&FloorplanSensor { x: 220.0, y: 140.0, floor_id: "eg".into() }));
         let saved = cmd_floorplan_save(&doc);
         assert_eq!(saved["floorplan"]["sensors"]["s-mot"]["x"], 220.0);
         assert_eq!(saved["floorplan"]["sensors"]["s-mot"]["y"], 140.0);

@@ -20,22 +20,22 @@ use floorplan::{
 };
 use model::{
     ASK_AI_KEY, COLOR_PRESETS, CONFIRM_ALL_ON_KEY, DAYS_ORDER, EXCLUDE_ALL_ON_KEY, FAVORITES_KEY, FONT_SCALES,
-    FONT_SCALE_KEY,
-    Favorite, FloorplanBox, FloorplanLamp, FloorplanSensor, FloorplanStamp, PANEL_ICONS, PANEL_ICON_KEY, RoomFilter,
+    FONT_SCALE_KEY, Favorite, FloorplanBox, FloorplanFloor, FloorplanLamp, FloorplanPoint, FloorplanSensor,
+    FloorplanStamp, PANEL_ICONS, PANEL_ICON_KEY, PLANNED_LIGHT_PRESETS, PlannedLight, RoomFilter,
     RuleDraft, SCHEDULE_MODES, SCHEDULE_MODE_KEY, SHOW_COUNT_KEY, SKINS, SKIN_KEY, SYNTH_BANDS, SYNTH_MODES,
     SYNTH_PALETTES, SYNTH_SOURCES, ScheduleDraft, Tab, TargetOption, ThemeDraft, WARMTH_PRESETS, all_rule_triggers,
     all_targets, belongs_to_rule, clamp_mirek, cmd_entertainment_sync, cmd_floorplan_bg_clear, cmd_floorplan_bg_set,
     cmd_floorplan_bg_update, cmd_floorplan_save, cmd_floorplan_sync_all, cmd_floorplan_sync_rooms,
-    cmd_floorplan_template, cmd_light_rename, cmd_motion_area_update, cmd_room_delete, cmd_room_update,
+    cmd_floorplan_template_with_plan, cmd_light_rename, cmd_motion_area_update, cmd_room_delete, cmd_room_update,
     cmd_scene_create, cmd_sensor_toggle, day_short_toggle, default_trigger_state, effect_label, extract_bridge_lights,
     favorites_to_value, font_scale_factor, font_scale_label, format_unix_ts, has_active_schedule, is_favorite,
-    is_light_or_room_trigger, lamp_icon_svg, motion_aware_eligible_rooms, normalize_font_scale, normalize_lamp_icon,
-    normalize_panel_icon, normalize_schedule_mode, normalize_skin, panel_icon_glyph, panel_icon_label, panel_icon_svg,
-    parse_favorites, parse_floorplan, parse_motion_areas, parse_sensors, parse_string_set, resolve_name,
-    room_matches_filter, schedule_action_summary, schedule_mode_label, schedule_trigger_summary,
-    should_show_motion_aware_hint, skin_label, skin_style, sorted_exclude_list, string_set_to_value, synth_band_label,
-    synth_mode_label, synth_palette_label, synth_palette_swatch, synth_source_label, synth_target_lights,
-    toggle_favorite, trigger_state_label, trigger_state_options,
+    is_light_or_room_trigger, kelvin_to_hex, lamp_icon_svg, motion_aware_eligible_rooms, normalize_font_scale,
+    normalize_lamp_icon, normalize_panel_icon, normalize_schedule_mode, normalize_skin, panel_icon_glyph,
+    panel_icon_label, panel_icon_svg, parse_favorites, parse_floorplan, parse_motion_areas, parse_sensors,
+    parse_string_set, resolve_name, room_matches_filter, schedule_action_summary, schedule_mode_label,
+    schedule_trigger_summary, should_show_motion_aware_hint, skin_label, skin_style, sorted_exclude_list,
+    string_set_to_value, synth_band_label, synth_mode_label, synth_palette_label, synth_palette_swatch,
+    synth_source_label, synth_target_lights, toggle_favorite, trigger_state_label, trigger_state_options,
 };
 use std::collections::{HashMap, HashSet};
 use maprisma_hue_lights::{TITLE, WINDOW_BUS, script_path};
@@ -594,6 +594,72 @@ impl AiState {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProviderDraft {
+    id: String,
+    kind: String,
+    name: String,
+    host: String,
+    port: String,
+    room_name: String,
+    token: String,
+    pair_id: String,
+    use_https: bool,
+    has_saved_token: bool,
+    original_kind: String,
+    original_host: String,
+    original_port: String,
+    awaiting_save: bool,
+}
+
+const EXTRA_PROVIDERS: [(&str, &str, &str, u16, bool, bool); 8] = [
+    ("home_assistant", "Home Assistant", "HA", 8123, true, false),
+    ("wled", "WLED", "WLED", 80, false, false),
+    ("wiz", "WiZ", "WiZ", 38899, false, false),
+    ("lifx", "LIFX", "LIFX", 56700, false, false),
+    ("govee", "Govee LAN", "Govee", 4003, false, false),
+    ("nanoleaf", "Nanoleaf", "Nanoleaf", 16021, true, true),
+    ("shelly", "Shelly", "Shelly", 80, false, false),
+    ("dirigera", "IKEA DIRIGERA", "IKEA", 8443, true, true),
+];
+
+fn provider_meta(kind: &str) -> Option<(&'static str, &'static str, &'static str, u16, bool, bool)> {
+    EXTRA_PROVIDERS.iter().copied().find(|(k, _, _, _, _, _)| *k == kind)
+}
+
+fn provider_badge_color(kind: &str) -> Color {
+    match kind {
+        "home_assistant" => Color::from_rgb(3.0 / 255.0, 169.0 / 255.0, 244.0 / 255.0),
+        "wled" => Color::from_rgb(236.0 / 255.0, 72.0 / 255.0, 153.0 / 255.0),
+        "wiz" => Color::from_rgb(139.0 / 255.0, 92.0 / 255.0, 246.0 / 255.0),
+        "lifx" => Color::from_rgb(16.0 / 255.0, 185.0 / 255.0, 129.0 / 255.0),
+        "govee" => Color::from_rgb(59.0 / 255.0, 130.0 / 255.0, 246.0 / 255.0),
+        "nanoleaf" => Color::from_rgb(34.0 / 255.0, 197.0 / 255.0, 94.0 / 255.0),
+        "shelly" => Color::from_rgb(6.0 / 255.0, 182.0 / 255.0, 212.0 / 255.0),
+        "dirigera" => Color::from_rgb(234.0 / 255.0, 179.0 / 255.0, 8.0 / 255.0),
+        _ => Color::from_rgb(245.0 / 255.0, 158.0 / 255.0, 11.0 / 255.0),
+    }
+}
+
+fn provider_pill<'a>(kind: &str) -> Option<Element<'a, Message>> {
+    let (_, _, badge, _, _, _) = provider_meta(kind)?;
+    let tint = provider_badge_color(kind);
+    Some(
+        container(text::caption(badge).class(theme::Text::Color(tint)))
+            .padding([1, 6])
+            .class(theme::Container::custom(move |_| iced_container::Style {
+                background: Some(Background::Color(with_alpha(tint, 0.14))),
+                border: Border {
+                    radius: corners::now().pill.into(),
+                    width: 1.0,
+                    color: with_alpha(tint, 0.35),
+                },
+                ..Default::default()
+            }))
+            .into(),
+    )
+}
+
 #[derive(Default)]
 struct HueLights<const WINDOW_MODE: bool = false> {
     core: Core,
@@ -619,6 +685,7 @@ struct HueLights<const WINDOW_MODE: bool = false> {
     schedule_draft: Option<ScheduleDraft>,
     rule_draft: Option<RuleDraft>,
     theme_draft: Option<ThemeDraft>,
+    provider_draft: Option<ProviderDraft>,
     activity_open: bool,
     // A slider being dragged: its value, and when it was last sent.
     dragging: HashMap<String, (u8, Instant)>,
@@ -799,6 +866,23 @@ enum Message {
     ToggleFontScale,
     ToggleScheduleMode,
     LookRefreshed(bool),
+    OpenAddProvider(Option<String>),
+    EditProvider(String),
+    CloseProviderDraft,
+    ProviderKind(String),
+    ProviderName(String),
+    ProviderHost(String),
+    ProviderPort(String),
+    ProviderRoomName(String),
+    ProviderToken(String),
+    ProviderHttps(bool),
+    ProviderUseDiscovered(String, String, String, u16),
+    DiscoverProviders,
+    TestProvider,
+    PairProvider,
+    SaveProvider,
+    ToggleProvider(String, bool),
+    RemoveProvider(String),
 }
 
 // Runs `work` on its own thread (saving must not hold up the popup) and answers with `done`.
@@ -1003,18 +1087,19 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                     .find(|s| s.id == sid)
                     .map(|s| s.room_id.as_str())
                     .unwrap_or("");
-                let (x, y) = self
+                let (x, y, floor_id) = self
                     .floorplan
                     .doc
                     .boxes
                     .iter()
                     .find(|b| !room_id.is_empty() && b.hue_id.as_deref() == Some(room_id))
-                    .map(|b| (b.x + (b.w * 0.5 + 36.0).min(b.w - 24.0), b.y + (b.h * 0.5).max(32.0)))
+                    .map(|b| (b.x + (b.w * 0.5 + 36.0).min(b.w - 24.0), b.y + (b.h * 0.5).max(32.0), b.floor_id.clone()))
                     .unwrap_or((
                         self.floorplan.doc.canvas.width * 0.5,
                         self.floorplan.doc.canvas.height * 0.5,
+                        self.floorplan.doc.active_floor_id.clone(),
                     ));
-                self.floorplan.doc.sensors.insert(sid.clone(), FloorplanSensor { x, y });
+                self.floorplan.doc.sensors.insert(sid.clone(), FloorplanSensor { x, y, floor_id });
                 self.floorplan.select(Some(Selection::Sensor(sid)), &self.stats);
                 self.save_floorplan(false);
             }
@@ -1073,13 +1158,16 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                 self.floorplan.close_menus();
                 self.floorplan.templates_open = next;
             }
+            MapMsg::ToggleGalleryIncludePlan(on) => {
+                self.floorplan.gallery_include_plan = on;
+            }
             MapMsg::ApplyTemplate(tid) => {
                 self.floorplan.close_menus();
                 self.floorplan.close_dialog();
                 self.floorplan.local_dirty = false;
                 self.floorplan.selection = None;
                 self.refresh_pending_sync();
-                self.send(cmd_floorplan_template(&tid));
+                self.send(cmd_floorplan_template_with_plan(&tid, self.floorplan.gallery_include_plan));
             }
             MapMsg::AddBox(kind) => {
                 self.floorplan.close_menus();
@@ -1089,6 +1177,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                 let bx = (120.0 + offset).min((self.floorplan.doc.canvas.width - 300.0).max(40.0));
                 let by = (120.0 + offset).min((self.floorplan.doc.canvas.height - 240.0).max(40.0));
                 let name = if is_zone { tr("New Zone") } else { tr("New Room") };
+                let floor_id = self.floorplan.doc.active_floor_id.clone();
                 self.floorplan.doc.boxes.push(FloorplanBox {
                     id: id.clone(),
                     kind: if is_zone { "zone".into() } else { "room".into() },
@@ -1099,8 +1188,38 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                     y: by,
                     w: 320.0,
                     h: 220.0,
+                    points: Vec::new(),
+                    floor_id,
                     entertainment_area_id: None,
                 });
+                self.floorplan.select(Some(Selection::Box(id)), &self.stats);
+                self.save_floorplan(true);
+            }
+            MapMsg::AddBoxWithShape(kind, shape) => {
+                self.floorplan.close_menus();
+                let is_zone = kind == "zone";
+                let id = self.floorplan.next_unique_id(if is_zone { "zone" } else { "box" });
+                let offset = ((self.floorplan.doc.boxes.len() % 5) as f64) * 30.0;
+                let bx = (120.0 + offset).min((self.floorplan.doc.canvas.width - 360.0).max(40.0));
+                let by = (120.0 + offset).min((self.floorplan.doc.canvas.height - 280.0).max(40.0));
+                let name = if is_zone { tr("New Zone") } else { tr("New Room") };
+                let floor_id = self.floorplan.doc.active_floor_id.clone();
+                let mut b = FloorplanBox {
+                    id: id.clone(),
+                    kind: if is_zone { "zone".into() } else { "room".into() },
+                    hue_id: None,
+                    name,
+                    archetype: if is_zone { "other".into() } else { "living_room".into() },
+                    x: bx,
+                    y: by,
+                    w: 340.0,
+                    h: 260.0,
+                    points: Vec::new(),
+                    floor_id,
+                    entertainment_area_id: None,
+                };
+                b.apply_shape(&shape);
+                self.floorplan.doc.boxes.push(b);
                 self.floorplan.select(Some(Selection::Box(id)), &self.stats);
                 self.save_floorplan(true);
             }
@@ -1116,10 +1235,12 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                     "bed" => (190.0, 155.0),
                     "dining" => (150.0, 90.0),
                     "kitchen" => (240.0, 54.0),
+                    "stairs" => (96.0, 130.0),
                     _ => (100.0, 60.0),
                 };
                 let cx = (self.floorplan.doc.canvas.width * 0.5 - w * 0.5).clamp(20.0, 3600.0);
                 let cy = (self.floorplan.doc.canvas.height * 0.5 - h * 0.5).clamp(20.0, 2600.0);
+                let floor_id = self.floorplan.doc.active_floor_id.clone();
                 self.floorplan.doc.stamps.push(FloorplanStamp {
                     id: id.clone(),
                     kind,
@@ -1128,8 +1249,288 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                     w,
                     h,
                     rot: 0,
+                    floor_id,
                 });
                 self.floorplan.select(Some(Selection::Stamp(id)), &self.stats);
+                self.save_floorplan(false);
+            }
+            MapMsg::SetAmbient(mode) => {
+                self.floorplan.ambient = mode;
+            }
+            MapMsg::SelectFloor(fid) => {
+                if self.floorplan.doc.floors.iter().any(|f| f.id == fid) {
+                    self.floorplan.doc.active_floor_id = fid;
+                    self.floorplan.selection = None;
+                    self.save_floorplan(false);
+                }
+            }
+            MapMsg::AddFloor => {
+                let next_level = self
+                    .floorplan
+                    .doc
+                    .floors
+                    .iter()
+                    .map(|f| f.level)
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                let mut idx = self.floorplan.doc.floors.len() + 1;
+                let fid = loop {
+                    let c = format!("fl-{idx}");
+                    if !self.floorplan.doc.floors.iter().any(|f| f.id == c) {
+                        break c;
+                    }
+                    idx += 1;
+                };
+                let name = match next_level {
+                    1 => tr("Upper Floor (OG)"),
+                    2 => tr("Attic (DG)"),
+                    n => trf("Floor {0}", &[n.to_string()]),
+                };
+                self.floorplan.doc.floors.push(FloorplanFloor {
+                    id: fid.clone(),
+                    name,
+                    level: next_level,
+                });
+                self.floorplan.doc.active_floor_id = fid;
+                self.floorplan.selection = None;
+                self.save_floorplan(false);
+            }
+            MapMsg::DeleteFloor(fid) => {
+                if self.floorplan.doc.floors.len() > 1 {
+                    self.floorplan.doc.floors.retain(|f| f.id != fid);
+                    let fallback = self
+                        .floorplan
+                        .doc
+                        .floors
+                        .first()
+                        .map(|f| f.id.clone())
+                        .unwrap_or_else(|| "eg".into());
+                    self.floorplan.doc.boxes.retain(|b| b.floor_id != fid);
+                    self.floorplan.doc.stamps.retain(|s| s.floor_id != fid);
+                    self.floorplan.doc.planned_lights.retain(|p| p.floor_id != fid);
+                    for l in self.floorplan.doc.lamps.values_mut() {
+                        if l.floor_id == fid {
+                            l.floor_id = fallback.clone();
+                        }
+                    }
+                    for s in self.floorplan.doc.sensors.values_mut() {
+                        if s.floor_id == fid {
+                            s.floor_id = fallback.clone();
+                        }
+                    }
+                    if self.floorplan.doc.active_floor_id == fid {
+                        self.floorplan.doc.active_floor_id = fallback;
+                    }
+                    self.floorplan.selection = None;
+                    self.save_floorplan(false);
+                }
+            }
+            MapMsg::BoxSetFloor(bid, fid) => {
+                if self.floorplan.doc.floors.iter().any(|f| f.id == fid)
+                    && let Some(b_snap) = self.floorplan.doc.boxes.iter().find(|b| b.id == bid).cloned()
+                {
+                    let old_floor = b_snap.floor_id.clone();
+                    if old_floor != fid {
+                        for l in self.floorplan.doc.lamps.values_mut() {
+                            if l.floor_id == old_floor && b_snap.contains_point(l.x, l.y) {
+                                l.floor_id = fid.clone();
+                            }
+                        }
+                        for s in self.floorplan.doc.sensors.values_mut() {
+                            if s.floor_id == old_floor && b_snap.contains_point(s.x, s.y) {
+                                s.floor_id = fid.clone();
+                            }
+                        }
+                        for pl in &mut self.floorplan.doc.planned_lights {
+                            let (px, py) = pl.anchor();
+                            if pl.floor_id == old_floor && b_snap.contains_point(px, py) {
+                                pl.floor_id = fid.clone();
+                            }
+                        }
+                        if let Some(b) = self.floorplan.doc.boxes.iter_mut().find(|b| b.id == bid) {
+                            b.floor_id = fid;
+                        }
+                        self.floorplan.selection = None;
+                        self.save_floorplan(false);
+                    }
+                }
+            }
+            MapMsg::BoxApplyShape(bid, shape) => {
+                if let Some(b) = self.floorplan.doc.boxes.iter_mut().find(|b| b.id == bid) {
+                    b.apply_shape(&shape);
+                    self.save_floorplan(true);
+                }
+            }
+            MapMsg::MoveBoxVertex { box_id, index, x, y, commit } => {
+                if let Some(b) = self.floorplan.doc.boxes.iter_mut().find(|b| b.id == box_id) {
+                    b.move_vertex(index, x, y);
+                }
+                self.floorplan.local_dirty = !commit;
+                if commit {
+                    self.save_floorplan(true);
+                }
+            }
+            MapMsg::InsertBoxVertex { box_id, after_edge, x, y } => {
+                if let Some(b) = self.floorplan.doc.boxes.iter_mut().find(|b| b.id == box_id) {
+                    b.insert_vertex(after_edge, x, y);
+                    self.save_floorplan(true);
+                }
+            }
+            MapMsg::RemoveBoxVertex { box_id, index } => {
+                if let Some(b) = self.floorplan.doc.boxes.iter_mut().find(|b| b.id == box_id) {
+                    b.remove_vertex(index);
+                    self.save_floorplan(true);
+                }
+            }
+            MapMsg::TogglePlanAddMenu => {
+                let next = !self.floorplan.plan_add_open;
+                self.floorplan.close_menus();
+                self.floorplan.plan_add_open = next;
+            }
+            MapMsg::TogglePlanList => {
+                let next = !self.floorplan.plan_list_open;
+                self.floorplan.close_menus();
+                self.floorplan.plan_list_open = next;
+            }
+            MapMsg::AddPlannedLight(preset_id) => {
+                self.floorplan.close_menus();
+                let preset = PLANNED_LIGHT_PRESETS
+                    .iter()
+                    .find(|p| p.id == preset_id)
+                    .unwrap_or(&PLANNED_LIGHT_PRESETS[0]);
+                let id = self.floorplan.next_unique_id("plan");
+                let offset = ((self.floorplan.doc.planned_lights.len() % 6) as f64) * 26.0;
+                let cx = (self.floorplan.doc.canvas.width * 0.5 - 60.0 + offset)
+                    .clamp(60.0, self.floorplan.doc.canvas.width - 60.0);
+                let cy = (self.floorplan.doc.canvas.height * 0.5 - 40.0 + offset)
+                    .clamp(60.0, self.floorplan.doc.canvas.height - 60.0);
+                let strip_points = if preset.is_strip {
+                    vec![
+                        FloorplanPoint { x: cx - 70.0, y: cy },
+                        FloorplanPoint { x: cx, y: cy },
+                        FloorplanPoint { x: cx + 70.0, y: cy },
+                    ]
+                } else {
+                    Vec::new()
+                };
+                let floor_id = self.floorplan.doc.active_floor_id.clone();
+                self.floorplan.doc.planned_lights.push(PlannedLight {
+                    id: id.clone(),
+                    name: tr(preset.label),
+                    icon: preset.icon.to_string(),
+                    floor_id,
+                    x: cx,
+                    y: cy,
+                    strip_points,
+                    lumens: preset.lumens,
+                    beam_radius: preset.beam_radius,
+                    kelvin: preset.kelvin,
+                    color: kelvin_to_hex(preset.kelvin),
+                    on: true,
+                    price: preset.price,
+                    model_note: String::new(),
+                });
+                self.floorplan.select(Some(Selection::Planned(id)), &self.stats);
+                self.save_floorplan(false);
+            }
+            MapMsg::MovePlannedLight { id, x, y, commit } => {
+                if let Some(pl) = self.floorplan.doc.planned_lights.iter_mut().find(|p| p.id == id) {
+                    pl.x = x;
+                    pl.y = y;
+                }
+                self.floorplan.local_dirty = !commit;
+                if commit {
+                    self.save_floorplan(false);
+                }
+            }
+            MapMsg::MovePlannedStripVertex { id, index, x, y, commit } => {
+                if let Some(pl) = self.floorplan.doc.planned_lights.iter_mut().find(|p| p.id == id)
+                    && index < pl.strip_points.len()
+                {
+                    pl.strip_points[index] = FloorplanPoint { x, y };
+                    let (ax, ay) = pl.anchor();
+                    pl.x = ax;
+                    pl.y = ay;
+                }
+                self.floorplan.local_dirty = !commit;
+                if commit {
+                    self.save_floorplan(false);
+                }
+            }
+            MapMsg::TogglePlannedLight(id) => {
+                if let Some(pl) = self.floorplan.doc.planned_lights.iter_mut().find(|p| p.id == id) {
+                    pl.on = !pl.on;
+                    self.save_floorplan(false);
+                }
+            }
+            MapMsg::PlannedSetLumens(id, lm) => {
+                if let Some(pl) = self.floorplan.doc.planned_lights.iter_mut().find(|p| p.id == id) {
+                    pl.lumens = lm.clamp(50, 6000);
+                    self.save_floorplan(false);
+                }
+            }
+            MapMsg::PlannedSetKelvin(id, k) => {
+                if let Some(pl) = self.floorplan.doc.planned_lights.iter_mut().find(|p| p.id == id) {
+                    let ck = k.clamp(2000, 6500);
+                    pl.kelvin = ck;
+                    pl.color = kelvin_to_hex(ck);
+                    self.save_floorplan(false);
+                }
+            }
+            MapMsg::PlannedSetBeam(id, r) => {
+                if let Some(pl) = self.floorplan.doc.planned_lights.iter_mut().find(|p| p.id == id) {
+                    pl.beam_radius = r.clamp(0.8, 10.0);
+                    self.save_floorplan(false);
+                }
+            }
+            MapMsg::PlannedNameInput(s) => {
+                self.floorplan.planned_name_draft = s.chars().take(48).collect();
+            }
+            MapMsg::PlannedNameSave(id) => {
+                let name = self.floorplan.planned_name_draft.trim().to_string();
+                if !name.is_empty()
+                    && let Some(pl) = self.floorplan.doc.planned_lights.iter_mut().find(|p| p.id == id)
+                {
+                    pl.name = name;
+                    self.save_floorplan(false);
+                }
+            }
+            MapMsg::PlannedPriceInput(s) => {
+                self.floorplan.planned_price_draft = s.chars().take(12).collect();
+            }
+            MapMsg::PlannedPriceSave(id) => {
+                let cleaned = self.floorplan.planned_price_draft.trim().replace(',', ".");
+                if let Ok(val) = cleaned.parse::<f64>()
+                    && let Some(pl) = self.floorplan.doc.planned_lights.iter_mut().find(|p| p.id == id)
+                {
+                    pl.price = val.clamp(0.0, 99999.0);
+                    self.save_floorplan(false);
+                }
+            }
+            MapMsg::BindPlannedToReal { planned_id, real_light_id } => {
+                if let Some(pos) = self.floorplan.doc.planned_lights.iter().position(|p| p.id == planned_id) {
+                    let pl = self.floorplan.doc.planned_lights.remove(pos);
+                    let (ax, ay) = pl.anchor();
+                    self.floorplan.doc.lamps.insert(
+                        real_light_id.clone(),
+                        FloorplanLamp {
+                            x: ax,
+                            y: ay,
+                            z: 0.0,
+                            icon: normalize_lamp_icon(&pl.icon).to_string(),
+                            floor_id: pl.floor_id,
+                        },
+                    );
+                    self.floorplan.select(Some(Selection::Lamp(real_light_id)), &self.stats);
+                    self.save_floorplan(true);
+                }
+            }
+            MapMsg::DeletePlannedLight(id) => {
+                self.floorplan.doc.planned_lights.retain(|p| p.id != id);
+                if matches!(&self.floorplan.selection, Some(Selection::Planned(pid)) if pid == &id) {
+                    self.floorplan.selection = None;
+                }
                 self.save_floorplan(false);
             }
             MapMsg::SetMode(mode) => {
@@ -1254,20 +1655,21 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                     .find(|l| l.id == lid)
                     .map(|l| l.room_id.as_str())
                     .unwrap_or("");
-                let (x, y) = self
+                let (x, y, floor_id) = self
                     .floorplan
                     .doc
                     .boxes
                     .iter()
                     .find(|b| !room_id.is_empty() && b.hue_id.as_deref() == Some(room_id))
-                    .map(|b| (b.x + b.w * 0.5, b.y + b.h * 0.5))
+                    .map(|b| (b.x + b.w * 0.5, b.y + b.h * 0.5, b.floor_id.clone()))
                     .unwrap_or((
                         self.floorplan.doc.canvas.width * 0.5,
                         self.floorplan.doc.canvas.height * 0.5,
+                        self.floorplan.doc.active_floor_id.clone(),
                     ));
                 self.floorplan.doc.lamps.insert(
                     lid.clone(),
-                    FloorplanLamp { x, y, z: 0.0, icon: "bulb".into() },
+                    FloorplanLamp { x, y, z: 0.0, icon: "bulb".into(), floor_id },
                 );
                 self.floorplan.select(Some(Selection::Lamp(lid)), &self.stats);
                 self.save_floorplan(true);
@@ -1302,9 +1704,10 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             }
             MapMsg::PlaceArmedAt { x, y } => {
                 if let Some(lid) = self.floorplan.armed_place_lamp.take() {
+                    let floor_id = self.floorplan.doc.active_floor_id.clone();
                     self.floorplan.doc.lamps.insert(
                         lid.clone(),
-                        FloorplanLamp { x, y, z: 0.0, icon: "bulb".into() },
+                        FloorplanLamp { x, y, z: 0.0, icon: "bulb".into(), floor_id },
                     );
                     self.floorplan.select(Some(Selection::Lamp(lid)), &self.stats);
                     self.save_floorplan(true);
@@ -1321,9 +1724,41 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                 }
             }
             MapMsg::MoveBox { id, x, y, commit } => {
-                if let Some(b) = self.floorplan.doc.boxes.iter_mut().find(|b| b.id == id) {
-                    b.x = x;
-                    b.y = y;
+                if let Some(orig) = self.floorplan.doc.boxes.iter().find(|b| b.id == id).cloned() {
+                    let dx = x - orig.x;
+                    let dy = y - orig.y;
+                    if let Some(b) = self.floorplan.doc.boxes.iter_mut().find(|b| b.id == id) {
+                        b.translate(dx, dy);
+                    }
+                    // Carry enclosed lights, sensors & planned lights on the same floor when dragging a room
+                    if orig.kind == "room" && (dx.abs() > 0.01 || dy.abs() > 0.01) {
+                        let max_w = self.floorplan.doc.canvas.width;
+                        let max_h = self.floorplan.doc.canvas.height;
+                        for l in self.floorplan.doc.lamps.values_mut() {
+                            if l.floor_id == orig.floor_id && orig.contains_point(l.x, l.y) {
+                                l.x = (l.x + dx).clamp(0.0, max_w);
+                                l.y = (l.y + dy).clamp(0.0, max_h);
+                            }
+                        }
+                        for s in self.floorplan.doc.sensors.values_mut() {
+                            if s.floor_id == orig.floor_id && orig.contains_point(s.x, s.y) {
+                                s.x = (s.x + dx).clamp(0.0, max_w);
+                                s.y = (s.y + dy).clamp(0.0, max_h);
+                            }
+                        }
+                        for pl in &mut self.floorplan.doc.planned_lights {
+                            let (px, py) = pl.anchor();
+                            if pl.floor_id == orig.floor_id && orig.contains_point(px, py) {
+                                pl.translate(dx, dy);
+                                pl.x = pl.x.clamp(0.0, max_w);
+                                pl.y = pl.y.clamp(0.0, max_h);
+                                for pt in &mut pl.strip_points {
+                                    pt.x = pt.x.clamp(0.0, max_w);
+                                    pt.y = pt.y.clamp(0.0, max_h);
+                                }
+                            }
+                        }
+                    }
                 }
                 self.floorplan.local_dirty = !commit;
                 if commit {
@@ -1332,10 +1767,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             }
             MapMsg::ResizeBox { id, x, y, w, h, commit } => {
                 if let Some(b) = self.floorplan.doc.boxes.iter_mut().find(|b| b.id == id) {
-                    b.x = x;
-                    b.y = y;
-                    b.w = w;
-                    b.h = h;
+                    b.scale_to(x, y, w, h);
                 }
                 self.floorplan.local_dirty = !commit;
                 if commit {
@@ -1407,20 +1839,21 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                         .find(|l| l.id == id)
                         .map(|l| l.room_id.as_str())
                         .unwrap_or("");
-                    let (x, y) = self
+                    let (x, y, floor_id) = self
                         .floorplan
                         .doc
                         .boxes
                         .iter()
                         .find(|b| !room_id.is_empty() && b.hue_id.as_deref() == Some(room_id))
-                        .map(|b| (b.x + b.w * 0.5, b.y + b.h * 0.5))
+                        .map(|b| (b.x + b.w * 0.5, b.y + b.h * 0.5, b.floor_id.clone()))
                         .unwrap_or((
                             self.floorplan.doc.canvas.width * 0.5,
                             self.floorplan.doc.canvas.height * 0.5,
+                            self.floorplan.doc.active_floor_id.clone(),
                         ));
                     self.floorplan.doc.lamps.insert(
                         id,
-                        FloorplanLamp { x, y, z: 0.0, icon: norm },
+                        FloorplanLamp { x, y, z: 0.0, icon: norm, floor_id },
                     );
                     self.save_floorplan(false);
                 }
@@ -1854,7 +2287,243 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             .align_y(Alignment::Center),
         );
         content = content.push(button::standard(tr("Search again")).on_press_maybe((!discovering).then_some(Message::Discover)));
+        content = content.push(divider::horizontal::default());
+        content = content.push(self.extra_devices_section(true));
         content.into()
+    }
+
+    fn extra_devices_section(&self, compact_onboarding: bool) -> Element<'_, Message> {
+        let mut sec = column![].spacing(8);
+        let providers = list(&self.stats, "providers");
+        if compact_onboarding {
+            sec = sec.push(text::heading(tr("Other smart lights & hubs")));
+            sec = sec.push(dim(tr("Connect Home Assistant, WLED, WiZ, LIFX, Govee LAN, Nanoleaf, Shelly, or IKEA DIRIGERA directly over your local network — with or without a Hue Bridge.")));
+            let mut row1 = row![].spacing(6);
+            let mut row2 = row![].spacing(6);
+            for (idx, (kind, _, badge, _, _, _)) in EXTRA_PROVIDERS.iter().enumerate() {
+                let b = button::standard(*badge).on_press(Message::OpenAddProvider(Some((*kind).to_string())));
+                if idx < 4 {
+                    row1 = row1.push(b);
+                } else {
+                    row2 = row2.push(b);
+                }
+            }
+            sec = sec.push(row1);
+            sec = sec.push(row2);
+        } else {
+            sec = sec.push(
+                row![
+                    column![
+                        text::body(tr("Other smart lights & hubs")),
+                        dim(tr("Mix Philips Hue with Home Assistant, WLED, WiZ, LIFX, Govee LAN, Nanoleaf, Shelly, or IKEA DIRIGERA.")),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    button::suggested(tr("Add Device…")).on_press(Message::OpenAddProvider(None)),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            );
+            if providers.is_empty() {
+                sec = sec.push(dim(tr("No extra devices added yet.")));
+            } else {
+                for p in providers {
+                    let pid = s(p, "id").to_string();
+                    let pkind = s(p, "kind");
+                    let pname = s(p, "name").to_string();
+                    let phost = s(p, "host");
+                    let pport = num(p, "port") as u16;
+                    let penabled = p.get("enabled").and_then(Value::as_bool) != Some(false);
+                    let pconn = flag(p, "connected");
+                    let lcount = num(p, "light_count") as u64;
+                    let perr = s(p, "error");
+                    let dot = if !penabled { "○" } else if pconn { "●" } else { "◐" };
+                    let mut title_row = row![text::body(format!("{dot} {pname}"))].spacing(6).align_y(Alignment::Center);
+                    if let Some(pill) = provider_pill(pkind) {
+                        title_row = title_row.push(pill);
+                    }
+                    let subtitle = if lcount > 0 {
+                        format!("{phost}:{pport} · {lcount}")
+                    } else {
+                        format!("{phost}:{pport}")
+                    };
+                    let mut info_col = column![title_row, dim(subtitle)].spacing(2).width(Length::Fill);
+                    if penabled && !perr.is_empty() {
+                        info_col = info_col.push(error_text(perr.to_string()));
+                    }
+                    let pid_tog = pid.clone();
+                    let pid_edit = pid.clone();
+                    let pid_del = pid.clone();
+                    sec = sec.push(
+                        container(
+                            row![
+                                info_col,
+                                toggler(penabled).on_toggle(move |v| Message::ToggleProvider(pid_tog.clone(), v)),
+                                button::standard(tr("Edit")).on_press(Message::EditProvider(pid_edit)),
+                                button::destructive(tr("Remove")).on_press(Message::RemoveProvider(pid_del)),
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center),
+                        )
+                        .padding(8)
+                        .class(card(None, &self.skin)),
+                    );
+                }
+            }
+        }
+        if let Some(draft) = &self.provider_draft {
+            sec = sec.push(self.provider_editor(draft));
+        }
+        sec.into()
+    }
+
+    fn provider_editor<'a>(&'a self, draft: &'a ProviderDraft) -> Element<'a, Message> {
+        let (_, disp_name, _, default_port, req_tok, supports_pair) =
+            provider_meta(&draft.kind).unwrap_or(EXTRA_PROVIDERS[0]);
+        let mut form = column![
+            row![
+                text::heading(if draft.id.is_empty() { tr("Add Lighting Device") } else { tr("Edit Lighting Device") }),
+                space::horizontal(),
+                button::text(tr("Cancel")).on_press(Message::CloseProviderDraft),
+            ]
+            .align_y(Alignment::Center),
+        ]
+        .spacing(8);
+
+        if draft.id.is_empty() {
+            let mut r1 = row![].spacing(4);
+            let mut r2 = row![].spacing(4);
+            for (idx, (k, _, badge, _, _, _)) in EXTRA_PROVIDERS.iter().enumerate() {
+                let active = draft.kind == *k;
+                let btn = if active {
+                    button::suggested(*badge).on_press(Message::ProviderKind((*k).to_string()))
+                } else {
+                    button::standard(*badge).on_press(Message::ProviderKind((*k).to_string()))
+                };
+                if idx < 4 { r1 = r1.push(btn); } else { r2 = r2.push(btn); }
+            }
+            form = form.push(r1).push(r2);
+
+            let disc_busy = flag(&self.stats, "discovering_providers");
+            let discovered = list(&self.stats, "discovered_providers");
+            form = form.push(
+                row![
+                    dim(tr("Discovered on local network")),
+                    space::horizontal(),
+                    button::standard(if disc_busy { tr("Scanning…") } else { tr("Scan LAN") })
+                        .on_press_maybe((!disc_busy).then_some(Message::DiscoverProviders)),
+                ]
+                .align_y(Alignment::Center),
+            );
+            for dev in discovered {
+                let dk = s(dev, "kind").to_string();
+                let dn = s(dev, "name").to_string();
+                let dh = s(dev, "host").to_string();
+                let dp = num(dev, "port") as u16;
+                let badge = s(dev, "badge").to_string();
+                form = form.push(
+                    row![
+                        text::caption(format!("[{badge}] {dn} · {dh}:{dp}")),
+                        space::horizontal(),
+                        button::standard(tr("Use")).on_press(Message::ProviderUseDiscovered(dk, dn, dh, dp)),
+                    ]
+                    .align_y(Alignment::Center),
+                );
+            }
+        }
+
+        form = form.push(
+            text_input(disp_name, &draft.name)
+                .on_input(Message::ProviderName)
+                .width(Length::Fill),
+        );
+        form = form.push(
+            row![
+                text_input(tr("Local IP or .local host"), &draft.host)
+                    .on_input(Message::ProviderHost)
+                    .width(Length::Fill),
+                text_input(default_port.to_string(), &draft.port)
+                    .on_input(Message::ProviderPort)
+                    .width(Length::Fixed(80.0)),
+            ]
+            .spacing(8),
+        );
+        if draft.kind != "home_assistant" && draft.kind != "dirigera" {
+            form = form.push(
+                text_input(tr("Room name (optional)"), &draft.room_name)
+                    .on_input(Message::ProviderRoomName)
+                    .width(Length::Fill),
+            );
+        }
+        if draft.kind == "home_assistant" {
+            form = form.push(
+                row![
+                    text::caption(tr("Use HTTPS (self-signed LAN cert allowed)")),
+                    space::horizontal(),
+                    toggler(draft.use_https).on_toggle(Message::ProviderHttps),
+                ]
+                .align_y(Alignment::Center),
+            );
+        }
+        let same_saved_target = draft.has_saved_token
+            && draft.kind == draft.original_kind
+            && draft.host.trim().eq_ignore_ascii_case(draft.original_host.trim())
+            && draft.port.trim() == draft.original_port.trim();
+        if req_tok {
+            let placeholder = if same_saved_target || !draft.pair_id.is_empty() {
+                tr("Saved (leave blank to keep)")
+            } else {
+                tr("Access Token")
+            };
+            form = form.push(
+                text_input(placeholder, &draft.token)
+                    .on_input(Message::ProviderToken)
+                    .password()
+                    .width(Length::Fill),
+            );
+        }
+        if supports_pair {
+            let pair_lbl = if draft.kind == "nanoleaf" {
+                tr("Pair via Power Button")
+            } else {
+                tr("Pair via Action Button")
+            };
+            form = form.push(
+                button::standard(pair_lbl)
+                    .on_press_maybe((!draft.host.trim().is_empty()).then_some(Message::PairProvider)),
+            );
+        }
+
+        if let Some(act) = self.stats.get("provider_action").and_then(Value::as_object) {
+            let running = act.get("running").and_then(Value::as_bool) == Some(true);
+            let ok = act.get("ok").and_then(Value::as_bool) == Some(true);
+            let msg = act.get("message").and_then(Value::as_str).unwrap_or("");
+            if running {
+                form = form.push(dim(tr("Working…")));
+            } else if !msg.is_empty() {
+                if ok {
+                    form = form.push(dim(format!("✓ {msg}")));
+                } else {
+                    form = form.push(error_text(msg.to_string()));
+                }
+            }
+        }
+
+        let host_ok = !draft.host.trim().is_empty();
+        let tok_ok = !req_tok || !draft.token.trim().is_empty() || !draft.pair_id.is_empty() || same_saved_target;
+        form = form.push(
+            row![
+                button::standard(tr("Test Connection"))
+                    .on_press_maybe((host_ok && tok_ok).then_some(Message::TestProvider)),
+                space::horizontal(),
+                button::suggested(tr("Save Device"))
+                    .on_press_maybe((host_ok && tok_ok).then_some(Message::SaveProvider)),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+
+        container(form).padding(10).class(card(None, &self.skin)).into()
     }
 
     // --------------------------------------------------------------------- Lights tab
@@ -2114,7 +2783,11 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         } else {
             dim(room_status(room, excluded))
         };
-        let names = column![text::heading(rname.clone()), status_el].spacing(4);
+        let mut title_row = row![text::heading(rname.clone())].spacing(6).align_y(Alignment::Center);
+        if let Some(pill) = provider_pill(s(room, "provider")) {
+            title_row = title_row.push(pill);
+        }
+        let names = column![title_row, status_el].spacing(4);
         let expander = button::custom(
             row![badge, names, space::horizontal(), chevron].spacing(12).align_y(Alignment::Center),
         )
@@ -3544,6 +4217,28 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
             toggler(self.shot_key).on_toggle(Message::SetShotKey).into(),
         ));
 
+        page = page.push(divider::horizontal::default());
+        if !flag(&self.stats, "hue_paired") && self.paired() {
+            let ip = self.ip.trim().to_string();
+            page = page.push(padded_control(
+                column![
+                    text::body(tr("Pair a Hue bridge")),
+                    row![
+                        text_input(tr("Bridge IP, e.g. 192.168.178.106"), &self.ip)
+                            .on_input(Message::Ip)
+                            .on_submit(|value: String| Message::Pair(value.trim().to_string()))
+                            .width(Length::Fill),
+                        button::standard(tr("Pair")).on_press_maybe((!ip.is_empty()).then_some(Message::Pair(ip)))
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                ]
+                .spacing(6),
+            ));
+            page = page.push(divider::horizontal::default());
+        }
+        page = page.push(padded_control(self.extra_devices_section(false)));
+
         if self.language_error { page = page.push(padded_control(error_text(tr("Could not save language setting.")))); }
         if self.setting_error { page = page.push(padded_control(error_text(tr("Could not save the setting.")))); }
         let page = page.width(if self.window_mode { Length::Fill } else { Length::Fixed(POPUP_WIDTH) }).padding([0, 0, 8, 0]);
@@ -3916,6 +4611,23 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                     self.confirm_all_on = false;
                 }
                 self.stats = stats;
+                if let Some(act) = self.stats.get("provider_action").and_then(Value::as_object) {
+                    let act_kind = act.get("kind").and_then(Value::as_str).unwrap_or("");
+                    let act_ok = act.get("ok").and_then(Value::as_bool) == Some(true);
+                    let act_running = act.get("running").and_then(Value::as_bool) == Some(true);
+                    let pair_id = act.get("pair_id").and_then(Value::as_str).unwrap_or("");
+                    if let Some(draft) = &mut self.provider_draft {
+                        if act_ok && !pair_id.is_empty() && act_kind == format!("pair_{}", draft.kind) {
+                            draft.pair_id = pair_id.to_string();
+                        }
+                        if draft.awaiting_save && act_kind == "save" && !act_running {
+                            draft.awaiting_save = false;
+                            if act_ok {
+                                self.provider_draft = None;
+                            }
+                        }
+                    }
+                }
                 self.ai_state = AiState::from_stats(&self.stats);
                 if let Some(fp) = parse_floorplan(&self.stats) {
                     self.floorplan.sync_from_snapshot(fp);
@@ -4766,6 +5478,161 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                     self.confirm_unpair = true;
                 }
             }
+            Message::OpenAddProvider(pre) => {
+                let kind = pre.unwrap_or_else(|| "home_assistant".to_string());
+                let (_, _, _, default_port, _, _) = provider_meta(&kind).unwrap_or(EXTRA_PROVIDERS[0]);
+                self.provider_draft = Some(ProviderDraft {
+                    id: String::new(),
+                    kind: kind.clone(),
+                    name: String::new(),
+                    host: String::new(),
+                    port: default_port.to_string(),
+                    room_name: String::new(),
+                    token: String::new(),
+                    pair_id: String::new(),
+                    use_https: kind == "dirigera",
+                    has_saved_token: false,
+                    original_kind: String::new(),
+                    original_host: String::new(),
+                    original_port: String::new(),
+                    awaiting_save: false,
+                });
+                self.send(json!({"cmd": "discover_providers"}));
+            }
+            Message::EditProvider(cid) => {
+                if let Some(p) = list(&self.stats, "providers").iter().find(|v| s(v, "id") == cid) {
+                    let pkind = s(p, "kind").to_string();
+                    let phost = s(p, "host").to_string();
+                    let pport = (num(p, "port") as u16).to_string();
+                    self.provider_draft = Some(ProviderDraft {
+                        id: cid,
+                        kind: pkind.clone(),
+                        name: s(p, "name").to_string(),
+                        host: phost.clone(),
+                        port: pport.clone(),
+                        room_name: s(p, "room_name").to_string(),
+                        token: String::new(),
+                        pair_id: String::new(),
+                        use_https: flag(p, "use_https"),
+                        has_saved_token: flag(p, "has_token"),
+                        original_kind: pkind,
+                        original_host: phost,
+                        original_port: pport,
+                        awaiting_save: false,
+                    });
+                }
+            }
+            Message::CloseProviderDraft => {
+                self.provider_draft = None;
+            }
+            Message::ProviderKind(k) => {
+                if let Some(draft) = &mut self.provider_draft {
+                    let (_, _, _, default_port, _, _) = provider_meta(&k).unwrap_or(EXTRA_PROVIDERS[0]);
+                    draft.kind = k.clone();
+                    draft.port = default_port.to_string();
+                    draft.use_https = k == "dirigera";
+                    draft.token.clear();
+                    draft.pair_id.clear();
+                    draft.has_saved_token = false;
+                }
+            }
+            Message::ProviderName(v) => {
+                if let Some(d) = &mut self.provider_draft { d.name = v; }
+            }
+            Message::ProviderHost(v) => {
+                if let Some(d) = &mut self.provider_draft {
+                    d.host = v;
+                    d.pair_id.clear();
+                }
+            }
+            Message::ProviderPort(v) => {
+                if let Some(d) = &mut self.provider_draft {
+                    d.port = v;
+                    d.pair_id.clear();
+                }
+            }
+            Message::ProviderRoomName(v) => {
+                if let Some(d) = &mut self.provider_draft { d.room_name = v; }
+            }
+            Message::ProviderToken(v) => {
+                if let Some(d) = &mut self.provider_draft { d.token = v; }
+            }
+            Message::ProviderHttps(v) => {
+                if let Some(d) = &mut self.provider_draft { d.use_https = v; }
+            }
+            Message::ProviderUseDiscovered(k, n, h, p) => {
+                if let Some(d) = &mut self.provider_draft {
+                    d.kind = k.clone();
+                    d.name = n;
+                    d.host = h;
+                    d.port = p.to_string();
+                    d.use_https = k == "dirigera";
+                    d.token.clear();
+                    d.pair_id.clear();
+                    d.has_saved_token = false;
+                }
+            }
+            Message::DiscoverProviders => {
+                self.send(json!({"cmd": "discover_providers"}));
+            }
+            Message::TestProvider => {
+                if let Some(d) = &self.provider_draft {
+                    let port_num: Option<u16> = d.port.trim().parse().ok();
+                    self.send(json!({
+                        "cmd": "test_provider",
+                        "provider": {
+                            "id": d.id,
+                            "kind": d.kind,
+                            "name": d.name.trim(),
+                            "host": d.host.trim(),
+                            "port": port_num,
+                            "room_name": d.room_name.trim(),
+                            "token": d.token.trim(),
+                            "pair_id": d.pair_id,
+                            "use_https": d.use_https,
+                        }
+                    }));
+                }
+            }
+            Message::PairProvider => {
+                if let Some(d) = &self.provider_draft {
+                    let port_num: Option<u16> = d.port.trim().parse().ok();
+                    self.send(json!({
+                        "cmd": "pair_provider",
+                        "kind": d.kind,
+                        "host": d.host.trim(),
+                        "port": port_num,
+                    }));
+                }
+            }
+            Message::SaveProvider => {
+                if let Some(d) = &mut self.provider_draft {
+                    let port_num: Option<u16> = d.port.trim().parse().ok();
+                    d.awaiting_save = true;
+                    let payload = json!({
+                        "cmd": "save_provider",
+                        "provider": {
+                            "id": d.id,
+                            "kind": d.kind,
+                            "name": d.name.trim(),
+                            "host": d.host.trim(),
+                            "port": port_num,
+                            "room_name": d.room_name.trim(),
+                            "token": d.token.trim(),
+                            "pair_id": d.pair_id,
+                            "use_https": d.use_https,
+                            "enabled": true,
+                        }
+                    });
+                    self.send(payload);
+                }
+            }
+            Message::ToggleProvider(cid, en) => {
+                self.send(json!({"cmd": "toggle_provider", "id": cid, "enabled": en}));
+            }
+            Message::RemoveProvider(cid) => {
+                self.send(json!({"cmd": "remove_provider", "id": cid}));
+            }
         }
         Task::none()
     }
@@ -4978,7 +5845,7 @@ mod tests {
         });
         app.floorplan.doc.lamps.insert(
             "l1".into(),
-            FloorplanLamp { x: 100.0, y: 100.0, z: 0.0, icon: "bulb".into() },
+            FloorplanLamp { x: 100.0, y: 100.0, z: 0.0, icon: "bulb".into(), floor_id: "eg".into() },
         );
 
         // Toggle Lights tab `⋯` submenu open & closed

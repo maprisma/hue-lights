@@ -780,12 +780,18 @@ class CommandsAndFloorplanTests(unittest.TestCase):
         with_sensors = dict(fp, sensors={S_MOT: {"x": 123.456, "y": 456.789}, S_CON: {"x": 0, "y": 3000}})
         validated = hue.validate_floorplan(with_sensors)
         self.assertIsNotNone(validated)
-        self.assertEqual(validated["sensors"], {S_MOT: {"x": 123.5, "y": 456.8}, S_CON: {"x": 0.0, "y": 3000.0}})
+        self.assertEqual(
+            validated["sensors"],
+            {S_MOT: {"x": 123.5, "y": 456.8, "floor_id": "eg"}, S_CON: {"x": 0.0, "y": 3000.0, "floor_id": "eg"}},
+        )
 
         # Out-of-range finite coordinates clamp to [0..4000] x [0..3000] (matching lamps)
         clamped = hue.validate_floorplan(dict(fp, sensors={S_MOT: {"x": -1, "y": 3001}, S_CON: {"x": 4001, "y": -5}}))
         self.assertIsNotNone(clamped)
-        self.assertEqual(clamped["sensors"], {S_MOT: {"x": 0.0, "y": 3000.0}, S_CON: {"x": 4000.0, "y": 0.0}})
+        self.assertEqual(
+            clamped["sensors"],
+            {S_MOT: {"x": 0.0, "y": 3000.0, "floor_id": "eg"}, S_CON: {"x": 4000.0, "y": 0.0, "floor_id": "eg"}},
+        )
 
         # Hostile/invalid sensor entries rejected
         self.assertIsNone(hue.validate_floorplan(dict(fp, sensors="bad")))
