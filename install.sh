@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and install Maprisma Lights for the current user (no root needed):
+# Build (source tree) or copy (release tarball) and install Maprisma Lights for the current user (no root needed):
 #   ~/.local/bin/maprisma-hue-lights                   the applet (symlinked as maprisma-lights)
 #   ~/.local/share/maprisma-hue-lights/scripts/        the bridge & multi-brand helper
 #   ~/.local/share/applications/…desktop             makes it an applet for the panel
@@ -11,9 +11,18 @@ id=io.github.ubruckhaus.CosmicMaprismaHueLights
 data="${XDG_DATA_HOME:-$HOME/.local/share}"
 bin="$HOME/.local/bin"
 
-cargo build --release
-install -Dm755 target/release/maprisma-hue-lights "$bin/maprisma-hue-lights"
-install -Dm755 target/release/maprisma-hue-lights-tray "$bin/maprisma-hue-lights-tray"
+# From the source tree: build. From a release tarball: use its prebuilt bin/ binaries.
+if [[ -f Cargo.toml ]]; then
+    cargo build --release
+    built=target/release
+elif [[ -x bin/maprisma-hue-lights && -x bin/maprisma-hue-lights-tray ]]; then
+    built=bin
+else
+    echo "No Cargo.toml and no prebuilt bin/ found next to install.sh." >&2
+    exit 1
+fi
+install -Dm755 "$built/maprisma-hue-lights" "$bin/maprisma-hue-lights"
+install -Dm755 "$built/maprisma-hue-lights-tray" "$bin/maprisma-hue-lights-tray"
 ln -sf maprisma-hue-lights "$bin/maprisma-lights"
 # Desktop Exec has two escaping layers: argument quoting, then string-value escaping.
 desktop_exec() {

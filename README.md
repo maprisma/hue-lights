@@ -4,6 +4,11 @@ A native Linux desktop & panel app (Rust/libcosmic) for **multi-brand local smar
 
 ![Maprisma Lights](preview.png)
 
+## What's New in v0.5.1
+
+- **Security fixes for the multi-brand backend** (from the Omarchy Lights review): devices only on home-LAN addresses (RFC 1918 / link-local), commands can no longer reach a device whose address was just edited, `providers.json` is read safely, every device request has one hard time limit, Home Assistant's second request is pinned to the same certificate, only one device test or pairing runs at a time, and floorplan background images are checked for their decoded size.
+- **Release tarball installs again:** `install.sh` uses the prebuilt `bin/` binaries when there is no source tree.
+
 ## What's New in v0.5.0
 
 - **Renamed to Maprisma Lights:** Clean multi-brand identity across the UI, desktop entries, tray menu, Help, and all 8 languages (while keeping internal IDs, binaries, and `~/.config/hue-lights/` 100% backwards-compatible, plus a new `~/.local/bin/maprisma-lights` convenience symlink).

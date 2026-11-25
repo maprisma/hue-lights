@@ -431,7 +431,7 @@ class ProtocolLifecycleTests(_MCPTestBase):
             "params": {"protocolVersion": "2024-11-05"},
         })
         self.assertEqual(r1["result"]["protocolVersion"], "2024-11-05")
-        self.assertEqual(r1["result"]["serverInfo"], {"name": "maprisma-hue-lights", "version": "0.5.0"})
+        self.assertEqual(r1["result"]["serverInfo"], {"name": "maprisma-hue-lights", "version": "0.5.1"})
         self.assertIn("tools", r1["result"]["capabilities"])
         self.assertIn("resources", r1["result"]["capabilities"])
 
