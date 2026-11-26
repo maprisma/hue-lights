@@ -4,6 +4,10 @@ A native Linux desktop & panel app (Rust/libcosmic) for **multi-brand local smar
 
 ![Maprisma Lights](preview.png)
 
+## What's New in v0.5.2
+
+- **Shared desktop core (`maprisma-kit` v0.1.0):** Migrated desktop look/theme integration, corner radius, private F12 screenshots, saved window size/position, and tray window presentation to the shared `maprisma-kit` crate with zero behavior regressions.
+
 ## What's New in v0.5.1
 
 - **Security fixes for the multi-brand backend** (from the Omarchy Lights review): devices only on home-LAN addresses (RFC 1918 / link-local), commands can no longer reach a device whose address was just edited, `providers.json` is read safely, every device request has one hard time limit, Home Assistant's second request is pinned to the same certificate, only one device test or pairing runs at a time, and floorplan background images are checked for their decoded size.
