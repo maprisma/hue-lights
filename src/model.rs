@@ -928,8 +928,8 @@ pub struct SkinStyle {
 }
 
 impl SkinStyle {
-    pub fn palette(&self) -> maprisma_hue_lights::look::Palette {
-        maprisma_hue_lights::look::Palette {
+    pub fn palette(&self) -> maprisma_kit::look::Palette {
+        maprisma_kit::look::Palette {
             accent: Some(self.accent_rgb),
             background: Some(self.window_bg),
             foreground: Some(self.foreground),
@@ -2438,7 +2438,7 @@ mod tests {
             assert!(pal.red.is_none());
             assert!(pal.yellow.is_none());
             assert!(pal.green.is_none());
-            let theme = maprisma_hue_lights::look::theme_from(&pal, Some(12.0));
+            let theme = maprisma_kit::look::theme_from(&pal, Some(12.0));
             assert!(theme.cosmic().is_dark);
         }
     }

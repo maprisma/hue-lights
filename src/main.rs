@@ -9,11 +9,10 @@
 // in ~/.config/hue-lights/config.json and never reaches this process.
 
 use maprisma_hue_lights::i18n::{read_pref, tr, trf, write_pref};
-use maprisma_hue_lights::{corners, shot};
+use maprisma_kit::{AppInfo, corners, look, shot, window_size};
 mod floorplan;
 mod help;
 mod model;
-mod window_size;
 use floorplan::{
     CanvasMode, FloorplanState, LampDialog, MapMsg, Selection, compute_pending_sync_count,
     view_lamp_dialog_overlay, view_map_tab,
@@ -74,10 +73,10 @@ impl WindowControl {
 const APP_ID: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights";
 const WINDOW_APP_ID: &str = "io.github.ubruckhaus.CosmicMaprismaHueLights.Window";
 static AUTOSIZE_ID: LazyLock<Id> = LazyLock::new(|| Id::new("hue-lights-autosize"));
-static NOTE_ID: LazyLock<Id> = LazyLock::new(|| Id::new("hue-lights-shot-note"));
+static NOTE_ID: LazyLock<Id> = LazyLock::new(Id::unique);
 static ASK_AI_ID: LazyLock<Id> = LazyLock::new(|| Id::new("hue-lights-ask-ai"));
 // F12 pictures go to ~/Pictures/<this>/ (the app's name, the same in every language).
-const SHOT_FOLDER: &str = TITLE;
+const SHOT_APP: AppInfo = AppInfo::new(APP_ID, TITLE);
 static BULB_ON: &[u8] = include_bytes!("../data/icons/io.github.ubruckhaus.CosmicMaprismaHueLights-symbolic.svg");
 static BULB_OFF: &[u8] = include_bytes!("../data/icons/hue-bulb-off-symbolic.svg");
 
@@ -123,11 +122,11 @@ fn main() -> cosmic::iced::Result {
             Err(zbus::Error::NameTaken) => { runtime.block_on(close_running_window(WINDOW_BUS)); return Ok(()); }
             Err(e) => { eprintln!("Window unavailable: {e}"); return Ok(()); }
         };
-        cosmic::app::run::<HueLights<true>>(cosmic::app::Settings::default().default_font(maprisma_hue_lights::look::default_font())
+        cosmic::app::run::<HueLights<true>>(cosmic::app::Settings::default().default_font(look::default_font())
             .size({ let (width, height) = window_start_size(); cosmic::iced::Size::new(width, height) })
             .resizable(Some(8.0)).exit_on_close(true).is_daemon(false), true)
     } else {
-        maprisma_hue_lights::look::keep_fonts();
+        look::keep_fonts();
         cosmic::applet::run::<HueLights>(false)
     }
 }
@@ -354,7 +353,7 @@ fn lit_svg_for(skin: &str) -> theme::Svg {
 fn active_theme(skin: &str, corners_choice: &str) -> Option<cosmic::Theme> {
     if let Some(st) = skin_style(skin) {
         let radius = corners::radius(corners_choice, corners::desktop_radius());
-        Some(maprisma_hue_lights::look::theme_from(&st.palette(), Some(radius)))
+        Some(look::theme_from(&st.palette(), Some(radius)))
     } else {
         corners::theme(corners_choice)
     }
@@ -2181,7 +2180,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
         if !self.window_mode {
             return Task::none();
         }
-        let scale = maprisma_hue_lights::look::text_scale() * font_scale_factor(&self.font_scale);
+        let scale = look::text_scale() * font_scale_factor(&self.font_scale);
         let theme = self.cached_theme.clone().unwrap_or_else(cosmic::theme::system_preference);
         Task::batch([
             cosmic::command::set_theme(theme),
@@ -2192,7 +2191,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
     fn themed_window_content(&self) -> Element<'_, Message> {
         match self.cached_theme.clone() {
             Some(theme) => cosmic::iced::widget::themer(Some(theme), self.popup_content())
-                .background(maprisma_hue_lights::look::window_background)
+                .background(look::window_background)
                 .text_color(|t: &cosmic::Theme| t.cosmic().on_bg_color().into())
                 .into(),
             None => self.popup_content(),
@@ -4178,7 +4177,7 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
                     // Busy until the note is written, so a new F12 cannot replace it.
                     self.shot = shot::Phase::Noting;
                     return off_thread(
-                        move || shot::save_note(&path, SHOT_FOLDER, &text).map(|_| ()).map_err(|e| e.to_string()),
+                        move || shot::save_note_for(&SHOT_APP, &path, &text).map(|_| ()).map_err(|e| e.to_string()),
                         Message::NoteSaved,
                     );
                 }
@@ -4220,29 +4219,24 @@ impl<const WINDOW_MODE: bool> HueLights<WINDOW_MODE> {
 
     // After F12: "Screenshot saved", where, the optional note and Done (or the error and Done).
     fn shot_overlay(&self) -> Option<Element<'_, Message>> {
-        let body: Element<Message> = match &self.shot {
-            shot::Phase::Note { shown, text: note, .. } => column![
-                text::heading(tr("Screenshot saved")),
-                dim(trf("Saved as {0}", &[shown.clone()])),
-                text_input(tr("What is wrong? (optional)"), note.as_str())
-                    .id(NOTE_ID.clone())
-                    .on_input(Message::NoteInput)
-                    .on_submit(|_| Message::NoteDone),
-                row![space::horizontal().width(Length::Fill), button::suggested(tr("Done")).on_press(Message::NoteDone)],
-            ]
-            .spacing(12)
-            .into(),
-            shot::Phase::Error(reason) => column![
-                text::body(reason.clone()),
-                row![space::horizontal().width(Length::Fill), button::suggested(tr("Done")).on_press(Message::NoteDone)],
-            ]
-            .spacing(12)
-            .into(),
-            _ => return None,
+        let labels = shot::ShotLabels {
+            saved_heading: tr("Screenshot saved"),
+            saved_as_template: tr("Saved as {0}"),
+            note_placeholder: tr("What is wrong? (optional)"),
+            done_button: tr("Done"),
+            save_error_template: tr("The screenshot could not be saved: {0}"),
+            note_error_template: tr("The note could not be saved: {0}"),
         };
-        let card = container(body).padding(16).width(Length::Fill).class(theme::Container::Card);
-        let card = container(card).padding(12).width(if self.window_mode { Length::Fill } else { Length::Fixed(POPUP_WIDTH) });
-        Some(card.into())
+        let width = if self.window_mode { Length::Fill } else { Length::Fixed(POPUP_WIDTH) };
+        shot::note_overlay(
+            &self.shot,
+            NOTE_ID.clone(),
+            &labels,
+            theme::Container::Card,
+            width,
+            Message::NoteInput,
+            Message::NoteDone,
+        )
     }
 
     /// Settings (as Maprisma Launcher's page): ← Back and the title, then one row per setting,
@@ -4660,7 +4654,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
     }
 
     fn init(mut core: Core, window_mode: bool) -> (Self, Task<Message>) {
-        maprisma_hue_lights::look::solid(&mut core);
+        look::solid(&mut core);
         if window_mode { core.set_header_title(TITLE.into()); }
         let start_size = window_start_size();
         let mut app = Self {
@@ -4857,9 +4851,9 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
                 }
                 let restyle = theme_changed || font_changed;
                 // The desktop's colours and corners (Maprisma Theme can change them any time), off the UI thread.
-                let refresh_look = if !self.look_refreshing && maprisma_hue_lights::look::is_refresh_due() {
+                let refresh_look = if !self.look_refreshing && look::is_refresh_due() {
                     self.look_refreshing = true;
-                    off_thread_value(maprisma_hue_lights::look::refresh, Message::LookRefreshed)
+                    off_thread_value(look::refresh, Message::LookRefreshed)
                 } else {
                     Task::none()
                 };
@@ -5402,7 +5396,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
             Message::Captured(picture) => {
                 if !std::mem::take(&mut self.capturing) { return Task::none(); }
                 let (width, height) = (picture.size.width, picture.size.height);
-                return off_thread(move || shot::save_screenshot(SHOT_FOLDER, &picture.rgba, width, height), Message::ShotSaved);
+                return off_thread(move || shot::save_screenshot_for(&SHOT_APP, &picture.rgba, width, height), Message::ShotSaved);
             }
             Message::ShotSaved(result) => {
                 self.shot = match result {
@@ -5889,7 +5883,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        maprisma_hue_lights::look::keep_fonts();
+        look::keep_fonts();
         if self.window_mode {
             return self.themed_window_content();
         }
@@ -5910,7 +5904,7 @@ impl<const WINDOW_MODE: bool> cosmic::Application for HueLights<WINDOW_MODE> {
     }
 
     fn view_window(&self, _id: window::Id) -> Element<'_, Message> {
-        maprisma_hue_lights::look::keep_fonts();
+        look::keep_fonts();
         if self.window_mode {
             return self.themed_window_content();
         }

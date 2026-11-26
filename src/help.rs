@@ -16,7 +16,7 @@ use cosmic::iced::widget::{container as iced_container, text as iced_text};
 use cosmic::iced::{Alignment, Background, Border, Color, Length, Point, Rectangle, Size, Vector};
 use cosmic::widget::{button, column, container, divider, icon, row, scrollable, space, text};
 use cosmic::{Element, theme};
-use maprisma_hue_lights::corners;
+use maprisma_kit::corners;
 use maprisma_hue_lights::i18n::tr;
 
 use crate::model::skin_style;

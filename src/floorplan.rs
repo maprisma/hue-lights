@@ -30,7 +30,7 @@ use cosmic::widget::{
     text, text_input, toggler,
 };
 use cosmic::{Element, theme};
-use maprisma_hue_lights::corners;
+use maprisma_kit::corners;
 use maprisma_hue_lights::i18n::{tr, trf};
 use serde_json::{Value, json};
 
